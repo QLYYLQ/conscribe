@@ -27,8 +27,6 @@ htmlcov/
 *.swo
 *~
 
-# Documentation / analysis (local only)
-*.md
 
 # OS
 .DS_Store
