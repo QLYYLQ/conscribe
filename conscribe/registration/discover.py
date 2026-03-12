@@ -47,8 +47,22 @@ def discover(*package_paths: str) -> List[str]:
             # It's a module, not a package — nothing to walk
             continue
 
-        # Walk all submodules recursively
+        # Deduplicate error logging between walk_packages and our import loop.
+        #
+        # pkgutil.walk_packages() sequence for a bad sub-package:
+        #   1. yield module_info          (our for-loop receives it)
+        #   2. our import_module() fails  (we log with traceback)
+        #   3. walk_packages tries the same import for recursion → also fails
+        #   4. walk_packages calls onerror callback
+        #
+        # Without dedup, steps 2 and 4 both log the same failure.
+        # Fix: track modules that failed in our try/except (step 2), and
+        # suppress the onerror callback (step 4) for those.
+        _already_failed: set[str] = set()
+
         def _handle_error(name: str) -> None:
+            if name in _already_failed:
+                return
             logger.warning(
                 "Failed to import module '%s' during discover(): skipping",
                 name,
@@ -63,6 +77,7 @@ def discover(*package_paths: str) -> List[str]:
                 importlib.import_module(module_info.name)
                 imported.append(module_info.name)
             except Exception:
+                _already_failed.add(module_info.name)
                 logger.warning(
                     "Failed to import module '%s' during discover(): skipping",
                     module_info.name,
