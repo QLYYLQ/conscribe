@@ -17,7 +17,7 @@ from typing import Protocol, runtime_checkable
 import pytest
 
 from conscribe import create_registrar
-from conscribe.registration.discover import discover
+from conscribe.discover import discover
 
 
 @runtime_checkable

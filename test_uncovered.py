@@ -8,7 +8,7 @@ import os
 from typing import Protocol, runtime_checkable
 
 from conscribe import create_registrar
-from conscribe.registration.discover import discover
+from conscribe.discover import discover
 from conscribe.registration.registry import LayerRegistry
 
 

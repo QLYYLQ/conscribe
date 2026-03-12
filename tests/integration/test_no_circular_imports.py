@@ -146,6 +146,47 @@ class TestNoCircularImports:
             f"registration/ internal DAG violations:\n" + "\n".join(violations)
         )
 
+    def test_config_internal_dag(self) -> None:
+        """Within config/, verify no reverse-direction imports.
+
+        Expected: config modules may import from each other following
+        the dependency direction (builder uses extractor, codegen uses builder).
+        No config module should import from registration/ or discover.
+        """
+        pkg_root = _get_package_root()
+        config_dir = os.path.join(pkg_root, "config")
+        py_files = _collect_python_files(config_dir)
+
+        violations: list[str] = []
+        for filepath in py_files:
+            filename = os.path.basename(filepath)
+            imports = _get_top_level_imports(filepath)
+            for imp in imports:
+                if "registration" in imp and "conscribe" in imp:
+                    violations.append(f"{filename}: imports {imp}")
+                if "conscribe.discover" in imp:
+                    violations.append(f"{filename}: imports {imp}")
+
+        assert violations == [], (
+            f"config/ internal DAG violations:\n" + "\n".join(violations)
+        )
+
+    def test_discover_does_not_import_registration(self) -> None:
+        """conscribe/discover.py may import from config/ but not registration/."""
+        pkg_root = _get_package_root()
+        filepath = os.path.join(pkg_root, "discover.py")
+        imports = _get_top_level_imports(filepath)
+
+        violations: list[str] = []
+        for imp in imports:
+            if "registration" in imp and "conscribe" in imp:
+                violations.append(f"discover.py: imports {imp}")
+
+        assert violations == [], (
+            f"discover.py has top-level imports from registration/:\n"
+            + "\n".join(violations)
+        )
+
     def test_conscribe_importable(self) -> None:
         """Smoke test: the package can be imported without circular import errors."""
         import conscribe
@@ -158,7 +199,6 @@ class TestNoCircularImports:
             create_auto_registrar,
             LayerRegistrar,
             create_registrar,
-            discover,
             make_key_transform,
             default_key_transform,
         )
@@ -167,9 +207,17 @@ class TestNoCircularImports:
         assert create_auto_registrar is not None
         assert LayerRegistrar is not None
         assert create_registrar is not None
-        assert discover is not None
         assert make_key_transform is not None
         assert default_key_transform is not None
+
+    def test_discover_module_importable(self) -> None:
+        """Smoke test: discover can be imported from both old and new location."""
+        from conscribe.discover import discover as d1
+        from conscribe.registration.discover import discover as d2
+        from conscribe import discover as d3
+
+        assert d1 is d2
+        assert d1 is d3
 
     def test_exceptions_importable(self) -> None:
         """Smoke test: exceptions can be imported."""

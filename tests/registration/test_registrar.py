@@ -665,23 +665,60 @@ class TestMultiLayerIndependence:
 # Config API stubs
 # ===================================================================
 
-class TestConfigStubs:
-    """Config API methods should raise NotImplementedError in Phase 1."""
+class TestConfigAPI:
+    """Config API methods return real results after Phase 2 implementation."""
 
-    def test_build_config_not_implemented(self) -> None:
-        R = create_registrar("test", SimpleProto)
-        with pytest.raises(NotImplementedError):
-            R.build_config()
+    def test_build_config_returns_result(self) -> None:
+        R = create_registrar("test", SimpleProto, discriminator_field="name")
 
-    def test_config_union_type_not_implemented(self) -> None:
-        R = create_registrar("test", SimpleProto)
-        with pytest.raises(NotImplementedError):
-            R.config_union_type()
+        class _B(metaclass=R.Meta):
+            __abstract__ = True
+            def run(self) -> None: pass
 
-    def test_get_config_schema_not_implemented(self) -> None:
-        R = create_registrar("test", SimpleProto)
-        with pytest.raises(NotImplementedError):
-            R.get_config_schema("some_key")
+        class _Impl(_B):
+            __registry_key__ = "impl"
+            def __init__(self, *, x: int = 1):
+                self.x = x
+
+        result = R.build_config()
+        assert result.layer_name == "test"
+        assert "impl" in result.per_key_models
+        R.unregister("impl")
+
+    def test_config_union_type_returns_type(self) -> None:
+        R = create_registrar("test", SimpleProto, discriminator_field="name")
+
+        class _B(metaclass=R.Meta):
+            __abstract__ = True
+            def run(self) -> None: pass
+
+        class _Impl(_B):
+            __registry_key__ = "impl"
+            def __init__(self, *, x: int = 1):
+                self.x = x
+
+        union_type = R.config_union_type()
+        assert union_type is not None
+        R.unregister("impl")
+
+    def test_get_config_schema_returns_model(self) -> None:
+        from pydantic import BaseModel
+
+        R = create_registrar("test", SimpleProto, discriminator_field="name")
+
+        class _B(metaclass=R.Meta):
+            __abstract__ = True
+            def run(self) -> None: pass
+
+        class _Impl(_B):
+            __registry_key__ = "impl"
+            def __init__(self, *, x: int = 1):
+                self.x = x
+
+        schema = R.get_config_schema("impl")
+        assert schema is not None
+        assert issubclass(schema, BaseModel)
+        R.unregister("impl")
 
 
 # ===================================================================
