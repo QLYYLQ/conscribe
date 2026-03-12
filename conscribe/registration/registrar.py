@@ -18,13 +18,13 @@ from typing import (
     Union,
 )
 
-from layer_registry.registration.auto import create_auto_registrar
-from layer_registry.registration.key_transform import (
+from conscribe.registration.auto import create_auto_registrar
+from conscribe.registration.key_transform import (
     KeyTransform,
     default_key_transform,
     make_key_transform,
 )
-from layer_registry.registration.registry import LayerRegistry
+from conscribe.registration.registry import LayerRegistry
 
 P = TypeVar("P")
 

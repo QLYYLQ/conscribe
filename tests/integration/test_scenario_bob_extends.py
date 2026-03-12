@@ -14,8 +14,8 @@ from typing import Protocol, runtime_checkable
 
 import pytest
 
-from layer_registry import create_registrar
-from layer_registry.exceptions import DuplicateKeyError
+from conscribe import create_registrar
+from conscribe.exceptions import DuplicateKeyError
 
 
 @runtime_checkable

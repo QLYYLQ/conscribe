@@ -1,4 +1,4 @@
-"""Tests for layer_registry.registration.key_transform module.
+"""Tests for conscribe.registration.key_transform module.
 
 Covers:
 - _camel_to_snake: parametrized CamelCase -> snake_case conversion
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from layer_registry.registration.key_transform import (
+from conscribe.registration.key_transform import (
     _camel_to_snake,
     default_key_transform,
     make_key_transform,

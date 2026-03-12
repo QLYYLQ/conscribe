@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from typing import IO
 from weakref import WeakSet
 
-from layer_registry.exceptions import (
+from conscribe.exceptions import (
     DuplicateKeyError,
     InvalidProtocolError,
     KeyNotFoundError,

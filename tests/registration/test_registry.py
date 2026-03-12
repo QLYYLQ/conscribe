@@ -1,4 +1,4 @@
-"""Tests for layer_registry.registration.registry.LayerRegistry.
+"""Tests for conscribe.registration.registry.LayerRegistry.
 
 Covers:
 - CRUD operations: add, get, get_or_none, remove, keys, items
@@ -16,8 +16,8 @@ from typing import Protocol, runtime_checkable
 
 import pytest
 
-from layer_registry.registration.registry import LayerRegistry
-from layer_registry.exceptions import (
+from conscribe.registration.registry import LayerRegistry
+from conscribe.exceptions import (
     DuplicateKeyError,
     KeyNotFoundError,
     InvalidProtocolError,

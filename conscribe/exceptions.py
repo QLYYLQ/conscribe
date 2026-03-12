@@ -1,4 +1,4 @@
-"""Custom exception classes for the layer-registry package.
+"""Custom exception classes for the conscribe package.
 
 All registration-related exceptions inherit from RegistryError,
 allowing consumers to catch all registry exceptions with a single handler.

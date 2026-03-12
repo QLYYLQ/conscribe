@@ -1,4 +1,4 @@
-"""Tests for layer_registry.registration.registrar module.
+"""Tests for conscribe.registration.registrar module.
 
 Covers:
 - create_registrar(): factory options, key_transform priority
@@ -18,9 +18,9 @@ from typing import Protocol, runtime_checkable
 
 import pytest
 
-from layer_registry import create_registrar
-from layer_registry.registration.key_transform import make_key_transform, default_key_transform
-from layer_registry.exceptions import (
+from conscribe import create_registrar
+from conscribe.registration.key_transform import make_key_transform, default_key_transform
+from conscribe.exceptions import (
     DuplicateKeyError,
     KeyNotFoundError,
     ProtocolViolationError,

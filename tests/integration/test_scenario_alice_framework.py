@@ -15,7 +15,7 @@ from typing import Protocol, runtime_checkable
 
 import pytest
 
-from layer_registry import create_registrar
+from conscribe import create_registrar
 
 
 # ===================================================================

@@ -1,4 +1,4 @@
-"""Shared fixtures for layer-registry test suite.
+"""Shared fixtures for conscribe test suite.
 
 Provides Protocol definitions, registrar factories, and cleanup fixtures
 modeled on real browseruse-bench scenarios (Agent, LLM, Browser Provider layers).
@@ -8,7 +8,7 @@ from __future__ import annotations
 import pytest
 from typing import Protocol, runtime_checkable
 
-from layer_registry import create_registrar
+from conscribe import create_registrar
 
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-"""Tests for layer_registry.registration.discover module.
+"""Tests for conscribe.registration.discover module.
 
 Covers:
 - discover() triggers module imports -> metaclass registration fills registry
@@ -16,8 +16,8 @@ from typing import Protocol, runtime_checkable
 
 import pytest
 
-from layer_registry import create_registrar
-from layer_registry.registration.discover import discover
+from conscribe import create_registrar
+from conscribe.registration.discover import discover
 
 
 @runtime_checkable

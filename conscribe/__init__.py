@@ -1,11 +1,11 @@
-"""layer-registry: Automatic class registration for layered Python architectures.
+"""conscribe: Automatic class registration for layered Python architectures.
 
 Inheritance is registration — when you write ``class FooAgent(BaseAgent)``,
 the class is automatically registered in the appropriate layer registry.
 """
 from __future__ import annotations
 
-from layer_registry.exceptions import (
+from conscribe.exceptions import (
     DuplicateKeyError,
     InvalidConfigSchemaError,
     InvalidProtocolError,
@@ -13,7 +13,7 @@ from layer_registry.exceptions import (
     ProtocolViolationError,
     RegistryError,
 )
-from layer_registry.registration import (
+from conscribe.registration import (
     KeyTransform,
     LayerRegistrar,
     LayerRegistry,

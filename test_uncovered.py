@@ -7,9 +7,9 @@ import textwrap
 import os
 from typing import Protocol, runtime_checkable
 
-from layer_registry import create_registrar
-from layer_registry.registration.discover import discover
-from layer_registry.registration.registry import LayerRegistry
+from conscribe import create_registrar
+from conscribe.registration.discover import discover
+from conscribe.registration.registry import LayerRegistry
 
 
 @runtime_checkable

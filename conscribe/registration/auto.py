@@ -8,11 +8,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from layer_registry.exceptions import InvalidConfigSchemaError
-from layer_registry.registration.key_transform import KeyTransform
+from conscribe.exceptions import InvalidConfigSchemaError
+from conscribe.registration.key_transform import KeyTransform
 
 if TYPE_CHECKING:
-    from layer_registry.registration.registry import LayerRegistry
+    from conscribe.registration.registry import LayerRegistry
 
 
 def create_auto_registrar(

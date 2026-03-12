@@ -1,4 +1,4 @@
-"""Tests for layer_registry.registration.auto.create_auto_registrar.
+"""Tests for conscribe.registration.auto.create_auto_registrar.
 
 Covers:
 - Root class (no bases) is skipped
@@ -20,9 +20,9 @@ from typing import Protocol, runtime_checkable
 
 import pytest
 
-from layer_registry.registration.registry import LayerRegistry
-from layer_registry.registration.key_transform import make_key_transform, default_key_transform
-from layer_registry.registration.auto import create_auto_registrar
+from conscribe.registration.registry import LayerRegistry
+from conscribe.registration.key_transform import make_key_transform, default_key_transform
+from conscribe.registration.auto import create_auto_registrar
 
 
 @runtime_checkable

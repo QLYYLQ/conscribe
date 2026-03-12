@@ -16,9 +16,9 @@ import pytest
 
 
 def _get_package_root() -> str:
-    """Return the absolute path to the layer_registry package directory."""
-    import layer_registry
-    return os.path.dirname(os.path.abspath(layer_registry.__file__))
+    """Return the absolute path to the conscribe package directory."""
+    import conscribe
+    return os.path.dirname(os.path.abspath(conscribe.__file__))
 
 
 def _get_top_level_imports(filepath: str) -> list[str]:
@@ -79,7 +79,7 @@ class TestNoCircularImports:
             filename = os.path.basename(filepath)
             imports = _get_top_level_imports(filepath)
             for imp in imports:
-                if "config" in imp and "layer_registry" in imp:
+                if "config" in imp and "conscribe" in imp:
                     violations.append(f"{filename}: imports {imp}")
 
         assert violations == [], (
@@ -98,7 +98,7 @@ class TestNoCircularImports:
             filename = os.path.basename(filepath)
             imports = _get_top_level_imports(filepath)
             for imp in imports:
-                if "registration" in imp and "layer_registry" in imp:
+                if "registration" in imp and "conscribe" in imp:
                     violations.append(f"{filename}: imports {imp}")
 
         assert violations == [], (
@@ -146,14 +146,14 @@ class TestNoCircularImports:
             f"registration/ internal DAG violations:\n" + "\n".join(violations)
         )
 
-    def test_layer_registry_importable(self) -> None:
+    def test_conscribe_importable(self) -> None:
         """Smoke test: the package can be imported without circular import errors."""
-        import layer_registry
-        assert hasattr(layer_registry, "create_registrar")
+        import conscribe
+        assert hasattr(conscribe, "create_registrar")
 
     def test_registration_subpackage_importable(self) -> None:
         """Smoke test: registration subpackage can be imported."""
-        from layer_registry.registration import (
+        from conscribe.registration import (
             LayerRegistry,
             create_auto_registrar,
             LayerRegistrar,
@@ -173,7 +173,7 @@ class TestNoCircularImports:
 
     def test_exceptions_importable(self) -> None:
         """Smoke test: exceptions can be imported."""
-        from layer_registry.exceptions import (
+        from conscribe.exceptions import (
             RegistryError,
             DuplicateKeyError,
             KeyNotFoundError,
