@@ -194,22 +194,43 @@ class LayerRegistrar(Generic[P]):
 
         target_cls.__init_subclass__ = __init_subclass__  # type: ignore[attr-defined]
 
-    # ── Config API stubs (Phase 2) ──
+    # ── Config API ──
 
     @classmethod
-    def build_config(cls) -> None:
-        """Build config union type. Not yet implemented."""
-        raise NotImplementedError("Config generation not yet implemented")
+    def build_config(cls) -> Any:
+        """Build discriminated union config from all registered classes.
+
+        Returns:
+            A ``LayerConfigResult`` with the union type and per-key models.
+        """
+        from conscribe.config.builder import build_layer_config
+
+        return build_layer_config(cls)
 
     @classmethod
-    def config_union_type(cls) -> None:
-        """Get the config union type. Not yet implemented."""
-        raise NotImplementedError("Config generation not yet implemented")
+    def config_union_type(cls) -> type:
+        """Get the discriminated union type for config validation.
+
+        Returns:
+            The union type (or single model if only one key).
+        """
+        return cls.build_config().union_type
 
     @classmethod
-    def get_config_schema(cls, key: str) -> None:
-        """Get the config schema for a specific key. Not yet implemented."""
-        raise NotImplementedError("Config generation not yet implemented")
+    def get_config_schema(cls, key: str) -> Any:
+        """Get the config schema for a specific registered key.
+
+        Args:
+            key: The registration key.
+
+        Returns:
+            A Pydantic ``BaseModel`` subclass, or ``None`` if no
+            extractable parameters.
+        """
+        from conscribe.config.extractor import extract_config_schema
+
+        target_cls = cls._registry.get(key)
+        return extract_config_schema(target_cls)
 
 
 def create_registrar(

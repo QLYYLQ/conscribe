@@ -5,7 +5,6 @@ Re-exports all public APIs from submodules.
 from __future__ import annotations
 
 from conscribe.registration.auto import create_auto_registrar
-from conscribe.registration.discover import discover
 from conscribe.registration.key_transform import (
     KeyTransform,
     default_key_transform,
@@ -25,5 +24,4 @@ __all__ = [
     "create_auto_registrar",
     "LayerRegistrar",
     "create_registrar",
-    "discover",
 ]

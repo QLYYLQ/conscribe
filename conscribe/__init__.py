@@ -13,6 +13,7 @@ from conscribe.exceptions import (
     ProtocolViolationError,
     RegistryError,
 )
+from conscribe.discover import discover
 from conscribe.registration import (
     KeyTransform,
     LayerRegistrar,
@@ -20,8 +21,17 @@ from conscribe.registration import (
     create_auto_registrar,
     create_registrar,
     default_key_transform,
-    discover,
     make_key_transform,
+)
+from conscribe.config import (
+    LayerConfigResult,
+    build_layer_config,
+    compute_registry_fingerprint,
+    extract_config_schema,
+    generate_layer_config_source,
+    generate_layer_json_schema,
+    load_cached_fingerprint,
+    save_fingerprint,
 )
 
 __version__ = "0.1.0"
@@ -36,6 +46,15 @@ __all__ = [
     "default_key_transform",
     "make_key_transform",
     "discover",
+    # Config API
+    "extract_config_schema",
+    "build_layer_config",
+    "LayerConfigResult",
+    "generate_layer_config_source",
+    "generate_layer_json_schema",
+    "compute_registry_fingerprint",
+    "load_cached_fingerprint",
+    "save_fingerprint",
     # Exceptions
     "RegistryError",
     "DuplicateKeyError",

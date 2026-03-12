@@ -11,6 +11,9 @@ dependencies = [
     "pydantic>=2.0,<3.0",
 ]
 
+[project.scripts]
+conscribe = "conscribe.cli:main"
+
 [project.optional-dependencies]
 docstring = ["docstring-parser>=0.15"]
 dev = [
