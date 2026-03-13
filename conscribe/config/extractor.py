@@ -98,12 +98,19 @@ def extract_config_schema(cls: type) -> Union[type[BaseModel], None]:
     # -- Get docstring descriptions for fallback --
     doc_descriptions = parse_param_descriptions(init_definer)
 
+    # -- Check annotated-only mode --
+    annotated_only = getattr(cls, "__config_annotated_only__", False)
+
     # -- Build field definitions --
     field_definitions: dict[str, Any] = {}
 
     for param in named_params:
         param_type = _get_param_type(param, hints)
         field_info = _extract_field_info_from_annotated(param_type)
+
+        # In annotated-only mode, skip params without Annotated[..., Field(...)]
+        if annotated_only and field_info is None:
+            continue
         base_type = _unwrap_annotated_type(param_type)
 
         if base_type is inspect.Parameter.empty:
