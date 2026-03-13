@@ -51,6 +51,10 @@ def compute_registry_fingerprint(registrar: type) -> str:
             init_doc = getattr(init_definer.__init__, "__doc__", None) or ""
             hasher.update(doc.encode("utf-8"))
             hasher.update(init_doc.encode("utf-8"))
+
+            # MRO parent signatures: when **kwargs is present,
+            # parent signatures affect the generated schema.
+            _hash_mro_parent_signatures(hasher, cls, init_definer)
         else:
             hasher.update(b"<no-init>")
 
@@ -125,3 +129,67 @@ def _find_init_definer(cls: type) -> Union[type, None]:
     """Walk MRO to find the class that actually defines ``__init__``."""
     from conscribe.config._utils import find_init_definer
     return find_init_definer(cls)
+
+
+def _hash_mro_parent_signatures(
+    hasher: hashlib._Hash,
+    cls: type,
+    init_definer: type,
+) -> None:
+    """Hash parent class signatures when ``init_definer`` has ``**kwargs``.
+
+    This ensures that changes to parent ``__init__`` signatures cause
+    fingerprint invalidation when the child uses ``**kwargs`` forwarding.
+    """
+    init = init_definer.__dict__.get("__init__")
+    if init is None:
+        return
+
+    try:
+        sig = inspect.signature(init)
+    except (ValueError, TypeError):
+        return
+
+    has_var_kw = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD
+        for p in sig.parameters.values()
+    )
+    if not has_var_kw:
+        return
+
+    # Walk MRO from init_definer upward
+    mro = cls.__mro__
+    try:
+        start_idx = mro.index(init_definer)
+    except ValueError:
+        return
+
+    for klass in mro[start_idx + 1 :]:
+        if klass is object:
+            break
+        if "__init__" not in klass.__dict__:
+            continue
+
+        try:
+            parent_sig = inspect.signature(klass.__init__)
+            hasher.update(f"mro:{klass.__qualname__}:{parent_sig}".encode("utf-8"))
+        except (ValueError, TypeError):
+            hasher.update(f"mro:{klass.__qualname__}:<no-sig>".encode("utf-8"))
+
+        # Hash parent docstrings too
+        parent_doc = klass.__doc__ or ""
+        parent_init_doc = getattr(klass.__init__, "__doc__", None) or ""
+        hasher.update(parent_doc.encode("utf-8"))
+        hasher.update(parent_init_doc.encode("utf-8"))
+
+        # Check if this parent also has **kwargs; if not, stop
+        try:
+            parent_sig = inspect.signature(klass.__init__)
+            parent_has_kw = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in parent_sig.parameters.values()
+            )
+            if not parent_has_kw:
+                break
+        except (ValueError, TypeError):
+            break

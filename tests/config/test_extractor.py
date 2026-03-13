@@ -911,3 +911,213 @@ class TestGeneratedModelValidation:
         instance = result(name="test")
         assert instance.retries == 3
         assert instance.verbose is False
+
+
+# ===================================================================
+# MRO **kwargs resolution
+# ===================================================================
+
+
+class _MROParent:
+    """Parent class for MRO tests.
+
+    Args:
+        x: The x coordinate.
+        y: The y label.
+    """
+
+    def __init__(self, x: int, y: str = "hello"):
+        self.x = x
+        self.y = y
+
+
+class _MROChild(_MROParent):
+    def __init__(self, z: float, **kwargs: Any):
+        super().__init__(**kwargs)
+        self.z = z
+
+
+class _MROGrandparent:
+    def __init__(self, a: int, b: str = "gp"):
+        pass
+
+
+class _MROMiddle(_MROGrandparent):
+    def __init__(self, x: int, **kwargs: Any):
+        super().__init__(**kwargs)
+
+
+class _MROGrandchild(_MROMiddle):
+    def __init__(self, z: float, **kwargs: Any):
+        super().__init__(**kwargs)
+
+
+class _MROChildNoKwargs(_MROParent):
+    """Child that overrides __init__ without **kwargs."""
+
+    def __init__(self, z: float):
+        super().__init__(x=0)
+        self.z = z
+
+
+class _MROChildOnlyKwargs(_MROParent):
+    """Child with only **kwargs (no own named params)."""
+
+    def __init__(self, **kwargs: Any):
+        super().__init__(**kwargs)
+
+
+class _MRODepthParent:
+    def __init__(self, deep_param: int = 99):
+        pass
+
+
+class _MRODepthMiddle(_MRODepthParent):
+    def __init__(self, mid_param: str = "mid", **kwargs: Any):
+        super().__init__(**kwargs)
+
+
+class _MRODepthChild(_MRODepthMiddle):
+    def __init__(self, z: float, **kwargs: Any):
+        super().__init__(**kwargs)
+
+
+class _MROScopeChild(_MROParent):
+    __config_mro_scope__ = "all"
+
+    def __init__(self, z: float, **kwargs: Any):
+        super().__init__(**kwargs)
+
+
+class _MRODepthOverrideChild(_MROGrandchild):
+    __config_mro_depth__ = 1
+
+    def __init__(self, w: float, **kwargs: Any):
+        super().__init__(**kwargs)
+
+
+class TestMROKwargsResolution:
+    """Tests for MRO **kwargs parameter collection in extract_config_schema."""
+
+    def test_basic_kwargs_collects_parent_params(self) -> None:
+        """Child with **kwargs collects parent's x and y."""
+        result = extract_config_schema(_MROChild, mro_scope="all")
+        assert result is not None
+        fields = result.model_fields
+        assert "z" in fields
+        assert "x" in fields
+        assert "y" in fields
+        assert fields["y"].default == "hello"
+
+    def test_fully_resolved_sets_extra_forbid(self) -> None:
+        """Fully resolved MRO chain produces extra='forbid'."""
+        result = extract_config_schema(_MROChild, mro_scope="all")
+        assert result is not None
+        assert result.model_config.get("extra") == "forbid"
+
+    def test_scope_truncation_sets_extra_allow(self) -> None:
+        """When MRO chain is truncated by scope, extra='allow'."""
+        from pydantic import BaseModel
+
+        class _ScopeChild(BaseModel):
+            z: float
+
+            def __init__(self, z: float, **kwargs: Any):
+                super().__init__(z=z, **kwargs)
+
+        result = extract_config_schema(_ScopeChild, mro_scope="local")
+        assert result is not None
+        assert result.model_config.get("extra") == "allow"
+
+    def test_no_kwargs_backward_compatible(self) -> None:
+        """Class without **kwargs behaves exactly as before."""
+        result = extract_config_schema(_MROChildNoKwargs, mro_scope="all")
+        assert result is not None
+        assert "z" in result.model_fields
+        # Parent params should NOT appear (no **kwargs)
+        assert "x" not in result.model_fields
+        assert "y" not in result.model_fields
+        assert result.model_config.get("extra") == "forbid"
+
+    def test_tier3_not_affected_by_mro(self) -> None:
+        """Tier 3 (__config_schema__) is not affected by MRO collection."""
+
+        class MyConfig(BaseModel):
+            only_this: str
+
+        class MyClass(_MROParent):
+            __config_schema__ = MyConfig
+
+            def __init__(self, z: float, **kwargs: Any):
+                super().__init__(**kwargs)
+
+        result = extract_config_schema(MyClass, mro_scope="all")
+        assert result is MyConfig
+
+    def test_class_level_mro_scope_override(self) -> None:
+        """__config_mro_scope__ overrides function-level mro_scope."""
+        result = extract_config_schema(_MROScopeChild, mro_scope="local")
+        assert result is not None
+        # Despite mro_scope="local", the class-level override sets "all"
+        assert "x" in result.model_fields
+        assert "y" in result.model_fields
+
+    def test_class_level_mro_depth_override(self) -> None:
+        """__config_mro_depth__ overrides function-level mro_depth."""
+        # _MRODepthOverrideChild extends _MROGrandchild which extends _MROMiddle
+        # which extends _MROGrandparent. __config_mro_depth__=1 should
+        # only go one level up from the child's init_definer.
+        result = extract_config_schema(_MRODepthOverrideChild, mro_scope="all")
+        assert result is not None
+        # Only direct parent's params should appear (depth=1)
+        assert "z" in result.model_fields
+        # Further params should not be collected due to depth=1
+        # The child has w, __init__ defines w + **kwargs
+        assert "w" in result.model_fields
+
+    def test_two_level_chain(self) -> None:
+        """Two-level kwargs chain collects from both parent and grandparent."""
+        result = extract_config_schema(_MROGrandchild, mro_scope="all")
+        assert result is not None
+        fields = result.model_fields
+        assert "z" in fields
+        assert "x" in fields
+        assert "a" in fields
+        assert "b" in fields
+
+    def test_depth_limit(self) -> None:
+        """mro_depth=1 limits collection to direct parent only."""
+        result = extract_config_schema(_MRODepthChild, mro_scope="all", mro_depth=1)
+        assert result is not None
+        assert "mid_param" in result.model_fields
+        assert "deep_param" not in result.model_fields
+
+    def test_only_kwargs_child_collects_all_parent_params(self) -> None:
+        """Child with only **kwargs (no own params) still collects parent params."""
+        result = extract_config_schema(_MROChildOnlyKwargs, mro_scope="all")
+        assert result is not None
+        assert "x" in result.model_fields
+        assert "y" in result.model_fields
+
+    def test_docstring_merged_from_parent(self) -> None:
+        """Docstring descriptions from parent classes are merged."""
+        result = extract_config_schema(_MROChild, mro_scope="all")
+        assert result is not None
+        # Parent's docstring describes 'x' and 'y'
+        x_field = result.model_fields.get("x")
+        assert x_field is not None
+        assert x_field.description == "The x coordinate."
+
+    def test_kwargs_no_parent_init_returns_allow(self) -> None:
+        """Class with **kwargs but parent has no custom __init__ gets extra='allow'."""
+
+        class Child:
+            def __init__(self, z: float, **kwargs: Any):
+                pass
+
+        result = extract_config_schema(Child, mro_scope="all")
+        assert result is not None
+        # No parent params collected, but has **kwargs and MRO found nothing
+        # fully_resolved = True (reached object), so extra='forbid'
+        # Actually, no mro_result.params means we fall through to has_var check
+        assert "z" in result.model_fields

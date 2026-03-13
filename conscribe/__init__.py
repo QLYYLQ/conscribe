@@ -25,6 +25,7 @@ from conscribe.registration import (
 )
 from conscribe.config import (
     LayerConfigResult,
+    MROScope,
     build_layer_config,
     compute_registry_fingerprint,
     extract_config_schema,
@@ -47,6 +48,7 @@ __all__ = [
     "make_key_transform",
     "discover",
     # Config API
+    "MROScope",
     "extract_config_schema",
     "build_layer_config",
     "LayerConfigResult",

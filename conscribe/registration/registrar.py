@@ -49,6 +49,8 @@ class LayerRegistrar(Generic[P]):
     Meta: type
     _key_transform: KeyTransform
     discriminator_field: str
+    _mro_scope: str
+    _mro_depth: Union[int, None]
 
     # ── Query API ──
 
@@ -230,7 +232,11 @@ class LayerRegistrar(Generic[P]):
         from conscribe.config.extractor import extract_config_schema
 
         target_cls = cls._registry.get(key)
-        return extract_config_schema(target_cls)
+        return extract_config_schema(
+            target_cls,
+            mro_scope=cls._mro_scope,
+            mro_depth=cls._mro_depth,
+        )
 
 
 def create_registrar(
@@ -242,6 +248,8 @@ def create_registrar(
     strip_prefixes: Optional[list[str]] = None,
     key_transform: Optional[KeyTransform] = None,
     base_metaclass: type = type,
+    mro_scope: str = "local",
+    mro_depth: Optional[int] = None,
 ) -> type:
     """One-line factory to create a Layer-specific Registrar class.
 
@@ -255,6 +263,10 @@ def create_registrar(
         strip_prefixes: Prefixes to strip during key inference.
         key_transform: Fully custom key inference function (highest priority).
         base_metaclass: Parent metaclass for AutoRegistrar.
+        mro_scope: Scope for MRO parameter collection (``"local"``,
+            ``"third_party"``, or ``"all"``).
+        mro_depth: Max MRO levels to traverse for parameter collection.
+            ``None`` means unlimited.
 
     Returns:
         A LayerRegistrar subclass with all class-level attributes populated.
@@ -288,6 +300,8 @@ def create_registrar(
             "Meta": meta,
             "_key_transform": staticmethod(kt),
             "discriminator_field": discriminator_field,
+            "_mro_scope": mro_scope,
+            "_mro_depth": mro_depth,
         },
     )
     return registrar_cls

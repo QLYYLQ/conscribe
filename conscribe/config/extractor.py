@@ -22,7 +22,11 @@ from pydantic.fields import FieldInfo
 from conscribe.config.docstring import parse_param_descriptions
 
 
-def extract_config_schema(cls: type) -> Union[type[BaseModel], None]:
+def extract_config_schema(
+    cls: type,
+    mro_scope: str = "local",
+    mro_depth: Union[int, None] = None,
+) -> Union[type[BaseModel], None]:
     """Extract config schema from a class.
 
     Extraction priority:
@@ -31,8 +35,16 @@ def extract_config_schema(cls: type) -> Union[type[BaseModel], None]:
     3. ``__init__`` signature reflection -> dynamic Pydantic model (Tier 1/1.5/2)
     4. No extractable params -> ``None``
 
+    When the ``__init__`` has ``**kwargs``, walks the MRO upward to
+    collect parent parameters, producing a more complete schema.
+
     Args:
         cls: The class to extract config schema from.
+        mro_scope: Scope for MRO traversal (``"local"``, ``"third_party"``,
+            or ``"all"``).  Can be overridden per-class via
+            ``__config_mro_scope__``.
+        mro_depth: Max MRO levels to traverse.  ``None`` = unlimited.
+            Can be overridden per-class via ``__config_mro_depth__``.
 
     Returns:
         A Pydantic ``BaseModel`` subclass, or ``None`` if no
@@ -67,7 +79,8 @@ def extract_config_schema(cls: type) -> Union[type[BaseModel], None]:
 
     # -- Filter params (exclude self, *args, **kwargs) --
     named_params = _filter_named_params(sig)
-    has_var = _has_var_keyword_or_positional(sig)
+    has_var_kw = _has_var_keyword(sig)
+    has_var = has_var_kw or _has_var_positional(sig)
 
     # -- Get type hints (with Annotated extras) --
     # Try get_type_hints first (resolves forward refs), fall back to
@@ -87,6 +100,26 @@ def extract_config_schema(cls: type) -> Union[type[BaseModel], None]:
         ):
             return base_type
 
+    # -- MRO collection for **kwargs chains --
+    # Resolve class-level overrides for mro_scope / mro_depth
+    effective_scope = getattr(cls, "__config_mro_scope__", mro_scope)
+    effective_depth = getattr(cls, "__config_mro_depth__", mro_depth)
+
+    mro_result = None
+    if has_var_kw:
+        from conscribe.config.mro import collect_mro_params
+
+        mro_result = collect_mro_params(cls, scope=effective_scope, depth=effective_depth)
+        if mro_result.params:
+            named_params = named_params + mro_result.params
+            # Merge hints: child hints take precedence
+            if hints is not None and mro_result.hints:
+                merged_hints = dict(mro_result.hints)
+                merged_hints.update(hints)
+                hints = merged_hints
+            elif hints is None and mro_result.hints:
+                hints = dict(mro_result.hints)
+
     # -- No named params -> None --
     if not named_params:
         return None
@@ -97,6 +130,13 @@ def extract_config_schema(cls: type) -> Union[type[BaseModel], None]:
 
     # -- Get docstring descriptions for fallback --
     doc_descriptions = parse_param_descriptions(init_definer)
+    # Merge docstring descriptions from MRO parent classes
+    if mro_result is not None and mro_result.init_definers:
+        for parent_cls in mro_result.init_definers:
+            parent_docs = parse_param_descriptions(parent_cls)
+            for name, desc in parent_docs.items():
+                if name not in doc_descriptions:
+                    doc_descriptions[name] = desc
 
     # -- Check annotated-only mode --
     annotated_only = getattr(cls, "__config_annotated_only__", False)
@@ -165,7 +205,13 @@ def extract_config_schema(cls: type) -> Union[type[BaseModel], None]:
             field_definitions[param.name] = (base_type, default)
 
     # -- Determine extra policy --
-    extra = "allow" if has_var else "forbid"
+    if has_var_kw and mro_result is not None and mro_result.params:
+        # MRO collection happened — use fully_resolved to decide
+        extra = "forbid" if mro_result.fully_resolved else "allow"
+    elif has_var:
+        extra = "allow"
+    else:
+        extra = "forbid"
 
     # -- Create dynamic model --
     model_name = f"{cls.__name__}Config"
@@ -201,15 +247,20 @@ def _filter_named_params(
     return result
 
 
-def _has_var_keyword_or_positional(sig: inspect.Signature) -> bool:
-    """Check if signature has *args or **kwargs."""
-    for param in sig.parameters.values():
-        if param.kind in (
-            inspect.Parameter.VAR_POSITIONAL,
-            inspect.Parameter.VAR_KEYWORD,
-        ):
-            return True
-    return False
+def _has_var_keyword(sig: inspect.Signature) -> bool:
+    """Check if signature has ``**kwargs``."""
+    return any(
+        p.kind == inspect.Parameter.VAR_KEYWORD
+        for p in sig.parameters.values()
+    )
+
+
+def _has_var_positional(sig: inspect.Signature) -> bool:
+    """Check if signature has ``*args``."""
+    return any(
+        p.kind == inspect.Parameter.VAR_POSITIONAL
+        for p in sig.parameters.values()
+    )
 
 
 def _safe_get_type_hints(func: Any) -> Union[dict[str, Any], None]:

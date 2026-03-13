@@ -329,11 +329,68 @@ class SubAgentConfig(BaseModel):
     timeout: int = 300      # ← from AgentBase.__init__
 ```
 
+### `**kwargs` Chain Resolution
+
+When a child's `__init__` accepts `**kwargs` and passes them to `super().__init__(**kwargs)`, Conscribe automatically walks the MRO upward to collect parent parameters:
+
+```python
+class Parent:
+    def __init__(self, x: int, y: str = "hello"):
+        ...
+
+class Child(Parent):
+    def __init__(self, z: float, **kwargs):
+        super().__init__(**kwargs)
+```
+
+Without this feature, `Child`'s config would only contain `z`. With MRO collection, it contains `z`, `x`, and `y` — the complete picture:
+
+```python
+schema = extract_config_schema(Child, mro_scope="all")
+print(schema.model_fields)  # z, x, y
+print(schema.model_config)  # extra="forbid" (fully resolved chain)
+```
+
+The chain walks upward until:
+- A parent has no `**kwargs` → **natural termination**, all params are known → `extra="forbid"`
+- A parent is outside the configured scope → **truncated** → `extra="allow"`
+- The depth limit is reached → **truncated** → `extra="allow"`
+
+#### Scope Control
+
+The `mro_scope` parameter controls which classes in the MRO are included:
+
+| Scope | Includes | Use Case |
+|-------|----------|----------|
+| `"local"` (default) | Only your project code | Safe default — ignores third-party internals |
+| `"third_party"` | + site-packages | Include params from libraries you depend on |
+| `"all"` | Everything except `object` | Full traversal for maximum schema completeness |
+
+#### Configuration Levels
+
+MRO scope and depth can be set at three levels (highest priority wins):
+
+```python
+# 1. Function-level default
+extract_config_schema(cls, mro_scope="local", mro_depth=None)
+
+# 2. Registrar-level
+create_registrar("agent", proto, mro_scope="all", mro_depth=2)
+
+# 3. Per-class override (highest priority)
+class MyAgent(BaseAgent):
+    __config_mro_scope__ = "all"
+    __config_mro_depth__ = 1
+
+    def __init__(self, z: float, **kwargs):
+        super().__init__(**kwargs)
+```
+
 ---
 
 ## Open vs Closed Config Schema
 
-Conscribe detects `**kwargs` in `__init__` to decide strictness:
+Conscribe uses `**kwargs` presence and MRO resolution to decide config strictness:
 
 ```python
 # No **kwargs → extra="forbid" → strict validation
@@ -342,11 +399,17 @@ class StrictProvider(Base):
         ...
 # → Unknown fields are rejected
 
-# Has **kwargs → extra="allow" → lenient validation
-class FlexibleProvider(Base):
+# Has **kwargs, fully resolved MRO chain → extra="forbid"
+class FullProvider(Base):
     def __init__(self, *, model_id: str, **kwargs):
-        ...
-# → Unknown fields are passed through
+        super().__init__(**kwargs)
+# → Parent params are collected, all params known → strict
+
+# Has **kwargs, MRO chain truncated (scope/depth) → extra="allow"
+class PartialProvider(ThirdPartyBase):
+    def __init__(self, *, model_id: str, **kwargs):
+        super().__init__(**kwargs)
+# → Some params may be unknown → lenient
 ```
 
 ---
@@ -418,7 +481,7 @@ layers:
 
 | API | Purpose |
 |-----|---------|
-| `create_registrar(name, protocol, ...)` | Create a layer registrar (recommended entry point) |
+| `create_registrar(name, protocol, ..., mro_scope, mro_depth)` | Create a layer registrar (recommended entry point) |
 | `Registrar.get(key)` | Look up a registered class |
 | `Registrar.keys()` | List all registered keys |
 | `Registrar.bridge(external_cls)` | Create bridge for external class |
@@ -429,11 +492,12 @@ layers:
 
 | API | Purpose |
 |-----|---------|
-| `extract_config_schema(cls)` | Extract Pydantic model from `__init__` |
+| `extract_config_schema(cls, mro_scope, mro_depth)` | Extract Pydantic model from `__init__` (with MRO `**kwargs` resolution) |
 | `build_layer_config(registrar)` | Build discriminated union for a layer |
 | `generate_layer_config_source(result)` | Generate Python stub source code |
 | `generate_layer_json_schema(result)` | Generate JSON Schema for YAML editors |
 | `compute_registry_fingerprint(registrar)` | Compute registry fingerprint hash |
+| `MROScope` | Type alias: `Literal["local", "third_party", "all"]` |
 
 ---
 

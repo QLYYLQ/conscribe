@@ -67,8 +67,14 @@ def build_layer_config(registrar: type) -> LayerConfigResult:
 
     per_key_models: dict[str, type[BaseModel]] = {}
 
+    # Read MRO config from the registrar
+    reg_mro_scope = getattr(registrar, "_mro_scope", "local")
+    reg_mro_depth = getattr(registrar, "_mro_depth", None)
+
     for key, cls in all_classes.items():
-        schema = extract_config_schema(cls)
+        schema = extract_config_schema(
+            cls, mro_scope=reg_mro_scope, mro_depth=reg_mro_depth,
+        )
         model_name = _build_model_name(key, layer_name)
 
         if schema is None:

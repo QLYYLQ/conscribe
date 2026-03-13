@@ -14,6 +14,7 @@ from conscribe.config.fingerprint import (
     save_fingerprint,
 )
 from conscribe.config.json_schema import generate_layer_json_schema
+from conscribe.config.mro import MROScope
 
 __all__ = [
     "extract_config_schema",
@@ -24,4 +25,5 @@ __all__ = [
     "compute_registry_fingerprint",
     "load_cached_fingerprint",
     "save_fingerprint",
+    "MROScope",
 ]
