@@ -8,6 +8,8 @@ See ``config-typing-design.md`` Section 6.1 for specification.
 """
 from __future__ import annotations
 
+import sys
+import types
 from typing import Annotated, Any, Literal, Union, get_args, get_origin
 
 from pydantic import BaseModel
@@ -15,6 +17,11 @@ from pydantic.fields import FieldInfo
 from pydantic_core import PydanticUndefined
 
 from conscribe.config.builder import LayerConfigResult
+
+# types.UnionType is the runtime type for PEP 604 `X | Y` syntax (Python 3.10+)
+_UNION_TYPES: tuple[type, ...] = (Union,)
+if sys.version_info >= (3, 10):
+    _UNION_TYPES = (Union, types.UnionType)
 
 # Constraint types from annotated_types (used by Pydantic's Annotated metadata)
 try:
@@ -127,7 +134,7 @@ def _generate_imports(result: LayerConfigResult) -> str:
 def _collect_type_imports(tp: Any, imports: set[str]) -> None:
     """Collect typing imports needed for a type annotation."""
     origin = get_origin(tp)
-    if origin is Union:
+    if origin in _UNION_TYPES:
         args = get_args(tp)
         if len(args) == 2 and type(None) in args:
             imports.add("Optional")
@@ -235,8 +242,8 @@ def _type_to_source(tp: Any) -> str:
         args_str = ", ".join(_value_to_source(a) for a in args)
         return f"Literal[{args_str}]"
 
-    # Handle Union (including Optional)
-    if origin is Union:
+    # Handle Union (including Optional and PEP 604 X | Y)
+    if origin in _UNION_TYPES:
         args = get_args(tp)
         if len(args) == 2 and type(None) in args:
             # Optional[T]
