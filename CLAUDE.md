@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Conscribe** (`conscribe` package, v0.1.2) — A Python library for automatic class registration and config typing stub generation for layered Python architectures. It targets framework developers building config-driven frameworks with pluggable layers (agents, LLM providers, etc.).
+**Conscribe** (`conscribe` package, v0.3.0) — A Python library for automatic class registration and config typing stub generation for layered Python architectures. It targets framework developers building config-driven frameworks with pluggable layers (agents, LLM providers, etc.).
 
 Two core capabilities:
 1. **Auto-registration**: Classes inheriting a base are automatically registered in their layer's registry (via metaclass). Also supports bridging external classes and explicit `@register` decorators.
@@ -46,8 +46,10 @@ pytest is pre-configured in `pyproject.toml` with `--cov=conscribe --cov-report=
 - Pipeline: **extract** → **build** → **generate**
 - `extractor.py` — `extract_config_schema()` reflects `__init__` signatures into Pydantic models. Three tiers: Tier 1 (types+defaults), Tier 1.5 (+docstring descriptions), Tier 2 (+Annotated metadata), Tier 3 (explicit `__config_schema__`). MRO-aware. Supports `mro_scope` and `mro_depth` params for `**kwargs` chain resolution.
 - `mro.py` — `collect_mro_params()` walks the MRO upward when `__init__` has `**kwargs`, collecting parent parameters. `classify_class_scope()` determines whether a class is local/third_party/stdlib. `MROScope` type alias (`"local" | "third_party" | "all"`).
-- `builder.py` — `build_layer_config()` creates discriminated unions by injecting `Literal[key]` discriminator fields. Passes registrar-level `mro_scope`/`mro_depth` to extraction.
-- `codegen.py` — `generate_layer_config_source()` outputs self-contained `.py` stub files.
+- `degradation.py` — Type degradation for Pydantic-incompatible field types. When MRO traversal reaches third-party classes with types Pydantic can't serialize (e.g., `httpx.Auth`), degrades them to `Any` while preserving field names and defaults. `DegradedField` dataclass records what was degraded. Try-first approach: zero overhead on happy path.
+- `builder.py` — `build_layer_config()` creates discriminated unions by injecting `Literal[key]` discriminator fields. Passes registrar-level `mro_scope`/`mro_depth` to extraction. `LayerConfigResult` includes `degraded_fields` dict for downstream warning generation.
+- `codegen.py` — `generate_layer_config_source()` outputs self-contained `.py` stub files. Includes WARNING header and inline `# degraded from:` comments when fields were degraded.
+- `json_schema.py` — `generate_layer_json_schema()` outputs JSON Schema dicts. Injects `x-degraded-fields` extension and per-property `description`/`x-degraded-from` annotations for IDE hover support when fields were degraded.
 - `fingerprint.py` — Hashes registry state (keys, qualnames, signatures, docstrings) for auto-freshness detection. When `**kwargs` is present, also hashes parent class signatures along the MRO chain.
 
 **Discovery** (`conscribe/discover.py`): Recursively imports modules to trigger metaclass registration. Optionally auto-regenerates stubs if fingerprint is stale.
@@ -60,6 +62,7 @@ pytest is pre-configured in `pyproject.toml` with `--cov=conscribe --cov-report=
 - `__config_annotated_only__` — Only include parameters with `Annotated[..., Field(...)]`.
 - `__config_mro_scope__` — Per-class override for MRO traversal scope (`"local"`, `"third_party"`, `"all"`).
 - `__config_mro_depth__` — Per-class override for MRO traversal depth (int or None).
+- `__degraded_fields__` — Attached to dynamically created models by `extract_config_schema()` when field types were degraded to `Any`. List of `DegradedField` instances. Only present when degradation occurred (zero overhead on happy path).
 
 ### Bridge Metaclass Conflict Resolution
 
