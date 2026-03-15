@@ -365,6 +365,24 @@ The `mro_scope` parameter controls which classes in the MRO are included:
 | `"local"` (default) | Only your project code | Safe default — ignores third-party internals |
 | `"third_party"` | + site-packages | Include params from libraries you depend on |
 | `"all"` | Everything except `object` | Full traversal for maximum schema completeness |
+| `["httpx", "pydantic"]` | Your code + only the listed packages | Precise control — traverse into specific libraries only |
+
+The `list[str]` form is the most practical for real-world use: you know which third-party base classes your implementations extend, so you list exactly those packages. Local classes always pass the filter; stdlib classes are always excluded.
+
+```python
+# Only traverse into httpx and my_sdk, ignore all other third-party
+LLMRegistrar = create_registrar(
+    "llm", proto,
+    mro_scope=["httpx", "my_sdk"],
+)
+
+# Per-class override with package list
+class MyClient(HttpxBridge):
+    __config_mro_scope__ = ["httpx"]
+
+    def __init__(self, *, api_key: str, **kwargs):
+        super().__init__(**kwargs)
+```
 
 #### Configuration Levels
 
@@ -375,11 +393,11 @@ MRO scope and depth can be set at three levels (highest priority wins):
 extract_config_schema(cls, mro_scope="local", mro_depth=None)
 
 # 2. Registrar-level
-create_registrar("agent", proto, mro_scope="all", mro_depth=2)
+create_registrar("agent", proto, mro_scope=["httpx"], mro_depth=2)
 
 # 3. Per-class override (highest priority)
 class MyAgent(BaseAgent):
-    __config_mro_scope__ = "all"
+    __config_mro_scope__ = ["httpx", "my_sdk"]
     __config_mro_depth__ = 1
 
     def __init__(self, z: float, **kwargs):
@@ -540,7 +558,7 @@ layers:
 | `generate_layer_json_schema(result)` | Generate JSON Schema for YAML editors |
 | `compute_registry_fingerprint(registrar)` | Compute registry fingerprint hash |
 | `DegradedField` | Dataclass recording a field degraded to `Any` |
-| `MROScope` | Type alias: `Literal["local", "third_party", "all"]` |
+| `MROScope` | Type alias: `Literal["local", "third_party", "all"] \| list[str]` |
 
 ---
 
