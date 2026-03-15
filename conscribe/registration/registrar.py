@@ -49,7 +49,7 @@ class LayerRegistrar(Generic[P]):
     Meta: type
     _key_transform: KeyTransform
     discriminator_field: str
-    _mro_scope: str
+    _mro_scope: Union[str, list[str]]
     _mro_depth: Union[int, None]
 
     # ── Query API ──
@@ -248,7 +248,7 @@ def create_registrar(
     strip_prefixes: Optional[list[str]] = None,
     key_transform: Optional[KeyTransform] = None,
     base_metaclass: type = type,
-    mro_scope: str = "local",
+    mro_scope: Union[str, list[str]] = "local",
     mro_depth: Optional[int] = None,
 ) -> type:
     """One-line factory to create a Layer-specific Registrar class.
@@ -263,8 +263,9 @@ def create_registrar(
         strip_prefixes: Prefixes to strip during key inference.
         key_transform: Fully custom key inference function (highest priority).
         base_metaclass: Parent metaclass for AutoRegistrar.
-        mro_scope: Scope for MRO parameter collection (``"local"``,
-            ``"third_party"``, or ``"all"``).
+        mro_scope: Scope for MRO parameter collection.  Accepts
+            ``"local"``, ``"third_party"``, ``"all"``, or a
+            ``list[str]`` of package names (local + listed packages).
         mro_depth: Max MRO levels to traverse for parameter collection.
             ``None`` means unlimited.
 

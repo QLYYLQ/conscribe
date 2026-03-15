@@ -509,3 +509,146 @@ class TestMultiLayerIndependentBuild:
         # Cross-layer isolation: LLM union should not accept agent configs
         with pytest.raises(ValidationError):
             llm_adapter.validate_python({"name": "smart", "max_steps": 50})
+
+
+# ===================================================================
+# Test: Package-specific MRO scope (list[str]) end-to-end
+# ===================================================================
+
+class TestPackageListScopeEndToEnd:
+    """End-to-end: create_registrar with mro_scope=list[str], build config."""
+
+    def test_mro_scope_list_in_registrar(self) -> None:
+        """create_registrar(..., mro_scope=['pydantic']) propagates to build."""
+        LR = create_registrar(
+            "llm", LLMProtocol,
+            strip_suffixes=["Provider"],
+            discriminator_field="provider",
+            mro_scope=["pydantic"],
+        )
+
+        class BaseLLM(metaclass=LR.Meta):
+            __abstract__ = True
+            async def chat(self, messages: list[dict]) -> str: ...
+
+        class SimpleProvider(BaseLLM):
+            def __init__(self, *, model_id: str, temperature: float = 0.0):
+                self.model_id = model_id
+                self.temperature = temperature
+
+            async def chat(self, messages: list[dict]) -> str:
+                return "simple"
+
+        # Should build without errors
+        result = build_layer_config(LR)
+        assert isinstance(result, LayerConfigResult)
+        assert "simple" in result.per_key_models
+
+        # get_config_schema should also work with list scope
+        schema = LR.get_config_schema("simple")
+        assert schema is not None
+        assert "model_id" in schema.model_fields
+        assert "temperature" in schema.model_fields
+
+
+# ===================================================================
+# Test: Degradation end-to-end
+# ===================================================================
+
+
+class _IncompatibleType:
+    """A type Pydantic cannot serialize."""
+
+    def __init__(self, x: int):
+        self.x = x
+
+
+class TestDegradationEndToEnd:
+    """End-to-end: register class with incompatible param, build, codegen/json_schema."""
+
+    def test_full_pipeline_with_degradation(self) -> None:
+        """Register -> extract -> build -> codegen -> verify warning."""
+        from typing import Any
+
+        LR = create_registrar(
+            "transport", LLMProtocol,
+            strip_suffixes=["Transport"],
+            discriminator_field="type",
+        )
+
+        class BaseTransport(metaclass=LR.Meta):
+            __abstract__ = True
+            async def chat(self, messages: list[dict]) -> str: ...
+
+        class HttpxTransport(BaseTransport):
+            def __init__(
+                self,
+                *,
+                api_key: str,
+                auth: _IncompatibleType,
+                base_url: str = "",
+            ):
+                self.api_key = api_key
+                self.auth = auth
+                self.base_url = base_url
+
+            async def chat(self, messages: list[dict]) -> str:
+                return "httpx"
+
+        # Build
+        result = build_layer_config(LR)
+        assert "httpx" in result.per_key_models
+
+        # Degraded fields should be present
+        assert "httpx" in result.degraded_fields
+        field_names = [df.field_name for df in result.degraded_fields["httpx"]]
+        assert "auth" in field_names
+
+        # Codegen
+        source = generate_layer_config_source(result)
+        assert "WARNING" in source
+        assert "# degraded from:" in source
+
+        # Source should compile and execute
+        ns: dict = {}
+        exec(compile(source, "<test-degradation>", "exec"), ns)  # noqa: S102
+
+        model_cls = ns.get("HttpxTransportConfig")
+        assert model_cls is not None
+
+        # Should validate with any value for degraded auth field
+        instance = model_cls(type="httpx", api_key="sk-123", auth="any")
+        assert instance.api_key == "sk-123"
+
+    def test_full_pipeline_degradation_json_schema(self) -> None:
+        """Register -> build -> json_schema -> verify x-degraded-fields."""
+        LR = create_registrar(
+            "transport", LLMProtocol,
+            strip_suffixes=["Transport"],
+            discriminator_field="type",
+        )
+
+        class BaseTransport(metaclass=LR.Meta):
+            __abstract__ = True
+            async def chat(self, messages: list[dict]) -> str: ...
+
+        class HttpxTransport(BaseTransport):
+            def __init__(
+                self,
+                *,
+                api_key: str,
+                auth: _IncompatibleType,
+                base_url: str = "",
+            ):
+                self.api_key = api_key
+                self.auth = auth
+                self.base_url = base_url
+
+            async def chat(self, messages: list[dict]) -> str:
+                return "httpx"
+
+        result = build_layer_config(LR)
+        schema = generate_layer_json_schema(result)
+
+        assert "x-degraded-fields" in schema
+        assert "httpx" in schema["x-degraded-fields"]

@@ -8,17 +8,20 @@ Scope controls which classes in the MRO are included:
 - ``"local"``: only classes NOT in site-packages (default)
 - ``"third_party"``: include site-packages, exclude stdlib
 - ``"all"``: all classes except ``object``
+- ``list[str]``: local classes + only the listed third-party packages
+  (e.g., ``["pydantic", "my_sdk"]``).  Stdlib is always excluded.
 """
 from __future__ import annotations
 
 import inspect
+import pathlib
 import sysconfig
 from dataclasses import dataclass, field
 from typing import Any, Literal, Union
 
 from conscribe.config._utils import find_init_definer
 
-MROScope = Literal["local", "third_party", "all"]
+MROScope = Union[Literal["local", "third_party", "all"], list[str]]
 
 
 @dataclass(frozen=True)
@@ -86,8 +89,12 @@ def collect_mro_params(
 
     Args:
         cls: The class whose MRO to walk.
-        scope: Which classes to include (``"local"``, ``"third_party"``,
-            or ``"all"``).
+        scope: Which classes to include.  String values ``"local"``,
+            ``"third_party"``, or ``"all"`` behave as before.  A
+            ``list[str]`` of package names includes local classes plus
+            only third-party classes whose top-level package name is in
+            the list (e.g., ``["pydantic", "my_sdk"]``).  Stdlib is
+            always excluded when a list is used.
         depth: Maximum number of MRO levels to traverse.  ``None`` means
             unlimited.  ``0`` disables MRO traversal entirely.
 
@@ -256,21 +263,66 @@ def _extract_class_params(
     return params, hints
 
 
+def _extract_package_name(cls: type) -> Union[str, None]:
+    """Extract the top-level package name for a third-party class.
+
+    Uses ``inspect.getfile()`` to locate the source file, then looks for
+    ``"site-packages"`` in the path components.  The component immediately
+    after ``site-packages`` is taken as the top-level package name (with
+    ``.py`` stripped for single-file packages).
+
+    Returns:
+        The top-level package name (e.g., ``"pydantic"``), or ``None``
+        if the class is not from site-packages or has no source file.
+    """
+    try:
+        source_file = inspect.getfile(cls)
+    except (TypeError, OSError):
+        return None
+
+    parts = pathlib.PurePath(source_file).parts
+    try:
+        idx = parts.index("site-packages")
+    except ValueError:
+        return None
+
+    if idx + 1 >= len(parts):
+        return None
+
+    pkg = parts[idx + 1]
+    # Single-file packages: e.g., "six.py" → "six"
+    if pkg.endswith(".py"):
+        pkg = pkg[:-3]
+    return pkg
+
+
 def _should_include_class(cls: type, scope: MROScope) -> bool:
     """Check whether a class should be included given the scope."""
-    if scope == "all":
-        return True
+    # String scopes: existing logic unchanged
+    if isinstance(scope, str):
+        if scope == "all":
+            return True
 
+        cls_scope = classify_class_scope(cls)
+
+        if cls_scope == "stdlib":
+            return False
+
+        if scope == "local":
+            return cls_scope == "local"
+
+        # scope == "third_party": include local + third_party
+        return cls_scope in ("local", "third_party")
+
+    # List scope: local + specified packages only
     cls_scope = classify_class_scope(cls)
-
+    if cls_scope == "local":
+        return True
     if cls_scope == "stdlib":
         return False
-
-    if scope == "local":
-        return cls_scope == "local"
-
-    # scope == "third_party": include local + third_party
-    return cls_scope in ("local", "third_party")
+    # third_party: check package name
+    pkg = _extract_package_name(cls)
+    return pkg is not None and pkg in scope
 
 
 _stdlib_paths_cache: Union[list[str], None] = None

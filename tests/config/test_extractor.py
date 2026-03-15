@@ -1121,3 +1121,98 @@ class TestMROKwargsResolution:
         # fully_resolved = True (reached object), so extra='forbid'
         # Actually, no mro_result.params means we fall through to has_var check
         assert "z" in result.model_fields
+
+    def test_scope_list_collects_specified_package(self) -> None:
+        """mro_scope=['pydantic'] collects pydantic parent params."""
+        from pydantic import BaseModel
+
+        class Child(BaseModel):
+            z: float
+
+            def __init__(self, z: float, **kwargs: Any):
+                super().__init__(z=z, **kwargs)
+
+        result = extract_config_schema(Child, mro_scope=["pydantic"])
+        assert result is not None
+        assert "z" in result.model_fields
+
+    def test_class_level_mro_scope_list_override(self) -> None:
+        """__config_mro_scope__ = ['pydantic'] overrides function-level scope."""
+
+        class _ListScopeChild(_MROParent):
+            __config_mro_scope__ = ["anything"]
+
+            def __init__(self, z: float, **kwargs: Any):
+                super().__init__(**kwargs)
+
+        # Despite mro_scope="local", the class-level override with list applies
+        result = extract_config_schema(_ListScopeChild, mro_scope="local")
+        assert result is not None
+        # _MROParent is local, so included regardless
+        assert "x" in result.model_fields
+        assert "y" in result.model_fields
+
+
+# ===================================================================
+# Type degradation
+# ===================================================================
+
+
+class _IncompatibleType:
+    """A type Pydantic cannot serialize."""
+
+    def __init__(self, x: int):
+        self.x = x
+
+
+class _ClassWithIncompatibleParam:
+    def __init__(self, name: str, auth: _IncompatibleType, count: int = 0):
+        pass
+
+
+class _ClassAllCompatible:
+    def __init__(self, name: str, count: int = 0, flag: bool = True):
+        pass
+
+
+class TestTypeDegradation:
+    """Tests for type degradation when Pydantic can't handle a field type."""
+
+    def test_incompatible_type_degraded(self) -> None:
+        """Class with an incompatible param returns schema with field as Any."""
+        result = extract_config_schema(_ClassWithIncompatibleParam)
+        assert result is not None
+        assert "auth" in result.model_fields
+        assert "name" in result.model_fields
+        assert "count" in result.model_fields
+        # auth should be degraded to Any
+        assert result.model_fields["auth"].annotation is Any
+
+    def test_degraded_fields_metadata_attached(self) -> None:
+        """model.__degraded_fields__ exists and contains correct info."""
+        result = extract_config_schema(_ClassWithIncompatibleParam)
+        assert result is not None
+        degraded = getattr(result, "__degraded_fields__", None)
+        assert degraded is not None
+        assert len(degraded) >= 1
+        field_names = [df.field_name for df in degraded]
+        assert "auth" in field_names
+        # original type repr should mention _IncompatibleType
+        auth_df = [df for df in degraded if df.field_name == "auth"][0]
+        assert "_IncompatibleType" in auth_df.original_type_repr
+
+    def test_compatible_class_no_degradation(self) -> None:
+        """Class with all compatible types has no __degraded_fields__."""
+        result = extract_config_schema(_ClassAllCompatible)
+        assert result is not None
+        degraded = getattr(result, "__degraded_fields__", None)
+        assert degraded is None
+
+    def test_degraded_model_validates(self) -> None:
+        """Degraded model can validate data (Any accepts anything)."""
+        result = extract_config_schema(_ClassWithIncompatibleParam)
+        assert result is not None
+        instance = result(name="test", auth="any_value", count=5)
+        assert instance.name == "test"
+        assert instance.auth == "any_value"
+        assert instance.count == 5

@@ -26,12 +26,17 @@ class LayerConfigResult:
         per_key_models: Dict mapping registry key to its per-key Pydantic model.
         layer_name: The layer name from the registrar (e.g. ``"llm"``).
         discriminator_field: The discriminator field name (e.g. ``"provider"``).
+        degraded_fields: Dict mapping registry key to list of
+            :class:`~conscribe.config.degradation.DegradedField` for fields
+            whose types were degraded to ``Any``.  Empty dict when no
+            degradation occurred (default).
     """
 
     union_type: Any
     per_key_models: dict[str, type[BaseModel]]
     layer_name: str
     discriminator_field: str
+    degraded_fields: dict[str, list[Any]] = dataclasses.field(default_factory=dict)
 
 
 def build_layer_config(registrar: type) -> LayerConfigResult:
@@ -66,6 +71,7 @@ def build_layer_config(registrar: type) -> LayerConfigResult:
     all_classes = registrar.get_all()
 
     per_key_models: dict[str, type[BaseModel]] = {}
+    all_degraded: dict[str, list[Any]] = {}
 
     # Read MRO config from the registrar
     reg_mro_scope = getattr(registrar, "_mro_scope", "local")
@@ -80,11 +86,17 @@ def build_layer_config(registrar: type) -> LayerConfigResult:
         if schema is None:
             # No extractable params — create discriminator-only model
             model = _create_discriminator_only_model(model_name, disc_field, key)
+            schema_degraded = None
         else:
+            # Read degraded fields BEFORE _inject_discriminator (which
+            # rebuilds the model and would lose the custom attribute).
+            schema_degraded = getattr(schema, "__degraded_fields__", None)
             # Inject discriminator into existing schema
             model = _inject_discriminator(schema, model_name, disc_field, key)
 
         per_key_models[key] = model
+        if schema_degraded:
+            all_degraded[key] = schema_degraded
 
     # Build union type
     if len(per_key_models) == 1:
@@ -100,6 +112,7 @@ def build_layer_config(registrar: type) -> LayerConfigResult:
         per_key_models=per_key_models,
         layer_name=layer_name,
         discriminator_field=disc_field,
+        degraded_fields=all_degraded,
     )
 
 

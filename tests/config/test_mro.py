@@ -21,6 +21,7 @@ import pytest
 
 from conscribe.config.mro import (
     MROCollectionResult,
+    _extract_package_name,
     classify_class_scope,
     collect_mro_params,
 )
@@ -401,3 +402,131 @@ class TestCollectMROParamsEdgeCases:
         result = MROCollectionResult()
         with pytest.raises(AttributeError):
             result.fully_resolved = False  # type: ignore[misc]
+
+
+# ===================================================================
+# _extract_package_name
+# ===================================================================
+
+class TestExtractPackageName:
+    """Tests for _extract_package_name()."""
+
+    def test_third_party_class(self) -> None:
+        """A third-party class returns its top-level package name."""
+        from pydantic import BaseModel
+
+        assert _extract_package_name(BaseModel) == "pydantic"
+
+    def test_local_class(self) -> None:
+        """A locally defined class returns None."""
+
+        class LocalClass:
+            pass
+
+        assert _extract_package_name(LocalClass) is None
+
+    def test_stdlib_class(self) -> None:
+        """A stdlib/builtin class returns None (no file or no site-packages)."""
+        assert _extract_package_name(int) is None
+        assert _extract_package_name(dict) is None
+
+
+# ===================================================================
+# collect_mro_params — package list scope
+# ===================================================================
+
+class TestPackageListScope:
+    """Tests for list[str] scope (package-specific filtering)."""
+
+    def test_scope_list_includes_specified_package(self) -> None:
+        """scope=['pydantic'] includes pydantic parent params."""
+        from pydantic import BaseModel
+
+        class Child(BaseModel):
+            z: float
+
+            def __init__(self, z: float, **kwargs: Any):
+                super().__init__(z=z, **kwargs)
+
+        result = collect_mro_params(Child, scope=["pydantic"])
+        # BaseModel is pydantic, should be included
+        # At minimum the chain should not be truncated by package filter
+        # (may still be truncated by other reasons)
+        # Check that we traversed into pydantic
+        assert any(
+            classify_class_scope(cls) == "third_party"
+            for cls in result.init_definers
+        ) or result.fully_resolved
+
+    def test_scope_list_excludes_unspecified_package(self) -> None:
+        """scope=['some_other'] excludes pydantic parent."""
+        from pydantic import BaseModel
+
+        class Child(BaseModel):
+            z: float
+
+            def __init__(self, z: float, **kwargs: Any):
+                super().__init__(z=z, **kwargs)
+
+        result = collect_mro_params(Child, scope=["some_other"])
+        # BaseModel is pydantic, not in ["some_other"], should be excluded
+        assert result.fully_resolved is False
+        # No pydantic classes in init_definers
+        for cls in result.init_definers:
+            assert classify_class_scope(cls) != "third_party"
+
+    def test_scope_list_always_includes_local(self) -> None:
+        """Local classes always pass the filter with list scope."""
+
+        class Parent:
+            def __init__(self, x: int):
+                pass
+
+        class Child(Parent):
+            def __init__(self, z: float, **kwargs: Any):
+                super().__init__(**kwargs)
+
+        result = collect_mro_params(Child, scope=["anything"])
+        param_names = [p.name for p in result.params]
+        assert "x" in param_names
+        assert result.fully_resolved is True
+
+    def test_scope_list_excludes_stdlib(self) -> None:
+        """Stdlib classes are always excluded with list scope."""
+
+        class Child(Exception):
+            def __init__(self, msg: str, **kwargs: Any):
+                super().__init__(msg, **kwargs)
+
+        result = collect_mro_params(Child, scope=["builtins"])
+        # Exception is stdlib, should be excluded regardless of list contents
+        assert result.fully_resolved is False
+
+    def test_scope_list_empty_excludes_all_third_party(self) -> None:
+        """scope=[] effectively means local-only (all third-party excluded)."""
+        from pydantic import BaseModel
+
+        class Child(BaseModel):
+            z: float
+
+            def __init__(self, z: float, **kwargs: Any):
+                super().__init__(z=z, **kwargs)
+
+        result = collect_mro_params(Child, scope=[])
+        # Empty list: no third-party packages included
+        assert result.fully_resolved is False
+        for cls in result.init_definers:
+            assert classify_class_scope(cls) != "third_party"
+
+    def test_scope_list_truncation_not_fully_resolved(self) -> None:
+        """Truncation by package filter sets fully_resolved=False."""
+        from pydantic import BaseModel
+
+        class Child(BaseModel):
+            z: float
+
+            def __init__(self, z: float, **kwargs: Any):
+                super().__init__(z=z, **kwargs)
+
+        result = collect_mro_params(Child, scope=["nonexistent_pkg"])
+        assert result.fully_resolved is False

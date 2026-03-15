@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from conscribe.config.builder import LayerConfigResult, build_layer_config
 from conscribe.config.codegen import generate_layer_config_source
+from conscribe.config.degradation import DegradedField
 from conscribe.config.extractor import extract_config_schema
 from conscribe.config.fingerprint import (
     compute_registry_fingerprint,
@@ -20,6 +21,7 @@ __all__ = [
     "extract_config_schema",
     "build_layer_config",
     "LayerConfigResult",
+    "DegradedField",
     "generate_layer_config_source",
     "generate_layer_json_schema",
     "compute_registry_fingerprint",

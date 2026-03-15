@@ -1027,3 +1027,78 @@ class TestValidity:
         # The alias should contain the layer name in some form
         # "LlmConfig" or "LLMConfig" or similar
         assert "LlmConfig" in source or "LLMConfig" in source
+
+
+# ===================================================================
+# Degraded field rendering tests
+# ===================================================================
+
+class _IncompatibleType:
+    """A type Pydantic cannot serialize."""
+
+    def __init__(self, x: int):
+        self.x = x
+
+
+_degraded_codegen_reg = create_registrar(
+    "llm", _LLMProto, discriminator_field="provider",
+)
+
+
+class _DegradedCodegenBase(metaclass=_degraded_codegen_reg.Meta):
+    __abstract__ = True
+    async def chat(self, messages: list[dict]) -> str:
+        return ""
+
+
+class DegradedCodegenProvider(_DegradedCodegenBase):
+    __registry_key__ = "degraded"
+
+    def __init__(self, *, model_id: str, auth: _IncompatibleType, count: int = 0):
+        self.model_id = model_id
+        self.auth = auth
+        self.count = count
+
+
+class TestDegradedFieldRendering:
+    """Tests for degraded field rendering in generated source."""
+
+    def test_inline_comment_on_degraded_field(self) -> None:
+        """Generated source contains '# degraded from:' for degraded fields."""
+        result = build_layer_config(_degraded_codegen_reg)
+        source = generate_layer_config_source(result)
+
+        assert "# degraded from:" in source
+
+    def test_header_warning_section(self) -> None:
+        """Generated source header contains WARNING section."""
+        result = build_layer_config(_degraded_codegen_reg)
+        source = generate_layer_config_source(result)
+
+        assert "WARNING" in source
+        assert "degraded to Any" in source
+
+    def test_no_warning_on_clean_build(self) -> None:
+        """No WARNING in header when there are no degraded fields."""
+        result = build_layer_config(_single_reg)
+        source = generate_layer_config_source(result)
+
+        assert "WARNING" not in source
+
+    def test_degraded_source_compiles(self) -> None:
+        """Generated source with degraded fields compiles and executes."""
+        result = build_layer_config(_degraded_codegen_reg)
+        source = generate_layer_config_source(result)
+
+        code = compile(source, "<test-degraded>", "exec")
+        ns: dict[str, Any] = {}
+        exec(code, ns)  # noqa: S102
+
+        # The model should be present and be a BaseModel subclass
+        model_cls = ns.get("DegradedLLMConfig")
+        assert model_cls is not None
+        assert issubclass(model_cls, BaseModel)
+
+        # Should validate with any value for the degraded field
+        instance = model_cls(provider="degraded", model_id="test", auth="any_value")
+        assert instance.model_id == "test"

@@ -24,6 +24,7 @@ from conscribe.registration import (
     make_key_transform,
 )
 from conscribe.config import (
+    DegradedField,
     LayerConfigResult,
     MROScope,
     build_layer_config,
@@ -52,6 +53,7 @@ __all__ = [
     "extract_config_schema",
     "build_layer_config",
     "LayerConfigResult",
+    "DegradedField",
     "generate_layer_config_source",
     "generate_layer_json_schema",
     "compute_registry_fingerprint",

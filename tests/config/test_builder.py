@@ -587,3 +587,62 @@ class TestValidation:
                     "temperature": 0.5,
                 }
             )
+
+
+# ===================================================================
+# Degraded fields propagation tests
+# ===================================================================
+
+class _IncompatibleType:
+    """A type Pydantic cannot serialize."""
+
+    def __init__(self, x: int):
+        self.x = x
+
+
+_degraded_reg = create_registrar(
+    "llm", _LLMProto, discriminator_field="provider",
+)
+
+
+class _DegradedBase(metaclass=_degraded_reg.Meta):
+    __abstract__ = True
+    async def chat(self, messages: list[dict]) -> str:
+        return ""
+
+
+class DegradedProvider(_DegradedBase):
+    """Implementation with an incompatible param type."""
+    __registry_key__ = "degraded"
+
+    def __init__(self, *, model_id: str, auth: _IncompatibleType, count: int = 0):
+        self.model_id = model_id
+        self.auth = auth
+        self.count = count
+
+
+class TestDegradedFieldsPropagation:
+    """Tests that degraded fields propagate through build_layer_config."""
+
+    def test_degraded_fields_in_result(self) -> None:
+        """LayerConfigResult.degraded_fields contains degraded field info."""
+        result = build_layer_config(_degraded_reg)
+        assert "degraded" in result.degraded_fields
+        field_names = [df.field_name for df in result.degraded_fields["degraded"]]
+        assert "auth" in field_names
+
+    def test_no_degraded_fields_default_empty(self) -> None:
+        """No degradation produces empty degraded_fields dict."""
+        result = build_layer_config(_single_llm_reg)
+        assert result.degraded_fields == {}
+
+    def test_backward_compat(self) -> None:
+        """Old code constructing LayerConfigResult without degraded_fields works."""
+        # Should not raise — degraded_fields has a default
+        r = LayerConfigResult(
+            union_type=str,
+            per_key_models={},
+            layer_name="test",
+            discriminator_field="type",
+        )
+        assert r.degraded_fields == {}

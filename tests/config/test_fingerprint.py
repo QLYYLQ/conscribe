@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 import pytest
 
@@ -696,3 +696,154 @@ class TestEndToEndRoundtrip:
 
         cached = load_cached_fingerprint(fp_file, "llm")
         assert cached != fp_added
+
+
+# ===================================================================
+# MRO **kwargs chain fingerprint tests
+# ===================================================================
+
+# -- Registrar A: child with **kwargs, parent has param_a --
+
+_mro_fp_reg_a = create_registrar(
+    "llm", _LLMProto, discriminator_field="provider",
+)
+
+
+class _MROFPParentA:
+    """Parent with some params.
+
+    Args:
+        param_a: A parent parameter.
+    """
+
+    def __init__(self, *, param_a: int = 10):
+        self.param_a = param_a
+
+
+class _MROFPBaseA(metaclass=_mro_fp_reg_a.Meta):
+    __abstract__ = True
+
+    async def chat(self, messages: list[dict]) -> str:
+        return ""
+
+
+class MROFPChildA(_MROFPBaseA, _MROFPParentA):
+    """Child with **kwargs forwarding to parent."""
+    __registry_key__ = "mro_child"
+
+    def __init__(self, *, model_id: str, **kwargs: Any):
+        super().__init__(**kwargs)
+        self.model_id = model_id
+
+    async def chat(self, messages: list[dict]) -> str:
+        return "mro_a"
+
+
+# -- Registrar B: same structure but parent has different signature --
+
+_mro_fp_reg_b = create_registrar(
+    "llm", _LLMProto, discriminator_field="provider",
+)
+
+
+class _MROFPParentB:
+    """Parent with different params.
+
+    Args:
+        param_a: A parent parameter.
+        param_b: An extra parent parameter.
+    """
+
+    def __init__(self, *, param_a: int = 10, param_b: str = "new"):
+        self.param_a = param_a
+        self.param_b = param_b
+
+
+class _MROFPBaseB(metaclass=_mro_fp_reg_b.Meta):
+    __abstract__ = True
+
+    async def chat(self, messages: list[dict]) -> str:
+        return ""
+
+
+class MROFPChildB(_MROFPBaseB, _MROFPParentB):
+    """Child with **kwargs forwarding to parent with different sig."""
+    __registry_key__ = "mro_child"
+
+    def __init__(self, *, model_id: str, **kwargs: Any):
+        super().__init__(**kwargs)
+        self.model_id = model_id
+
+    async def chat(self, messages: list[dict]) -> str:
+        return "mro_b"
+
+
+# -- Registrar C: two-level **kwargs chain --
+
+_mro_fp_reg_chain = create_registrar(
+    "llm", _LLMProto, discriminator_field="provider",
+)
+
+
+class _MROFPGrandparent:
+    def __init__(self, *, deep_param: int = 99):
+        self.deep_param = deep_param
+
+
+class _MROFPMiddle(_MROFPGrandparent):
+    def __init__(self, *, mid_param: str = "mid", **kwargs: Any):
+        super().__init__(**kwargs)
+        self.mid_param = mid_param
+
+
+class _MROFPChainBase(metaclass=_mro_fp_reg_chain.Meta):
+    __abstract__ = True
+
+    async def chat(self, messages: list[dict]) -> str:
+        return ""
+
+
+class MROFPChainChild(_MROFPChainBase, _MROFPMiddle):
+    """Two-level **kwargs chain for fingerprint test."""
+    __registry_key__ = "chain"
+
+    def __init__(self, *, model_id: str, **kwargs: Any):
+        super().__init__(**kwargs)
+        self.model_id = model_id
+
+    async def chat(self, messages: list[dict]) -> str:
+        return "chain"
+
+
+class TestMROKwargsFingerprint:
+    """Tests that **kwargs MRO parent signatures are included in fingerprint."""
+
+    def test_kwargs_child_fingerprint_is_deterministic(self) -> None:
+        """Fingerprint of a registrar with **kwargs child is deterministic."""
+        fp1 = compute_registry_fingerprint(_mro_fp_reg_a)
+        fp2 = compute_registry_fingerprint(_mro_fp_reg_a)
+        assert fp1 == fp2
+
+    def test_parent_sig_change_changes_fingerprint(self) -> None:
+        """Changing a parent's __init__ signature (via **kwargs chain)
+        produces a different fingerprint."""
+        fp_a = compute_registry_fingerprint(_mro_fp_reg_a)
+        fp_b = compute_registry_fingerprint(_mro_fp_reg_b)
+        assert fp_a != fp_b
+
+    def test_two_level_chain_fingerprint_valid(self) -> None:
+        """Two-level **kwargs chain produces a valid 16-char hex fingerprint."""
+        fp = compute_registry_fingerprint(_mro_fp_reg_chain)
+        assert isinstance(fp, str)
+        assert len(fp) == 16
+        assert re.fullmatch(r"[0-9a-f]{16}", fp) is not None
+
+    def test_kwargs_vs_no_kwargs_different_fingerprint(self) -> None:
+        """A class with **kwargs and one without produce different fingerprints,
+        even if the child's own params are identical."""
+        # _mro_fp_reg_a has **kwargs child -> hashes parent sigs
+        # _determinism_reg has no **kwargs -> does NOT hash parent sigs
+        fp_kwargs = compute_registry_fingerprint(_mro_fp_reg_a)
+        fp_plain = compute_registry_fingerprint(_determinism_reg)
+        # Different keys/classes, so fingerprints differ
+        assert fp_kwargs != fp_plain

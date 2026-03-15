@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 
 from conscribe import create_registrar
 from conscribe.config.builder import LayerConfigResult, build_layer_config
+from conscribe.config.degradation import DegradedField
 from conscribe.config.json_schema import generate_layer_json_schema
 
 
@@ -721,3 +722,195 @@ class TestTypeRepresentation:
             f"Expected Optional[str] to use anyOf or type list for nullable. "
             f"Got: {desc_prop}"
         )
+
+
+# ===================================================================
+# Degraded fields in JSON Schema
+# ===================================================================
+
+class _IncompatibleType:
+    """A type Pydantic cannot serialize."""
+
+    def __init__(self, x: int):
+        self.x = x
+
+
+_degraded_json_reg = create_registrar(
+    "llm", _LLMProto, discriminator_field="provider",
+)
+
+
+class _DegradedJsonBase(metaclass=_degraded_json_reg.Meta):
+    __abstract__ = True
+    async def chat(self, messages: list[dict]) -> str:
+        return ""
+
+
+class DegradedJsonProvider(_DegradedJsonBase):
+    __registry_key__ = "degraded"
+
+    def __init__(self, *, model_id: str, auth: _IncompatibleType, count: int = 0):
+        self.model_id = model_id
+        self.auth = auth
+        self.count = count
+
+
+class TestDegradedFieldsJsonSchema:
+    """Tests for degraded fields metadata in JSON Schema."""
+
+    def test_x_degraded_fields_present(self) -> None:
+        """JSON schema contains x-degraded-fields when degradation occurred."""
+        result = build_layer_config(_degraded_json_reg)
+        schema = generate_layer_json_schema(result)
+
+        assert "x-degraded-fields" in schema
+        x_degraded = schema["x-degraded-fields"]
+        assert "degraded" in x_degraded
+        field_entries = x_degraded["degraded"]
+        field_names = [e["field"] for e in field_entries]
+        assert "auth" in field_names
+
+    def test_no_degraded_no_extension(self) -> None:
+        """JSON schema does NOT contain x-degraded-fields when no degradation."""
+        result = build_layer_config(_single_reg)
+        schema = generate_layer_json_schema(result)
+
+        assert "x-degraded-fields" not in schema
+
+    def test_degraded_property_has_description(self) -> None:
+        """Degraded field property has a description with [degraded] prefix."""
+        result = build_layer_config(_degraded_json_reg)
+        schema = generate_layer_json_schema(result)
+
+        auth_prop = _find_property_in_schema(schema, "auth")
+        assert auth_prop is not None
+        desc = auth_prop.get("description", "")
+        assert "[degraded]" in desc
+
+    def test_degraded_property_has_x_degraded_from(self) -> None:
+        """Degraded field property has x-degraded-from extension."""
+        result = build_layer_config(_degraded_json_reg)
+        schema = generate_layer_json_schema(result)
+
+        auth_prop = _find_property_in_schema(schema, "auth")
+        assert auth_prop is not None
+        assert "x-degraded-from" in auth_prop
+
+
+# ===================================================================
+# Multi-model degraded JSON Schema ($defs path)
+# ===================================================================
+
+_multi_degraded_reg = create_registrar(
+    "llm", _LLMProto, discriminator_field="provider",
+    strip_suffixes=["Multi"],
+)
+
+
+class _MultiDegradedBase(metaclass=_multi_degraded_reg.Meta):
+    __abstract__ = True
+    async def chat(self, messages: list[dict]) -> str:
+        return ""
+
+
+class DegradedMulti(_MultiDegradedBase):
+    """Provider with an incompatible param for multi-model $defs test."""
+    __registry_key__ = "degraded"
+
+    def __init__(self, *, model_id: str, auth: _IncompatibleType, count: int = 0):
+        self.model_id = model_id
+        self.auth = auth
+        self.count = count
+
+
+class CleanMulti(_MultiDegradedBase):
+    """Provider with all-compatible params."""
+    __registry_key__ = "clean"
+
+    def __init__(self, *, model_id: str, temperature: float = 0.0):
+        self.model_id = model_id
+        self.temperature = temperature
+
+
+class TestDegradedFieldsMultiModelJsonSchema:
+    """Tests for degraded fields in multi-model JSON Schema ($defs path)."""
+
+    def test_multi_model_x_degraded_fields_present(self) -> None:
+        """Multi-model schema has x-degraded-fields with the degraded key."""
+        result = build_layer_config(_multi_degraded_reg)
+        schema = generate_layer_json_schema(result)
+
+        assert "x-degraded-fields" in schema
+        assert "degraded" in schema["x-degraded-fields"]
+        # Clean provider should NOT be in x-degraded-fields
+        assert "clean" not in schema["x-degraded-fields"]
+
+    def test_multi_model_defs_annotated(self) -> None:
+        """In multi-model schema, the degraded model inside $defs has
+        x-degraded-from and description on the degraded property."""
+        result = build_layer_config(_multi_degraded_reg)
+        schema = generate_layer_json_schema(result)
+
+        # Multi-model schema should have $defs
+        assert "$defs" in schema
+
+        auth_prop = _find_property_in_schema(schema, "auth")
+        assert auth_prop is not None
+        assert "x-degraded-from" in auth_prop
+        assert "[degraded]" in auth_prop.get("description", "")
+
+    def test_multi_model_clean_model_not_annotated(self) -> None:
+        """The clean (non-degraded) model in $defs has no x-degraded-from."""
+        result = build_layer_config(_multi_degraded_reg)
+        schema = generate_layer_json_schema(result)
+
+        temp_prop = _find_property_in_schema(schema, "temperature")
+        assert temp_prop is not None
+        assert "x-degraded-from" not in temp_prop
+
+
+# ===================================================================
+# Degraded field with existing description (append path)
+# ===================================================================
+
+_desc_degraded_reg = create_registrar(
+    "llm", _LLMProto, discriminator_field="provider",
+)
+
+
+class _DescDegradedBase(metaclass=_desc_degraded_reg.Meta):
+    __abstract__ = True
+    async def chat(self, messages: list[dict]) -> str:
+        return ""
+
+
+class DescDegradedProvider(_DescDegradedBase):
+    """Provider with a degraded field that has an existing description."""
+    __registry_key__ = "desc_degraded"
+
+    def __init__(
+        self,
+        *,
+        model_id: str,
+        auth: Annotated[_IncompatibleType, Field(description="Authentication handler")],
+    ):
+        self.model_id = model_id
+        self.auth = auth
+
+
+class TestDegradedFieldDescriptionAppend:
+    """Test that degradation info is appended when field already has a description."""
+
+    def test_existing_description_preserved_and_appended(self) -> None:
+        """When a degraded field already has a description, the degradation
+        info is appended rather than replacing it."""
+        result = build_layer_config(_desc_degraded_reg)
+        schema = generate_layer_json_schema(result)
+
+        auth_prop = _find_property_in_schema(schema, "auth")
+        assert auth_prop is not None
+        desc = auth_prop.get("description", "")
+        # Original description should be preserved
+        assert "Authentication handler" in desc
+        # Degradation info should be appended
+        assert "[degraded]" in desc

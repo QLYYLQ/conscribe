@@ -24,7 +24,7 @@ from conscribe.config.docstring import parse_param_descriptions
 
 def extract_config_schema(
     cls: type,
-    mro_scope: str = "local",
+    mro_scope: Union[str, list[str]] = "local",
     mro_depth: Union[int, None] = None,
 ) -> Union[type[BaseModel], None]:
     """Extract config schema from a class.
@@ -40,9 +40,10 @@ def extract_config_schema(
 
     Args:
         cls: The class to extract config schema from.
-        mro_scope: Scope for MRO traversal (``"local"``, ``"third_party"``,
-            or ``"all"``).  Can be overridden per-class via
-            ``__config_mro_scope__``.
+        mro_scope: Scope for MRO traversal.  Accepts ``"local"``,
+            ``"third_party"``, ``"all"``, or a ``list[str]`` of
+            package names (local classes + only the listed packages).
+            Can be overridden per-class via ``__config_mro_scope__``.
         mro_depth: Max MRO levels to traverse.  ``None`` = unlimited.
             Can be overridden per-class via ``__config_mro_depth__``.
 
@@ -215,7 +216,20 @@ def extract_config_schema(
 
     # -- Create dynamic model --
     model_name = f"{cls.__name__}Config"
-    model = _create_dynamic_model(model_name, field_definitions, extra)
+    from pydantic import PydanticSchemaGenerationError, PydanticUserError
+
+    try:
+        model = _create_dynamic_model(model_name, field_definitions, extra)
+    except (PydanticSchemaGenerationError, PydanticUserError):
+        # Pydantic couldn't handle some field types — degrade them to Any
+        from conscribe.config.degradation import degrade_field_definitions
+
+        source_class_name = f"{cls.__module__}.{cls.__qualname__}"
+        field_definitions, degraded = degrade_field_definitions(
+            field_definitions, source_class_name=source_class_name,
+        )
+        model = _create_dynamic_model(model_name, field_definitions, extra)
+        model.__degraded_fields__ = degraded  # type: ignore[attr-defined]
     return model
 
 
