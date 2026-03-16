@@ -1,0 +1,34 @@
+# Conscribe
+
+> Automatic class registration and config typing stub generation for layered Python architectures. Inheritance is registration. `__init__` signature is config schema.
+
+Conscribe targets framework developers building config-driven frameworks with pluggable layers (agents, LLM providers, browser backends, etc.). It eliminates manual registry boilerplate and generates Pydantic-based config schemas from constructor signatures.
+
+- Python >= 3.9, Pydantic v2
+- Two subsystems: registration (metaclass-based) and config typing (signature reflection)
+- Three registration paths: inheritance (auto), bridge (external classes), decorator (manual)
+- Four config tiers: plain `__init__` -> docstring -> Annotated[Field] -> explicit BaseModel
+- Designed and tested for compatibility with mainstream Python frameworks: Pydantic, Django, SQLAlchemy, attrs, dataclasses, and any class hierarchy using standard Python MRO
+- Full usability under complex scenarios: Pydantic BaseModel + Generic[T] multi-inheritance, metaclass conflict resolution, and automatic type degradation for Pydantic-incompatible third-party types
+
+## Docs
+
+All paths are relative to this file's directory (`conscribe/`).
+
+- [Overview](docs/overview.md): Core concepts, two-subsystem architecture, learning path. Start here.
+- [Guide: Framework Developer](docs/guide-alice.md): Tutorial for building a framework with conscribe. Covers registrar creation, base class setup, config generation, external class integration, CLI usage.
+- [Guide: Framework User](docs/guide-bob.md): Tutorial for consuming a conscribe-based framework. Covers config tiers, MRO parameter collection, scope control, open/closed schemas.
+- [Registration Deep-Dive](docs/registration.md): Internals of the registration subsystem. Registry, metaclass, key transform, protocol checking, bridge metaclass conflict resolution.
+- [Config Typing Deep-Dive](docs/config-typing.md): Config pipeline internals. Extract -> build -> generate. Codegen, JSON Schema, fingerprinting.
+- [MRO and Type Degradation](docs/mro-and-degradation.md): MRO-aware `**kwargs` chain resolution, scope classification, type degradation for Pydantic-incompatible types.
+- [API Reference](docs/api-reference.md): Full API signatures, parameters, return types, and usage examples for all public functions and classes.
+- [Recipes](docs/recipes.md): Task-oriented "how do I X?" answers with code snippets.
+- [CLI Reference](docs/cli.md): Command-line interface usage, batch config files, and examples.
+
+## Optional
+
+- [Source: registration/registrar.py](registration/registrar.py): `create_registrar()` and `LayerRegistrar` implementation.
+- [Source: config/extractor.py](config/extractor.py): `extract_config_schema()` with tier logic.
+- [Source: config/builder.py](config/builder.py): `build_layer_config()` discriminated union builder.
+- [Source: config/mro.py](config/mro.py): `collect_mro_params()` MRO walker.
+- [Source: config/degradation.py](config/degradation.py): Type degradation to `Any`.

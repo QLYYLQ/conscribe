@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "conscribe"
-version = "0.4.0"
+version = "0.4.1"
 description = "Automatic class registration and config typing stub generation for layered Python architectures"
 readme = "README.md"
 license = "MIT"
@@ -26,8 +26,9 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/QLYYLQ/conscribe"
+Documentation = "https://github.com/QLYYLQ/conscribe/tree/master/conscribe/docs"
 Repository = "https://github.com/QLYYLQ/conscribe"
-Issues = "https://github.com/QLYYLQ/conscribe"
+Issues = "https://github.com/QLYYLQ/conscribe/issues"
 
 [project.scripts]
 conscribe = "conscribe.cli:main"
