@@ -65,6 +65,19 @@ def extract_config_schema(
             )
         return config_schema
 
+    # -- BaseModel fast path --
+    # When cls IS a BaseModel subclass and does NOT define its own __init__,
+    # the standard reflection path would resolve to BaseModel.__init__
+    # which has signature (self, /, **data: Any) — zero named params.
+    # Instead, extract fields directly from cls.model_fields.
+    if (
+        isinstance(cls, type)
+        and issubclass(cls, BaseModel)
+        and cls is not BaseModel
+        and "__init__" not in cls.__dict__
+    ):
+        return _extract_from_pydantic_model(cls)
+
     # -- Find the actual __init__ definer via MRO --
     init_definer = _find_init_definer(cls)
     if init_definer is None:
@@ -231,6 +244,45 @@ def extract_config_schema(
         model = _create_dynamic_model(model_name, field_definitions, extra)
         model.__degraded_fields__ = degraded  # type: ignore[attr-defined]
     return model
+
+
+def _extract_from_pydantic_model(
+    cls: type,
+) -> Union[type[BaseModel], None]:
+    """Extract config schema from a Pydantic BaseModel subclass.
+
+    Uses ``cls.model_fields`` to build field definitions, preserving
+    all FieldInfo metadata (description, constraints, etc.).
+
+    Args:
+        cls: A Pydantic BaseModel subclass.
+
+    Returns:
+        A dynamically created BaseModel subclass, or None if no
+        init-eligible fields exist.
+    """
+    field_definitions: dict[str, Any] = {}
+
+    for fname, field_info in cls.model_fields.items():
+        # Skip fields where init=False
+        if field_info.init is not None and not field_info.init:
+            continue
+
+        annotation = field_info.annotation
+        if annotation is None:
+            annotation = Any
+
+        # Pass the FieldInfo directly to preserve all metadata
+        field_definitions[fname] = (annotation, field_info)
+
+    if not field_definitions:
+        return None
+
+    # Read extra policy from the model's config
+    extra = cls.model_config.get("extra", "forbid")
+
+    model_name = f"{cls.__name__}Config"
+    return _create_dynamic_model(model_name, field_definitions, extra)
 
 
 # ---------------------------------------------------------------------------

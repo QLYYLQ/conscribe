@@ -1216,3 +1216,126 @@ class TestTypeDegradation:
         assert instance.name == "test"
         assert instance.auth == "any_value"
         assert instance.count == 5
+
+
+# ===================================================================
+# BaseModel fast path
+# ===================================================================
+
+
+class TestBaseModelFastPath:
+    """Tests for the BaseModel fast path in extract_config_schema.
+
+    When cls is a BaseModel subclass without a custom __init__, fields
+    are extracted from cls.model_fields instead of reflecting __init__.
+    """
+
+    def test_basemodel_subclass_extracts_fields(self) -> None:
+        """BaseModel subclass with fields produces a config schema."""
+
+        class MyModel(BaseModel):
+            name: str
+            count: int = 5
+            flag: bool = True
+
+        result = extract_config_schema(MyModel)
+        assert result is not None
+        fields = result.model_fields
+        assert "name" in fields
+        assert "count" in fields
+        assert "flag" in fields
+        assert fields["count"].default == 5
+        assert fields["flag"].default is True
+
+    def test_basemodel_init_false_excluded(self) -> None:
+        """Fields with init=False are excluded from the config schema."""
+
+        class MyModel(BaseModel):
+            name: str
+            internal: str = Field(default="auto", init=False)
+
+        result = extract_config_schema(MyModel)
+        assert result is not None
+        assert "name" in result.model_fields
+        assert "internal" not in result.model_fields
+
+    def test_basemodel_with_own_init_uses_reflection(self) -> None:
+        """BaseModel subclass with custom __init__ falls through to reflection."""
+
+        class MyModel(BaseModel):
+            name: str = "default"
+
+            def __init__(self, *, label: str = "custom", **data: Any):
+                super().__init__(**data)
+                self.label = label  # type: ignore[attr-defined]
+
+        result = extract_config_schema(MyModel)
+        assert result is not None
+        # Should use reflection path, which sees 'label' as a param
+        assert "label" in result.model_fields
+
+    def test_basemodel_field_metadata_preserved(self) -> None:
+        """Field(description=...) metadata is preserved in the config schema."""
+
+        class MyModel(BaseModel):
+            name: str = Field(description="The name of the entity")
+            count: int = Field(default=0, ge=0, description="Non-negative count")
+
+        result = extract_config_schema(MyModel)
+        assert result is not None
+        name_field = result.model_fields["name"]
+        assert name_field.description == "The name of the entity"
+        count_field = result.model_fields["count"]
+        assert count_field.description == "Non-negative count"
+
+    def test_config_schema_still_highest_priority(self) -> None:
+        """__config_schema__ wins over BaseModel fast path."""
+
+        class OverrideSchema(BaseModel):
+            override_field: str = "override"
+
+        class MyModel(BaseModel):
+            __config_schema__ = OverrideSchema
+            name: str
+            count: int = 5
+
+        result = extract_config_schema(MyModel)
+        assert result is OverrideSchema
+
+    def test_basemodel_no_fields_returns_none(self) -> None:
+        """BaseModel with all fields init=False returns None."""
+
+        class EmptyModel(BaseModel):
+            internal: str = Field(default="auto", init=False)
+
+        result = extract_config_schema(EmptyModel)
+        assert result is None
+
+    def test_basemodel_extra_config_preserved(self) -> None:
+        """model_config extra setting is preserved in the config schema."""
+
+        class AllowExtraModel(BaseModel):
+            model_config = ConfigDict(extra="allow")
+            name: str
+
+        result = extract_config_schema(AllowExtraModel)
+        assert result is not None
+        assert result.model_config.get("extra") == "allow"
+
+    def test_basemodel_validates_correctly(self) -> None:
+        """Generated config schema validates data correctly."""
+
+        class MyModel(BaseModel):
+            name: str
+            count: int = 0
+
+        result = extract_config_schema(MyModel)
+        assert result is not None
+        instance = result(name="test")
+        assert instance.name == "test"
+        assert instance.count == 0
+
+    def test_basemodel_itself_returns_none(self) -> None:
+        """BaseModel itself (not a subclass) does not trigger fast path."""
+        result = extract_config_schema(BaseModel)
+        assert result is None

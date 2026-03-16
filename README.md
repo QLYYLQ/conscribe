@@ -301,6 +301,47 @@ class CustomAgent:
 
 ---
 
+## Pydantic BaseModel + Generic[T]
+
+When you use Pydantic's `BaseModel` with `Generic[T]`, specializing like `BaseEvent[str]` creates real intermediate class objects — and these would normally trigger conscribe's registration hooks, polluting the registry with unwanted keys like `base_event[str]`.
+
+Conscribe handles this automatically: `skip_pydantic_generic=True` is the default on `create_registrar()`, which filters out any class whose name contains `[`.
+
+```python
+from pydantic import BaseModel
+from typing import Generic, TypeVar
+
+T = TypeVar("T")
+
+class BaseEvent(BaseModel, Generic[T]):
+    payload: T
+
+# Bridge the Pydantic class into your layer
+EventBridge = EventRegistrar.bridge(BaseEvent)
+
+class StringEvent(EventBridge):   # auto-registered as "string_event"
+    payload: str = "hello"
+
+class IntEvent(EventBridge):      # auto-registered as "int_event"
+    payload: int = 0
+
+# BaseEvent[str] intermediates are automatically filtered — no bracket keys
+print(EventRegistrar.keys())  # ["string_event", "int_event"]
+```
+
+Config extraction also works automatically for BaseModel subclasses — fields are read from `model_fields` instead of reflecting `__init__`.
+
+For advanced filtering, pass a custom `skip_filter`:
+
+```python
+EventRegistrar = create_registrar(
+    "event", EventProto,
+    skip_filter=lambda cls: cls.__name__.startswith("Internal"),
+)
+```
+
+---
+
 ## MRO-Aware Parameter Collection
 
 When a subclass doesn't define its own `__init__`, Conscribe walks the MRO chain to find the actual definer and extracts its parameters. Inherited config is never lost:

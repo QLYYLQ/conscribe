@@ -847,3 +847,63 @@ class TestMROKwargsFingerprint:
         fp_plain = compute_registry_fingerprint(_determinism_reg)
         # Different keys/classes, so fingerprints differ
         assert fp_kwargs != fp_plain
+
+
+# ===================================================================
+# BaseModel fingerprint tests
+# ===================================================================
+
+class TestBaseModelFingerprint:
+    """Tests that BaseModel subclass field changes invalidate fingerprints."""
+
+    def test_basemodel_field_change_invalidates_fingerprint(self) -> None:
+        """Adding/removing a field on a BaseModel subclass changes the fingerprint."""
+        from pydantic import BaseModel as BM
+
+        # Registrar A: model with 2 fields
+        reg_a = create_registrar("llm", _LLMProto, discriminator_field="provider")
+        BridgeA = reg_a.bridge(BM)
+
+        class ModelA(BridgeA):
+            __registry_key__ = "model"
+            name: str
+            count: int = 0
+
+            async def chat(self, messages: list[dict]) -> str:
+                return ""
+
+        # Registrar B: model with 3 fields (added extra_field)
+        reg_b = create_registrar("llm", _LLMProto, discriminator_field="provider")
+        BridgeB = reg_b.bridge(BM)
+
+        class ModelB(BridgeB):
+            __registry_key__ = "model"
+            name: str
+            count: int = 0
+            extra_field: str = "new"
+
+            async def chat(self, messages: list[dict]) -> str:
+                return ""
+
+        fp_a = compute_registry_fingerprint(reg_a)
+        fp_b = compute_registry_fingerprint(reg_b)
+        assert fp_a != fp_b
+
+    def test_basemodel_fingerprint_deterministic(self) -> None:
+        """BaseModel subclass fingerprint is deterministic."""
+        from pydantic import BaseModel as BM
+
+        reg = create_registrar("llm", _LLMProto, discriminator_field="provider")
+        Bridge = reg.bridge(BM)
+
+        class DetModel(Bridge):
+            __registry_key__ = "det_model"
+            name: str
+            value: int = 42
+
+            async def chat(self, messages: list[dict]) -> str:
+                return ""
+
+        fp1 = compute_registry_fingerprint(reg)
+        fp2 = compute_registry_fingerprint(reg)
+        assert fp1 == fp2

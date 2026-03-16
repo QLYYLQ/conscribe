@@ -549,3 +549,85 @@ class TestAutoRegistrarEdgeCases:
 
         assert registry.get("fast") is FastImpl
         assert FastImpl.__registry_key__ == "fast"
+
+
+# ===================================================================
+# Pydantic Generic skipping
+# ===================================================================
+
+class TestPydanticGenericSkipping:
+    """Classes with '[' in their name (Pydantic Generic intermediates) should be skipped."""
+
+    def test_bracket_name_skipped_by_default(self) -> None:
+        """Class with '[' in name is NOT registered when skip_pydantic_generic=True (default)."""
+        registry = LayerRegistry("test", SimpleProto)
+        Meta = create_auto_registrar(registry, default_key_transform)
+
+        class Base(metaclass=Meta):
+            __abstract__ = True
+            def do_work(self) -> str:
+                return ""
+
+        # Simulate Pydantic Generic intermediate by creating class with bracket name
+        BracketClass = Meta("Foo[bar]", (Base,), {"do_work": lambda self: "bracket"})
+
+        assert registry.keys() == []
+        # Class should still be created (not None)
+        assert BracketClass is not None
+
+    def test_bracket_name_registered_when_disabled(self) -> None:
+        """Class with '[' in name IS registered when skip_pydantic_generic=False."""
+        registry = LayerRegistry("test", SimpleProto)
+        Meta = create_auto_registrar(
+            registry, default_key_transform, skip_pydantic_generic=False
+        )
+
+        class Base(metaclass=Meta):
+            __abstract__ = True
+            def do_work(self) -> str:
+                return ""
+
+        BracketClass = Meta("Foo[bar]", (Base,), {"do_work": lambda self: "bracket"})
+
+        assert len(registry.keys()) == 1
+
+    def test_custom_skip_filter(self) -> None:
+        """skip_filter callable can reject specific classes."""
+        registry = LayerRegistry("test", SimpleProto)
+        Meta = create_auto_registrar(
+            registry,
+            default_key_transform,
+            skip_filter=lambda cls: cls.__name__ == "Rejected",
+        )
+
+        class Base(metaclass=Meta):
+            __abstract__ = True
+            def do_work(self) -> str:
+                return ""
+
+        class Accepted(Base):
+            def do_work(self) -> str:
+                return "accepted"
+
+        class Rejected(Base):
+            def do_work(self) -> str:
+                return "rejected"
+
+        assert "accepted" in registry.keys()
+        assert len(registry.keys()) == 1
+
+    def test_normal_classes_unaffected_by_skip(self) -> None:
+        """Normal classes (no bracket in name) are registered as usual."""
+        registry = LayerRegistry("test", SimpleProto)
+        Meta = create_auto_registrar(registry, default_key_transform)
+
+        class Base(metaclass=Meta):
+            __abstract__ = True
+            def do_work(self) -> str:
+                return ""
+
+        class NormalWorker(Base):
+            def do_work(self) -> str:
+                return "normal"
+
+        assert "normal_worker" in registry.keys()

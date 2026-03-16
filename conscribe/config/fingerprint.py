@@ -33,9 +33,28 @@ def compute_registry_fingerprint(registrar: type) -> str:
     hasher = hashlib.sha256()
     all_classes = registrar.get_all()
 
+    _BM = _get_base_model()
+
     for key in sorted(all_classes.keys()):
         cls = all_classes[key]
         hasher.update(key.encode("utf-8"))
+
+        # BaseModel fast path: hash model_fields instead of __init__
+        if (
+            _BM is not None
+            and isinstance(cls, type)
+            and issubclass(cls, _BM)
+            and cls is not _BM
+            and "__init__" not in cls.__dict__
+        ):
+            for fname in sorted(cls.model_fields.keys()):
+                fi = cls.model_fields[fname]
+                hasher.update(
+                    f"pydantic:{fname}:{fi.annotation}:{fi.default}".encode("utf-8")
+                )
+            doc = cls.__doc__ or ""
+            hasher.update(doc.encode("utf-8"))
+            continue
 
         # Signature
         init_definer = _find_init_definer(cls)
@@ -123,6 +142,15 @@ def save_fingerprint(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _get_base_model() -> Union[type, None]:
+    """Lazily import pydantic.BaseModel, returning None if unavailable."""
+    try:
+        from pydantic import BaseModel
+        return BaseModel
+    except ImportError:
+        return None
 
 
 def _find_init_definer(cls: type) -> Union[type, None]:

@@ -42,6 +42,8 @@ class LayerRegistrar(Generic[P]):
         Meta: The AutoRegistrar metaclass.
         _key_transform: Key inference function.
         discriminator_field: Config union discriminator field name.
+        _skip_pydantic_generic: Whether to skip Pydantic Generic intermediates.
+        _skip_filter: Optional custom skip filter callable.
     """
 
     protocol: type
@@ -51,6 +53,8 @@ class LayerRegistrar(Generic[P]):
     discriminator_field: str
     _mro_scope: Union[str, list[str]]
     _mro_depth: Union[int, None]
+    _skip_pydantic_generic: bool
+    _skip_filter: Union[Callable[[type], bool], None]
 
     # ── Query API ──
 
@@ -169,6 +173,8 @@ class LayerRegistrar(Generic[P]):
         """
         registry = cls._registry
         kt = cls._key_transform
+        skip_pg = cls._skip_pydantic_generic
+        skip_fn = cls._skip_filter
 
         # Save the ORIGINAL __init_subclass__ from this class's own dict
         # (NOT inherited). Use __dict__.get(), NOT getattr().
@@ -181,6 +187,14 @@ class LayerRegistrar(Generic[P]):
                 original.__func__(sub_cls, **kwargs)
             else:
                 super(target_cls, sub_cls).__init_subclass__(**kwargs)
+
+            # Skip Pydantic Generic specialization intermediates
+            if skip_pg and "[" in sub_cls.__name__:
+                return
+
+            # Skip classes rejected by custom filter
+            if skip_fn is not None and skip_fn(sub_cls):
+                return
 
             # Skip abstract subclasses — use __dict__ NOT getattr
             # to avoid inheriting parent's __abstract__=True
@@ -250,6 +264,8 @@ def create_registrar(
     base_metaclass: type = type,
     mro_scope: Union[str, list[str]] = "local",
     mro_depth: Optional[int] = None,
+    skip_pydantic_generic: bool = True,
+    skip_filter: Optional[Callable[[type], bool]] = None,
 ) -> type:
     """One-line factory to create a Layer-specific Registrar class.
 
@@ -268,6 +284,12 @@ def create_registrar(
             ``list[str]`` of package names (local + listed packages).
         mro_depth: Max MRO levels to traverse for parameter collection.
             ``None`` means unlimited.
+        skip_pydantic_generic: If True (default), skip classes whose name
+            contains ``[`` — these are Pydantic Generic intermediates
+            (e.g. ``BaseModel[str]``) that should not pollute the
+            registry.
+        skip_filter: Optional callable ``(cls) -> bool``. If it returns
+            True for a class, that class is skipped (not registered).
 
     Returns:
         A LayerRegistrar subclass with all class-level attributes populated.
@@ -289,7 +311,13 @@ def create_registrar(
     registry = LayerRegistry(name, protocol)
 
     # 3. Create AutoRegistrar metaclass
-    meta = create_auto_registrar(registry, kt, base_metaclass=base_metaclass)
+    meta = create_auto_registrar(
+        registry,
+        kt,
+        base_metaclass=base_metaclass,
+        skip_pydantic_generic=skip_pydantic_generic,
+        skip_filter=skip_filter,
+    )
 
     # 4. Dynamically create LayerRegistrar subclass
     registrar_cls = type(
@@ -303,6 +331,8 @@ def create_registrar(
             "discriminator_field": discriminator_field,
             "_mro_scope": mro_scope,
             "_mro_depth": mro_depth,
+            "_skip_pydantic_generic": skip_pydantic_generic,
+            "_skip_filter": skip_filter,
         },
     )
     return registrar_cls

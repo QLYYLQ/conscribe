@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Conscribe** (`conscribe` package, v0.3.0) — A Python library for automatic class registration and config typing stub generation for layered Python architectures. It targets framework developers building config-driven frameworks with pluggable layers (agents, LLM providers, etc.).
+**Conscribe** (`conscribe` package, v0.4.0) — A Python library for automatic class registration and config typing stub generation for layered Python architectures. It targets framework developers building config-driven frameworks with pluggable layers (agents, LLM providers, etc.).
 
 Two core capabilities:
 1. **Auto-registration**: Classes inheriting a base are automatically registered in their layer's registry (via metaclass). Also supports bridging external classes and explicit `@register` decorators.
@@ -63,6 +63,18 @@ pytest is pre-configured in `pyproject.toml` with `--cov=conscribe --cov-report=
 - `__config_mro_scope__` — Per-class override for MRO traversal scope (`"local"`, `"third_party"`, `"all"`).
 - `__config_mro_depth__` — Per-class override for MRO traversal depth (int or None).
 - `__degraded_fields__` — Attached to dynamically created models by `extract_config_schema()` when field types were degraded to `Any`. List of `DegradedField` instances. Only present when degradation occurred (zero overhead on happy path).
+
+### Pydantic Generic Compatibility
+
+`create_registrar()` and `create_auto_registrar()` accept:
+- `skip_pydantic_generic: bool = True` — Filters classes with `[` in name (Pydantic Generic intermediates like `BaseEvent[str]`).
+- `skip_filter: Callable[[type], bool] | None = None` — Custom class filter. Return True to skip.
+
+Both filters apply in `AutoRegistrar.__new__` (Path A) and `_inject_auto_registration` (Path C propagate).
+
+`extract_config_schema()` has a **BaseModel fast path**: when `cls` is a `BaseModel` subclass without custom `__init__`, fields are extracted from `cls.model_fields` instead of reflecting `__init__` (which would resolve to `BaseModel.__init__` with zero named params).
+
+`compute_registry_fingerprint()` has a **BaseModel-aware hashing** branch: hashes `model_fields` instead of `__init__` signature for BaseModel subclasses.
 
 ### Bridge Metaclass Conflict Resolution
 

@@ -850,3 +850,103 @@ class TestBobBridgesExternalAgent:
 
         assert R.get("prob_variant_a") is ProbVariantA
         assert R.get("prob_variant_b") is ProbVariantB
+
+
+# ===================================================================
+# Pydantic Generic compatibility
+# ===================================================================
+
+class TestPydanticGenericCompatibility:
+    """Tests for skip_pydantic_generic and skip_filter on LayerRegistrar."""
+
+    def test_create_registrar_default_skip_pydantic_generic(self) -> None:
+        """create_registrar defaults to skip_pydantic_generic=True."""
+        R = create_registrar("test", SimpleProto)
+        assert R._skip_pydantic_generic is True
+
+    def test_skip_filter_on_registrar(self) -> None:
+        """skip_filter passed to create_registrar filters classes."""
+        R = create_registrar(
+            "test",
+            SimpleProto,
+            skip_filter=lambda cls: cls.__name__ == "Skipped",
+        )
+
+        class Base(metaclass=R.Meta):
+            __abstract__ = True
+            def do_work(self) -> str:
+                return ""
+
+        class Allowed(Base):
+            def do_work(self) -> str:
+                return "allowed"
+
+        class Skipped(Base):
+            def do_work(self) -> str:
+                return "skipped"
+
+        assert "allowed" in R.keys()
+        assert len(R.keys()) == 1
+
+    def test_bridge_with_bracket_name_class(self) -> None:
+        """Bridge + subclass with bracket name should not pollute registry."""
+        R = create_registrar("test", SimpleProto)
+
+        class External:
+            def do_work(self) -> str:
+                return "ext"
+
+        Bridge = R.bridge(External)
+
+        # Normal subclass should register
+        class NormalChild(Bridge):
+            def do_work(self) -> str:
+                return "normal"
+
+        # Simulate Pydantic Generic intermediate
+        BracketChild = type(Bridge).__call__(
+            type(Bridge), "Bridge[str]", (Bridge,), {"do_work": lambda self: "bracket"}
+        )
+
+        assert "normal_child" in R.keys()
+        # No bracket key registered
+        assert all("[" not in k for k in R.keys())
+
+    def test_propagate_with_bracket_name_class(self) -> None:
+        """@register(propagate=True) + bracket-named subclass should not register."""
+        R = create_registrar("test", SimpleProto)
+
+        @R.register("base", propagate=True)
+        class PropBase:
+            def do_work(self) -> str:
+                return "base"
+
+        class NormalChild(PropBase):
+            def do_work(self) -> str:
+                return "normal"
+
+        # Simulate bracket-named class via __init_subclass__
+        # We create it dynamically to trigger __init_subclass__
+        BracketChild = type("PropBase[str]", (PropBase,), {
+            "do_work": lambda self: "bracket"
+        })
+
+        assert R.get("normal_child") is NormalChild
+        # Bracket class should not be registered
+        bracket_keys = [k for k in R.keys() if "[" in k]
+        assert bracket_keys == []
+
+    def test_skip_pydantic_generic_disabled(self) -> None:
+        """skip_pydantic_generic=False allows bracket names."""
+        R = create_registrar(
+            "test", SimpleProto, skip_pydantic_generic=False,
+        )
+
+        class Base(metaclass=R.Meta):
+            __abstract__ = True
+            def do_work(self) -> str:
+                return ""
+
+        BracketClass = R.Meta("Foo[bar]", (Base,), {"do_work": lambda self: "b"})
+
+        assert len(R.keys()) == 1

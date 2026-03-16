@@ -6,7 +6,7 @@ This is the shared mechanism for Path A (inheritance) and Path B (bridge).
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, Optional
 
 from conscribe.exceptions import InvalidConfigSchemaError
 from conscribe.registration.key_transform import KeyTransform
@@ -20,6 +20,8 @@ def create_auto_registrar(
     key_transform: KeyTransform,
     *,
     base_metaclass: type = type,
+    skip_pydantic_generic: bool = True,
+    skip_filter: Optional[Callable[[type], bool]] = None,
 ) -> type:
     """Create an AutoRegistrar metaclass via closure.
 
@@ -28,6 +30,12 @@ def create_auto_registrar(
         key_transform: Key inference function (class name -> registry key).
         base_metaclass: Parent metaclass for AutoRegistrar.
             Default is ``type``. Pass ``ABCMeta`` etc. to resolve conflicts.
+        skip_pydantic_generic: If True (default), skip classes whose name
+            contains ``[`` — these are Pydantic Generic specialization
+            intermediates (e.g. ``BaseEvent[str]``) and should not be
+            registered.
+        skip_filter: Optional callable ``(cls) -> bool``. If it returns
+            True for a class, that class is skipped (not registered).
 
     Returns:
         An AutoRegistrar metaclass (subclass of base_metaclass).
@@ -54,7 +62,15 @@ def create_auto_registrar(
             if not bases:
                 return cls
 
-            # 3b: Explicitly abstract — MUST use namespace.get(), NOT getattr()
+            # 3b: Pydantic Generic specialization (e.g. BaseEvent[str])
+            if skip_pydantic_generic and "[" in name:
+                return cls
+
+            # 3c: Custom skip filter
+            if skip_filter is not None and skip_filter(cls):
+                return cls
+
+            # 3d: Explicitly abstract — MUST use namespace.get(), NOT getattr()
             #     to avoid inheriting parent's __abstract__=True
             if namespace.get("__abstract__", False):
                 return cls
