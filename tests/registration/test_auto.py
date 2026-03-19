@@ -616,6 +616,36 @@ class TestPydanticGenericSkipping:
         assert "accepted" in registry.keys()
         assert len(registry.keys()) == 1
 
+    def test_hierarchical_key_no_cascade(self) -> None:
+        """Deep inheritance should NOT cascade parent keys into grandchild keys.
+
+        Without __dict__.get fix, a 3-level chain A→B→C with separator="."
+        would produce "a.b.a.b.c" instead of "a.b.c".
+        """
+        registry = LayerRegistry("test", SimpleProto, separator=".")
+        Meta = create_auto_registrar(
+            registry, default_key_transform, key_separator=".",
+        )
+
+        class Root(metaclass=Meta):
+            __abstract__ = True
+            __registry_key__ = "a"
+            def do_work(self) -> str:
+                return ""
+
+        class Middle(Root):
+            __registry_key__ = "a.b"
+            def do_work(self) -> str:
+                return "mid"
+
+        class Leaf(Middle):
+            def do_work(self) -> str:
+                return "leaf"
+
+        # Leaf should be "a.b.leaf", NOT "a.b.a.b.leaf"
+        assert "a.b.leaf" in registry.keys()
+        assert not any(k.count("a.b") > 1 for k in registry.keys())
+
     def test_normal_classes_unaffected_by_skip(self) -> None:
         """Normal classes (no bracket in name) are registered as usual."""
         registry = LayerRegistry("test", SimpleProto)

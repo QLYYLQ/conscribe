@@ -35,12 +35,9 @@ class LayerRegistry(Generic[P]):
         _lock: threading.Lock — thread safety (NOT RLock)
         _check_cache: WeakSet — positive Protocol check cache
         _check_negative_cache: WeakSet — negative Protocol check cache
-        _invalidation_counter: int — class variable (global), incremented on remove()
-        _negative_cache_version: int — instance variable, compared to global counter
+        _invalidation_counter: int — instance variable, incremented on remove()
+        _negative_cache_version: int — instance variable, compared to own counter
     """
-
-    _invalidation_counter: int = 0
-    _counter_lock: threading.Lock = threading.Lock()
 
     def __init__(self, name: str, protocol: type, *, separator: str = "") -> None:
         """Initialize the registry.
@@ -64,7 +61,9 @@ class LayerRegistry(Generic[P]):
         self._lock = threading.Lock()
         self._check_cache: WeakSet = WeakSet()
         self._check_negative_cache: WeakSet = WeakSet()
-        self._negative_cache_version: int = type(self)._invalidation_counter
+        self._invalidation_counter: int = 0
+        self._counter_lock = threading.Lock()
+        self._negative_cache_version: int = self._invalidation_counter
         self._protocol_methods: frozenset[str] = frozenset(
             name
             for name in dir(protocol)
@@ -87,9 +86,9 @@ class LayerRegistry(Generic[P]):
                 return
 
             # 2. Check if negative cache is stale
-            if self._negative_cache_version != type(self)._invalidation_counter:
+            if self._negative_cache_version != self._invalidation_counter:
                 self._check_negative_cache = WeakSet()
-                self._negative_cache_version = type(self)._invalidation_counter
+                self._negative_cache_version = self._invalidation_counter
 
             # 3. Negative cache hit -> raise
             if cls in self._check_negative_cache:
@@ -155,8 +154,8 @@ class LayerRegistry(Generic[P]):
         """
         with self._lock:
             del self._store[key]  # KeyError if missing
-        with type(self)._counter_lock:
-            type(self)._invalidation_counter += 1
+        with self._counter_lock:
+            self._invalidation_counter += 1
 
     def get(self, key: str) -> type:
         """Look up a registered class.
@@ -244,6 +243,14 @@ class LayerRegistry(Generic[P]):
             for part in parts[:-1]:
                 if part not in node:
                     node[part] = {}
+                elif not isinstance(node[part], dict):
+                    raise ValueError(
+                        f"Key conflict in registry '{self.name}': "
+                        f"'{part}' is registered as a leaf class "
+                        f"({node[part].__name__}) but also used as a "
+                        f"prefix for key '{key}'. Use distinct key "
+                        f"prefixes to avoid collisions."
+                    )
                 node = node[part]
             node[parts[-1]] = cls
         return result
@@ -265,7 +272,7 @@ class LayerRegistry(Generic[P]):
 
         print(f"Registry: {self.name}", file=file)
         print(
-            f"Invalidation counter: {type(self)._invalidation_counter}",
+            f"Invalidation counter: {self._invalidation_counter}",
             file=file,
         )
         print(f"Entries ({len(entries)}):", file=file)

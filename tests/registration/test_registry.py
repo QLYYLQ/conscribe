@@ -625,6 +625,24 @@ class TestAgentRegistryScenario:
         with pytest.raises(DuplicateKeyError, match="Duplicate key"):
             registry.add("browser_use", AnotherAgentStub)
 
+    def test_tree_raises_on_prefix_leaf_collision(self) -> None:
+        """tree() raises ValueError when a leaf class blocks nesting for a deeper key."""
+        registry = LayerRegistry("test", WorkerProtocol, separator=".")
+
+        class A:
+            def do_work(self) -> str:
+                return "a"
+
+        class B:
+            def do_work(self) -> str:
+                return "b"
+
+        registry.add("openai", A)
+        registry.add("openai.azure", B)
+
+        with pytest.raises(ValueError, match="Key conflict"):
+            registry.tree()
+
     def test_dump_registry_does_not_crash(self) -> None:
         """_dump_registry is a debug method -- it should not raise."""
         registry = LayerRegistry("test", WorkerProtocol)

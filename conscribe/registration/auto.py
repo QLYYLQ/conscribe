@@ -175,7 +175,7 @@ def _derive_hierarchical_key(
     for base in cls.__mro__[1:]:
         if base is object:
             continue
-        parent_key = getattr(base, "__registry_key__", None)
+        parent_key = base.__dict__.get("__registry_key__", None)
         if parent_key and isinstance(parent_key, str):
             return f"{parent_key}{separator}{key_transform(name)}"
     return None

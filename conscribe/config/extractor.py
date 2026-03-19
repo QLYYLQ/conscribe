@@ -390,7 +390,10 @@ def _safe_get_type_hints(func: Any) -> Union[dict[str, Any], None]:
     try:
         return get_type_hints(func, include_extras=True)
     except Exception:
-        # Fall back to raw __annotations__ with manual eval
+        # Fall back to raw __annotations__ with per-annotation eval.
+        # This handles the case where get_type_hints fails globally
+        # (e.g. one annotation references a name missing from the
+        # module namespace) but other annotations are resolvable.
         try:
             raw_annotations = getattr(func, "__annotations__", {})
             if not raw_annotations:
@@ -398,26 +401,30 @@ def _safe_get_type_hints(func: Any) -> Union[dict[str, Any], None]:
             globalns = getattr(func, "__globals__", {})
             localns = None
             import typing as _typing_mod
-            safe_ns = {
+            # Start with typing module exports (Annotated, Union, etc.)
+            eval_ns = {
                 k: v for k, v in vars(_typing_mod).items()
                 if not k.startswith("_")
             }
-            safe_ns["__builtins__"] = {
+            # Include ALL names from the function's module globals.
+            # This is critical: callables like pydantic.Field, custom
+            # types, and other objects referenced in annotations must
+            # be available.  get_type_hints() itself evaluates with
+            # full globals, so the fallback needs the same namespace.
+            if globalns:
+                eval_ns.update(globalns)
+            # Restrict __builtins__ to type-like names only.
+            eval_ns["__builtins__"] = {
                 "str": str, "int": int, "float": float, "bool": bool,
                 "bytes": bytes, "list": list, "dict": dict, "set": set,
                 "tuple": tuple, "type": type, "None": None,
                 "Ellipsis": Ellipsis,
             }
-            if globalns:
-                safe_ns.update({
-                    k: v for k, v in globalns.items()
-                    if isinstance(v, type) or hasattr(v, "__origin__")
-                })
             result: dict[str, Any] = {}
             for name, annotation in raw_annotations.items():
                 if isinstance(annotation, str):
                     try:
-                        result[name] = eval(annotation, safe_ns, localns)  # noqa: S307
+                        result[name] = eval(annotation, eval_ns, localns)  # noqa: S307
                     except Exception:
                         result[name] = annotation
                 else:

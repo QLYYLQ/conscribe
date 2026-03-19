@@ -114,6 +114,10 @@ def save_fingerprint(
 ) -> None:
     """Save a fingerprint to a JSON cache file, preserving other layers.
 
+    Note: This is not atomic — concurrent writes from separate processes
+    could cause a race condition (read-modify-write). Acceptable for a
+    CLI build tool. For atomic writes, use tempfile + os.replace().
+
     Args:
         fingerprint_path: Path to the JSON cache file.
         layer_name: The layer name key.

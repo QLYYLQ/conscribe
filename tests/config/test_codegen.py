@@ -16,6 +16,8 @@ so that ``get_type_hints()`` can resolve forward references under
 """
 from __future__ import annotations
 
+import enum
+import pathlib
 from typing import Annotated, Any, Optional, Protocol, Union, runtime_checkable
 
 import pytest
@@ -1102,3 +1104,104 @@ class TestDegradedFieldRendering:
         # Should validate with any value for the degraded field
         instance = model_cls(provider="degraded", model_id="test", auth="any_value")
         assert instance.model_id == "test"
+
+
+# ===================================================================
+# Enum and non-serializable defaults (3a)
+# ===================================================================
+
+class Color(enum.Enum):
+    RED = "red"
+    GREEN = "green"
+    BLUE = "blue"
+
+
+_enum_reg = create_registrar(
+    "llm", _LLMProto, discriminator_field="provider",
+)
+
+
+class _EnumBase(metaclass=_enum_reg.Meta):
+    __abstract__ = True
+    async def chat(self, messages: list[dict]) -> str:
+        return ""
+
+
+class EnumDefaultProvider(_EnumBase):
+    __registry_key__ = "enum_default"
+
+    def __init__(self, *, color: Color = Color.RED, model_id: str = "test"):
+        self.color = color
+        self.model_id = model_id
+
+
+class TestEnumAndCallableDefaults:
+    """Tests for Enum and non-serializable default rendering (3a)."""
+
+    def test_enum_default_renders_as_member_access(self) -> None:
+        """Enum default should render as 'Color.RED', not '<Color.RED: ...>'."""
+        result = build_layer_config(_enum_reg)
+        source = generate_layer_config_source(result)
+
+        # Should contain "Color.RED" not "<Color.RED"
+        assert "Color.RED" in source
+        assert "<Color.RED" not in source
+
+    def test_enum_import_generated(self) -> None:
+        """Generated source should import the enum type."""
+        result = build_layer_config(_enum_reg)
+        source = generate_layer_config_source(result)
+
+        # Should have an import for the Color enum
+        assert "Color" in source
+
+    def test_enum_source_compiles(self) -> None:
+        """Generated source with enum default compiles and executes."""
+        result = build_layer_config(_enum_reg)
+        source = generate_layer_config_source(result)
+
+        code = compile(source, "<test-enum>", "exec")
+        assert code is not None
+
+
+# ===================================================================
+# Non-builtin type imports in stubs (3b)
+# ===================================================================
+
+_path_reg = create_registrar(
+    "llm", _LLMProto, discriminator_field="provider",
+)
+
+
+class _PathBase(metaclass=_path_reg.Meta):
+    __abstract__ = True
+    async def chat(self, messages: list[dict]) -> str:
+        return ""
+
+
+class PathProvider(_PathBase):
+    __registry_key__ = "path_provider"
+
+    def __init__(self, *, config_path: pathlib.Path, model_id: str = "test"):
+        self.config_path = config_path
+        self.model_id = model_id
+
+
+class TestNonBuiltinTypeImports:
+    """Tests that non-builtin types get import statements in generated source (3b)."""
+
+    def test_pathlib_path_import_generated(self) -> None:
+        """pathlib.Path field type should generate 'from pathlib import Path'."""
+        result = build_layer_config(_path_reg)
+        source = generate_layer_config_source(result)
+
+        assert "from pathlib import" in source
+        assert "Path" in source
+
+    def test_pathlib_path_type_in_field(self) -> None:
+        """Field type should show 'Path' not 'pathlib.Path'."""
+        result = build_layer_config(_path_reg)
+        source = generate_layer_config_source(result)
+
+        # Should contain ": Path" in the field definition
+        assert ": Path" in source or ": Path =" in source

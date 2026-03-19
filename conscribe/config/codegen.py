@@ -8,6 +8,7 @@ See ``config-typing-design.md`` Section 6.1 for specification.
 """
 from __future__ import annotations
 
+import enum
 import sys
 import types
 from typing import Annotated, Any, Literal, Union, get_args, get_origin
@@ -187,8 +188,9 @@ def _generate_nested_imports(
     if has_degraded:
         typing_imports.add("Any")
 
-    # Scan for Field usage
+    # Scan for Field usage and non-builtin types
     has_field = False
+    extra_imports: dict[str, set[str]] = {}
     all_models = list(result.per_key_models.values())
     if result.per_segment_models:
         for seg_models in result.per_segment_models.values():
@@ -198,9 +200,15 @@ def _generate_nested_imports(
         for field_info in model.model_fields.values():
             if _needs_field(field_info):
                 has_field = True
-                break
-        if has_field:
-            break
+            tp = field_info.annotation
+            _collect_type_imports(tp, typing_imports)
+            _collect_non_builtin_types(tp, extra_imports)
+            if isinstance(field_info.default, enum.Enum):
+                enum_type = type(field_info.default)
+                mod = getattr(enum_type, "__module__", None)
+                name = enum_type.__name__
+                if mod and mod != "builtins":
+                    extra_imports.setdefault(mod, set()).add(name)
 
     if has_field:
         pydantic_imports.add("Field")
@@ -209,6 +217,9 @@ def _generate_nested_imports(
     lines.append(f"from typing import {', '.join(sorted(typing_imports))}")
     lines.append("")
     lines.append(f"from pydantic import {', '.join(sorted(pydantic_imports))}")
+    for mod in sorted(extra_imports.keys()):
+        names = ", ".join(sorted(extra_imports[mod]))
+        lines.append(f"from {mod} import {names}")
     lines.append("")
     return "\n".join(lines)
 
@@ -228,13 +239,23 @@ def _generate_discriminator_fn(result: LayerConfigResult) -> str:
     lines.append(f"    else:")
     lines.append(f"        _l0 = v.{disc_fields[0]}")
 
-    # Level 1+: nested fields
+    # Level 1+: nested fields — traverse into nested dicts/models
     for i in range(1, len(disc_fields)):
-        field_name = disc_fields[i]
+        # Build nested traversal for dict path
+        dict_chain = "v"
+        for j in range(1, i + 1):
+            dict_chain = f'{dict_chain}.get("{disc_fields[j]}", {{}}) if isinstance({dict_chain}, dict) else {{}}'
+        # Build nested traversal for model path
+        model_chain = "v"
+        for j in range(1, i + 1):
+            model_chain = f"getattr({model_chain}, '{disc_fields[j]}', None)"
+
         lines.append(f"    if isinstance(v, dict):")
-        lines.append(f'        _l{i} = v.get("{field_name}", {{}}).get("name", "")')
+        lines.append(f"        _nested{i} = {dict_chain}")
+        lines.append(f'        _l{i} = _nested{i}.get("name", "default") if isinstance(_nested{i}, dict) else "default"')
         lines.append(f"    else:")
-        lines.append(f"        _l{i} = v.{field_name}.name")
+        lines.append(f"        _obj{i} = {model_chain}")
+        lines.append(f'        _l{i} = getattr(_obj{i}, "name", "default") if _obj{i} else "default"')
 
     # Return joined string
     parts_str = ", ".join(f"_l{i}" for i in range(len(disc_fields)))
@@ -317,12 +338,21 @@ def _generate_imports(result: LayerConfigResult, has_degraded: bool = False) -> 
 
     # Scan fields to determine needed imports
     has_field = False
+    extra_imports: dict[str, set[str]] = {}
     for model in result.per_key_models.values():
         for field_name, field_info in model.model_fields.items():
             tp = field_info.annotation
             _collect_type_imports(tp, typing_imports)
+            _collect_non_builtin_types(tp, extra_imports)
             if _needs_field(field_info):
                 has_field = True
+            # Check enum defaults
+            if isinstance(field_info.default, enum.Enum):
+                enum_type = type(field_info.default)
+                mod = getattr(enum_type, "__module__", None)
+                name = enum_type.__name__
+                if mod and mod != "builtins":
+                    extra_imports.setdefault(mod, set()).add(name)
 
     if has_field:
         pydantic_imports.add("Field")
@@ -337,6 +367,10 @@ def _generate_imports(result: LayerConfigResult, has_degraded: bool = False) -> 
     lines.append(f"from typing import {', '.join(sorted(typing_imports))}")
     lines.append("")
     lines.append(f"from pydantic import {', '.join(sorted(pydantic_imports))}")
+    # Extra imports for non-builtin types
+    for mod in sorted(extra_imports.keys()):
+        names = ", ".join(sorted(extra_imports[mod]))
+        lines.append(f"from {mod} import {names}")
     lines.append("")
     return "\n".join(lines)
 
@@ -359,6 +393,43 @@ def _collect_type_imports(tp: Any, imports: set[str]) -> None:
             _collect_type_imports(args[0], imports)
     elif tp is Any:
         imports.add("Any")
+    elif origin is not None:
+        # Generic like list[T], dict[K,V] — recurse into args
+        for arg in get_args(tp):
+            _collect_type_imports(arg, imports)
+
+
+def _collect_non_builtin_types(tp: Any, extra_imports: dict[str, set[str]]) -> None:
+    """Collect non-builtin type imports needed for source generation.
+
+    Populates extra_imports as {module: {name, ...}} for types whose
+    ``__module__`` is not ``builtins`` or ``typing``.
+    """
+    origin = get_origin(tp)
+    if origin in _UNION_TYPES or origin is Annotated:
+        for arg in get_args(tp):
+            if arg is not type(None):
+                _collect_non_builtin_types(arg, extra_imports)
+        return
+    if origin is Literal:
+        return
+    if origin is not None:
+        # Generic: check the origin + recurse into args
+        _check_type_module(origin, extra_imports)
+        for arg in get_args(tp):
+            _collect_non_builtin_types(arg, extra_imports)
+        return
+    _check_type_module(tp, extra_imports)
+
+
+def _check_type_module(tp: Any, extra_imports: dict[str, set[str]]) -> None:
+    """Add an import entry if tp is from a non-builtin, non-typing module."""
+    if tp is Any or tp is type(None):
+        return
+    module = getattr(tp, "__module__", None)
+    name = getattr(tp, "__name__", None)
+    if module and name and module not in ("builtins", "typing"):
+        extra_imports.setdefault(module, set()).add(name)
 
 
 def _needs_field(field_info: FieldInfo) -> bool:
@@ -515,11 +586,16 @@ def _value_to_source(value: Any) -> str:
         return repr(value)
     if isinstance(value, str):
         return repr(value)
+    if isinstance(value, enum.Enum):
+        return f"{type(value).__name__}.{value.name}"
     if isinstance(value, list):
         return repr(value)
     if isinstance(value, dict):
         return repr(value)
-    return repr(value)
+    r = repr(value)
+    if r.startswith("<"):
+        return f"...  # default: {r}"
+    return r
 
 
 def _generate_union_alias(result: LayerConfigResult) -> str:

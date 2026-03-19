@@ -18,6 +18,8 @@ from typing import (
     Annotated,
     Protocol,
     Union,
+    get_args,
+    get_origin,
     runtime_checkable,
 )
 from unittest.mock import patch
@@ -318,6 +320,64 @@ class TestExtractorEdgeCases:
             result = _safe_get_type_hints(func)
 
         assert result == {"x": int}
+
+    def test_safe_get_type_hints_fallback_resolves_field_annotations(self) -> None:
+        """When ``get_type_hints`` fails globally (e.g. one annotation
+        references a name missing from the module), the per-annotation
+        fallback must still resolve annotations containing callables
+        like ``pydantic.Field`` — not filter them out of the namespace.
+
+        Regression test for: ``from __future__ import annotations`` +
+        cross-file type references causing ``get_type_hints`` to fail,
+        which then caused ``Annotated[..., Field(...)]`` annotations
+        to degrade to raw strings (because ``Field`` was excluded from
+        the eval namespace), breaking ``__config_annotated_only__``.
+        """
+        from conscribe.config.extractor import (
+            _safe_get_type_hints,
+            _extract_field_info_from_annotated,
+        )
+        from pydantic import Field
+        from pydantic.fields import FieldInfo
+
+        # Simulate a function with string annotations (from __future__)
+        # where get_type_hints fails because of one bad annotation.
+        def func(good_param="x", bad_param=None):
+            pass
+
+        func.__annotations__ = {
+            "good_param": 'Annotated[str, Field(description="hello")]',
+            "bad_param": "SomeUnresolvableType",
+        }
+
+        # Inject Field into the function's module globals so the
+        # fallback eval can find it (mirrors real-world imports).
+        func.__globals__["Field"] = Field
+
+        with patch(
+            "conscribe.config.extractor.get_type_hints",
+            side_effect=NameError("name 'SomeUnresolvableType' is not defined"),
+        ):
+            hints = _safe_get_type_hints(func)
+
+        assert hints is not None
+        # good_param must be a resolved Annotated type, not a raw string
+        good_hint = hints["good_param"]
+        assert get_origin(good_hint) is Annotated, (
+            f"Expected Annotated, got {type(good_hint).__name__}: {good_hint!r}"
+        )
+        args = get_args(good_hint)
+        assert args[0] is str
+        assert isinstance(args[1], FieldInfo)
+        assert args[1].description == "hello"
+
+        # _extract_field_info_from_annotated must find the FieldInfo
+        field_info = _extract_field_info_from_annotated(good_hint)
+        assert field_info is not None
+        assert field_info.description == "hello"
+
+        # bad_param should fall back to raw string (not crash)
+        assert hints["bad_param"] == "SomeUnresolvableType"
 
     def test_safe_get_type_hints_catastrophic_failure_returns_none(self) -> None:
         """If even the fallback annotation processing crashes (e.g.

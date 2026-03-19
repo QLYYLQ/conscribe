@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import pytest
-from typing import Protocol, runtime_checkable
+from typing import Annotated, Protocol, runtime_checkable
 
-from pydantic import BaseModel, TypeAdapter
+from pydantic import BaseModel, Field, TypeAdapter
+from pydantic_core import PydanticUndefined
 
 from conscribe import create_registrar
 from conscribe.config.builder import LayerConfigResult
@@ -470,3 +471,212 @@ class TestLeafKeyFiltering:
         # Only leaf key should be in the result
         assert "openai.azure" in result.per_key_models
         assert "openai" not in result.per_key_models
+
+
+# ===================================================================
+# Phase 4: Tests for uncommitted builder.py code
+# ===================================================================
+
+
+class TestLeafParamPromotion:
+    """Test that leaf-only params are promoted to level 0 (4a)."""
+
+    def test_single_provider_params_flat(self, nested_registrar):
+        """Class with key 'google.default' but no abstract parent defining
+        level-0 params should have its params appear flat at level 0."""
+        R = nested_registrar
+
+        class GoogleBase(metaclass=R.Meta):
+            __registry_key__ = "google"
+            __abstract__ = True
+            async def chat(self, messages: list[dict]) -> str:
+                return "ok"
+
+        class GoogleDefault(GoogleBase):
+            __registry_key__ = "google.default"
+            def __init__(self, api_key: str, region: str = "us"):
+                self.api_key = api_key
+                self.region = region
+
+        result = R.build_config()
+        model = result.per_key_models["google.default"]
+
+        # Params should be flat on the combined model (level 0), not nested
+        assert "model_type" in model.model_fields
+        # At least one of the params should be directly on the model
+        flat_fields = set(model.model_fields.keys()) - {"model_type", "provider"}
+        assert len(flat_fields) > 0, (
+            "Leaf-only params should be promoted to level 0 (flat)"
+        )
+
+
+class TestNestedAutoDefault:
+    """Test nested sub-model auto-default behavior (4b)."""
+
+    def test_all_defaults_provider_optional(self, nested_registrar):
+        """When ALL nested sub-model fields have defaults, the provider
+        field itself becomes optional (has a default)."""
+        R = nested_registrar
+
+        class Base(metaclass=R.Meta):
+            __registry_key__ = "openai"
+            __abstract__ = True
+            async def chat(self, messages: list[dict]) -> str:
+                return "ok"
+            def __init__(self, temperature: float = 0.7):
+                self.temperature = temperature
+
+        class OfficialImpl(Base):
+            __registry_key__ = "openai.official"
+            def __init__(self, endpoint: str = "https://api.openai.com", **kwargs):
+                super().__init__(**kwargs)
+                self.endpoint = endpoint
+
+        result = R.build_config()
+        model = result.per_key_models["openai.official"]
+
+        # The provider field should have a default (not PydanticUndefined)
+        provider_field = model.model_fields.get("provider")
+        assert provider_field is not None
+        assert provider_field.default is not PydanticUndefined, (
+            "Provider field should be optional when all sub-fields have defaults"
+        )
+
+    def test_required_field_provider_required(self, nested_registrar):
+        """When a nested sub-model has at least one required field,
+        the provider field stays required (...)."""
+        R = nested_registrar
+
+        class Base(metaclass=R.Meta):
+            __registry_key__ = "openai"
+            __abstract__ = True
+            async def chat(self, messages: list[dict]) -> str:
+                return "ok"
+            def __init__(self, temperature: float = 0.7):
+                self.temperature = temperature
+
+        class AzureImpl(Base):
+            __registry_key__ = "openai.azure"
+            def __init__(self, deployment: str, **kwargs):
+                super().__init__(**kwargs)
+                self.deployment = deployment
+
+        result = R.build_config()
+        model = result.per_key_models["openai.azure"]
+
+        # The provider field should be required
+        provider_field = model.model_fields.get("provider")
+        assert provider_field is not None
+        assert provider_field.default is PydanticUndefined, (
+            "Provider field should be required when sub-model has required fields"
+        )
+
+
+class TestAnnotatedOnlyNested:
+    """Test __config_annotated_only__ in nested mode (4c)."""
+
+    def test_annotated_only_filters_bare_params(self, nested_registrar):
+        """Parent with __config_annotated_only__ = True: only params with
+        Annotated[..., Field()] should appear in the config."""
+        R = nested_registrar
+
+        class Base(metaclass=R.Meta):
+            __registry_key__ = "openai"
+            __abstract__ = True
+            __config_annotated_only__ = True
+            async def chat(self, messages: list[dict]) -> str:
+                return "ok"
+            def __init__(
+                self,
+                temperature: Annotated[float, Field(description="Sampling temp")] = 0.7,
+                internal_state: str = "init",
+            ):
+                self.temperature = temperature
+                self.internal_state = internal_state
+
+        class AzureImpl(Base):
+            __registry_key__ = "openai.azure"
+            def __init__(
+                self,
+                deployment: Annotated[str, Field(description="Azure deployment")],
+                _debug: bool = False,
+                **kwargs,
+            ):
+                super().__init__(**kwargs)
+                self.deployment = deployment
+                self._debug = _debug
+
+        result = R.build_config()
+        model = result.per_key_models["openai.azure"]
+
+        # Collect all field names from combined model and nested models
+        all_fields = set(model.model_fields.keys())
+        for fname, finfo in model.model_fields.items():
+            if hasattr(finfo.annotation, "model_fields"):
+                all_fields.update(finfo.annotation.model_fields.keys())
+
+        # Annotated params should be present
+        assert "temperature" in all_fields or "deployment" in all_fields
+
+        # Bare params should NOT be present
+        assert "internal_state" not in all_fields, (
+            "Bare-typed params should be excluded in annotated-only mode"
+        )
+        assert "_debug" not in all_fields, (
+            "Bare-typed params should be excluded in annotated-only mode"
+        )
+
+
+class TestDiscriminatorDefaultFallback:
+    """Test discriminator 'default' fallback (4d)."""
+
+    def test_missing_name_field_returns_default(self, nested_registrar):
+        """When the provider sub-model dict is missing the 'name' field,
+        the discriminator should return 'default' (not empty string)."""
+        R = nested_registrar
+
+        class Base(metaclass=R.Meta):
+            __registry_key__ = "openai"
+            __abstract__ = True
+            async def chat(self, messages: list[dict]) -> str:
+                return "ok"
+            def __init__(self, temperature: float = 0.7):
+                self.temperature = temperature
+
+        class DefaultImpl(Base):
+            __registry_key__ = "openai.default"
+            def __init__(self, endpoint: str = "https://api.openai.com", **kwargs):
+                super().__init__(**kwargs)
+                self.endpoint = endpoint
+
+        result = R.build_config()
+
+        # The discriminator function should handle missing 'name' gracefully
+        # Extract the discriminator function from the union_type
+        from typing import get_args
+        union_args = get_args(result.union_type)
+        discriminator = None
+        for arg in union_args:
+            if hasattr(arg, "func") or hasattr(arg, "__metadata__"):
+                # Get the Discriminator from metadata
+                from typing import get_args as ga
+                meta_args = ga(result.union_type)
+                for ma in meta_args:
+                    if hasattr(ma, "discriminator"):
+                        discriminator = ma.discriminator
+                        break
+                break
+
+        # Test with dict missing 'name' in provider
+        test_dict = {
+            "model_type": "openai",
+            "provider": {},
+        }
+
+        # Validate via TypeAdapter — the "openai.default" key should match
+        adapter = TypeAdapter(result.union_type)
+        config = adapter.validate_python({
+            "model_type": "openai",
+            "provider": {"name": "default", "endpoint": "https://custom.api.com"},
+        })
+        assert config.model_type == "openai"

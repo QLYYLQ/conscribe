@@ -17,13 +17,18 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
+import logging
 from typing import Annotated, Any, Literal, Union
 
+logger = logging.getLogger(__name__)
+
 from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag, create_model
+from pydantic_core import PydanticUndefined
 
 from conscribe.config.extractor import (
     extract_config_schema,
     extract_own_init_params,
+    _extract_field_info_from_annotated,
     _safe_get_type_hints,
     _unwrap_annotated_type,
 )
@@ -94,6 +99,7 @@ def _build_flat_config(registrar: type) -> LayerConfigResult:
 
     per_key_models: dict[str, type[BaseModel]] = {}
     all_degraded: dict[str, list[Any]] = {}
+    _seen_model_names: dict[str, str] = {}  # model_name -> key
 
     # Read MRO config from the registrar
     reg_mro_scope = getattr(registrar, "_mro_scope", "local")
@@ -104,6 +110,13 @@ def _build_flat_config(registrar: type) -> LayerConfigResult:
             cls, mro_scope=reg_mro_scope, mro_depth=reg_mro_depth,
         )
         model_name = _build_model_name(key, layer_name)
+        if model_name in _seen_model_names:
+            logger.warning(
+                "Model name collision: keys %r and %r both produce "
+                "model name %r in layer %r",
+                _seen_model_names[model_name], key, model_name, layer_name,
+            )
+        _seen_model_names[model_name] = key
 
         if schema is None:
             # No extractable params — create discriminator-only model
@@ -225,7 +238,13 @@ def _build_nested_config(registrar: type) -> LayerConfigResult:
 
         # Add nested sub-model for level 1 (if exists)
         if n_levels > 1 and nested_field_type is not None:
-            combined_defs[disc_fields[1]] = (nested_field_type, ...)
+            # Auto-default when all sub-model fields have defaults
+            all_have_defaults = all(
+                fi.default is not PydanticUndefined
+                for fi in nested_field_type.model_fields.values()
+            )
+            nested_default = nested_field_type() if all_have_defaults else ...
+            combined_defs[disc_fields[1]] = (nested_field_type, nested_default)
 
         combined_base = type(
             f"_{combined_name}Base",
@@ -290,6 +309,12 @@ def _extract_params_by_level(
     seen_params: set[str] = set()
     level_params: dict[int, dict[str, tuple[Any, Any]]] = {}
 
+    # Check annotated-only mode from the leaf class or its MRO
+    annotated_only = any(
+        getattr(anc, "__config_annotated_only__", False)
+        for _, anc in keyed_mro
+    )
+
     for level, ancestor in keyed_mro:
         if "__init__" not in ancestor.__dict__:
             continue
@@ -314,15 +339,24 @@ def _extract_params_by_level(
         for param in own_params:
             if param.name in seen_params:
                 continue
+
+            # Get type hint
+            raw_type = Any
+            if hints is not None and param.name in hints:
+                raw_type = hints[param.name]
+
+            # In annotated-only mode, skip params without Annotated[..., Field(...)]
+            if annotated_only and _extract_field_info_from_annotated(raw_type) is None:
+                seen_params.add(param.name)
+                continue
+
             seen_params.add(param.name)
 
-            # Get type
-            param_type = Any
-            if hints is not None and param.name in hints:
-                param_type = hints[param.name]
-                base = _unwrap_annotated_type(param_type)
-                if base is not inspect.Parameter.empty:
-                    param_type = base
+            # Unwrap to base type
+            param_type = raw_type
+            base = _unwrap_annotated_type(param_type)
+            if base is not inspect.Parameter.empty:
+                param_type = base
 
             # Get default
             if param.default is not inspect.Parameter.empty:
@@ -331,6 +365,13 @@ def _extract_params_by_level(
                 default = ...
 
             level_params.setdefault(level, {})[param.name] = (param_type, default)
+
+    # Promote leaf-only params to level 0 when no intermediate ancestor exists.
+    # This handles single-provider types (e.g., google.default) where all params
+    # are defined on the leaf class but should appear flat in the config.
+    if 0 not in level_params and level_params:
+        max_level = max(level_params.keys())
+        level_params[0] = level_params.pop(max_level)
 
     return level_params
 
@@ -361,12 +402,12 @@ def _build_compound_union(
                     nested = v
                     for j in range(1, i + 1):
                         nested = nested.get(disc_fields[j], {}) if isinstance(nested, dict) else {}
-                    parts.append(nested.get("name", "") if isinstance(nested, dict) else getattr(nested, "name", ""))
+                    parts.append(nested.get("name", "default") if isinstance(nested, dict) else getattr(nested, "name", "default"))
                 else:
                     obj = v
                     for j in range(1, i + 1):
                         obj = getattr(obj, disc_fields[j], None)
-                    parts.append(getattr(obj, "name", "") if obj else "")
+                    parts.append(getattr(obj, "name", "default") if obj else "default")
         return separator.join(parts)
 
     # Set a descriptive name

@@ -146,7 +146,15 @@ class LayerRegistrar(Generic[P]):
             meta = ext_meta
         else:
             # Strategy 4: incompatible — create combined metaclass
-            meta = type(f"{bridge_name}Meta", (cls.Meta, ext_meta), {})
+            try:
+                meta = type(f"{bridge_name}Meta", (cls.Meta, ext_meta), {})
+            except TypeError as exc:
+                raise TypeError(
+                    f"Cannot create combined metaclass for bridge '{bridge_name}': "
+                    f"{cls.Meta.__name__} and {ext_meta.__name__} are incompatible. "
+                    f"Consider using base_metaclass= in create_registrar() to resolve "
+                    f"the metaclass conflict."
+                ) from exc
 
         return meta(bridge_name, (external_class,), {"__abstract__": True})
 
@@ -201,7 +209,7 @@ class LayerRegistrar(Generic[P]):
         """
         registry = cls._registry
         kt = cls._key_transform
-        path_c_filters = cls._filters
+        path_c_filters = tuple(cls._filters)
 
         # Save the ORIGINAL __init_subclass__ from this class's own dict
         # (NOT inherited). Use __dict__.get(), NOT getattr().

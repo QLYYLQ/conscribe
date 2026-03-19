@@ -102,7 +102,7 @@ def discover(
             try:
                 importlib.import_module(module_info.name)
                 imported.append(module_info.name)
-            except Exception:
+            except (ImportError, SyntaxError):
                 _already_failed.add(module_info.name)
                 logger.warning(
                     "Failed to import module '%s' during discover(): skipping",
