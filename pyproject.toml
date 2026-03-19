@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "conscribe"
-version = "0.5.2"
+version = "0.5.3"
 description = "Automatic class registration and config typing stub generation for layered Python architectures"
 readme = "README.md"
 license = "MIT"
@@ -40,6 +40,20 @@ dev = [
     "pytest-cov>=4.0",
     "attrs>=22.0",
 ]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "tests/",
+    "*.md",
+    "!README.md",
+    ".claude/",
+    "demo_*.py",
+    "test_*.py",
+    "uv.lock",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["conscribe"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
