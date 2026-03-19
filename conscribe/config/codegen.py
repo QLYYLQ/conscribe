@@ -423,8 +423,16 @@ def _collect_non_builtin_types(tp: Any, extra_imports: dict[str, set[str]]) -> N
 
 
 def _check_type_module(tp: Any, extra_imports: dict[str, set[str]]) -> None:
-    """Add an import entry if tp is from a non-builtin, non-typing module."""
+    """Add an import entry if tp is from a non-builtin, non-typing module.
+
+    Skips dynamically created Pydantic models (segment/combined models
+    from the builder) since they are defined in the generated file itself.
+    """
     if tp is Any or tp is type(None):
+        return
+    # Skip Pydantic BaseModel subclasses — these are builder-generated
+    # models that will be defined in the output stub file, not imported.
+    if isinstance(tp, type) and issubclass(tp, BaseModel):
         return
     module = getattr(tp, "__module__", None)
     name = getattr(tp, "__name__", None)
