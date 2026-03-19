@@ -184,6 +184,41 @@ class PartialProviderConfig(BaseModel):
     model_config = ConfigDict(extra="allow")
 ```
 
+## Nested Config (Hierarchical Keys)
+
+Some frameworks use hierarchical keys (e.g., `"openai.azure"`) with compound discriminators. In this case, the config has a hybrid format — level 0 params are flat, level 1+ are nested:
+
+```yaml
+# experiment.yaml
+llm:
+  model_type: openai           # flat (level 0 discriminator)
+  temperature: 0.7             # flat (level 0 param)
+  max_tokens: 1000
+  provider:                    # nested (level 1)
+    name: azure                # level 1 discriminator
+    deployment: my-deployment
+    api_version: 2024-02
+```
+
+The generated stub looks like:
+
+```python
+class OpenaiAzureLLMConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    model_type: Literal["openai"] = "openai"
+    temperature: float = 0.7
+    max_tokens: int = 1000
+    provider: AzureProviderConfig
+
+class AzureProviderConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: Literal["azure"] = "azure"
+    deployment: str
+    api_version: str = "2024-02"
+```
+
+Invalid combinations (e.g., `model_type: openai` + `provider.name: bedrock` when `"openai.bedrock"` isn't registered) are rejected at validation time.
+
 ## Type Degradation
 
 When MRO traversal reaches third-party types that Pydantic can't serialize (e.g., `httpx.Auth`, `ssl.SSLContext`), conscribe degrades them to `Any`:

@@ -192,6 +192,136 @@ class ChatGPT4(ChatBase):
 # Registered as "gpt4" instead of "chat_gpt4"
 ```
 
+## How do I register under multiple keys?
+
+Set `__registry_key__` to a list:
+
+```python
+class UniversalProvider(Base):
+    __registry_key__ = ["openai.universal", "anthropic.universal"]
+    def __init__(self, endpoint: str): ...
+# Registered under BOTH keys
+# cls.__registry_key__ == "openai.universal"  (primary)
+# cls.__registry_keys__ == ["openai.universal", "anthropic.universal"]
+```
+
+## How do I use hierarchical (dotted) keys?
+
+Set `key_separator` on the registrar:
+
+```python
+LLM = create_registrar(
+    "llm", proto,
+    discriminator_field="provider",
+    key_separator=".",
+)
+
+class OpenAIBase(metaclass=LLM.Meta):
+    __registry_key__ = "openai"
+    __abstract__ = True
+
+class AzureOpenAI(OpenAIBase):
+    __registry_key__ = "openai.azure"
+    # Or omit __registry_key__ for auto-derivation: "openai.azure_open_ai"
+
+# Query the hierarchy:
+LLM.children("openai")  # {"openai.azure": AzureOpenAI, ...}
+LLM.tree()               # {"openai": {"azure": AzureOpenAI, ...}}
+```
+
+## How do I register in multiple registries (diamond inheritance)?
+
+Use the `|` operator on metaclasses:
+
+```python
+LLM = create_registrar("llm", LLMProtocol, discriminator_field="provider")
+Agent = create_registrar("agent", AgentProtocol, discriminator_field="name")
+
+CombinedMeta = LLM.Meta | Agent.Meta
+
+class LLMAgentBase(metaclass=CombinedMeta):
+    __abstract__ = True
+    # Implement both protocols...
+
+class MyLLMAgent(LLMAgentBase):
+    ...
+# Registered in BOTH llm and agent registries
+```
+
+To opt out of one registry, use `__skip_registries__`:
+
+```python
+class LLMOnly(LLMAgentBase):
+    __skip_registries__ = ["agent"]
+# Only registered in llm, not agent
+```
+
+## How do I control which subclasses get registered?
+
+Use parent-level controls:
+
+```python
+class StrictBase(metaclass=R.Meta):
+    __abstract__ = True
+
+    # Block children whose name contains "Test"
+    @staticmethod
+    def __registration_filter__(child_cls):
+        return "Test" not in child_cls.__name__
+
+class ValidImpl(StrictBase): ...  # registered
+class TestImpl(StrictBase): ...   # blocked
+
+# Limit depth:
+class ShallowBase(metaclass=R.Meta):
+    __abstract__ = True
+    __propagate_depth__ = 1  # only direct children register
+
+# Stop propagation entirely:
+class TerminalBase(metaclass=R.Meta):
+    __abstract__ = True
+    __propagate__ = False  # no children register
+```
+
+## How do I build nested config with compound discriminators?
+
+Use `discriminator_fields` (list) instead of `discriminator_field` (string):
+
+```python
+LLM = create_registrar(
+    "llm", LLMProtocol,
+    discriminator_fields=["model_type", "provider"],
+    key_separator=".",
+)
+
+class OpenAIBase(metaclass=LLM.Meta):
+    __registry_key__ = "openai"
+    __abstract__ = True
+    def __init__(self, temperature: float = 0.7): ...
+
+class AzureOpenAI(OpenAIBase):
+    __registry_key__ = "openai.azure"
+    def __init__(self, deployment: str, **kwargs): ...
+
+# YAML config (hybrid format):
+# llm:
+#   model_type: openai           # flat (level 0 discriminator)
+#   temperature: 0.7             # flat (level 0 param)
+#   provider:                    # nested (level 1)
+#     name: azure
+#     deployment: my-deploy
+
+# Validation:
+from pydantic import TypeAdapter
+result = LLM.build_config()
+adapter = TypeAdapter(result.union_type)
+config = adapter.validate_python({
+    "model_type": "openai",
+    "temperature": 0.9,
+    "provider": {"name": "azure", "deployment": "my-deploy"},
+})
+```
+
 ## How do I skip a class from registration?
 
 Mark it abstract:

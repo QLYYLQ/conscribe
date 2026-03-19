@@ -105,6 +105,40 @@ See the [Config Typing Guide](https://github.com/QLYYLQ/conscribe/blob/master/co
 | **2** | + `Annotated[int, Field(ge=0)]` | + constraints |
 | **3** | `__config_schema__ = MyModel` | Full Pydantic model |
 
+### Nested Config (Hierarchical Keys)
+
+For layers with natural hierarchies (e.g., model_type → provider):
+
+```python
+LLM = create_registrar(
+    "llm", ChatModelProtocol,
+    discriminator_fields=["model_type", "provider"],
+    key_separator=".",
+)
+```
+
+Produces hybrid YAML configs where level 0 is flat and level 1+ is nested:
+
+```yaml
+llm:
+  model_type: openai        # flat (level 0)
+  temperature: 0.7          # flat (level 0 param)
+  provider:                 # nested (level 1)
+    name: azure
+    deployment: my-deploy
+```
+
+### Cross-Registry Diamond Inheritance
+
+Register a class in multiple registries:
+
+```python
+CombinedMeta = LLM.Meta | Agent.Meta
+
+class LLMAgent(metaclass=CombinedMeta):
+    ...  # in both LLM and Agent registries
+```
+
 ---
 
 ## API Reference
@@ -116,6 +150,8 @@ See the [Config Typing Guide](https://github.com/QLYYLQ/conscribe/blob/master/co
 | `create_registrar(name, protocol, ...)` | Create a layer registrar (recommended entry point) |
 | `Registrar.get(key)` | Look up a registered class |
 | `Registrar.keys()` | List all registered keys |
+| `Registrar.children(prefix)` | Query hierarchical key descendants |
+| `Registrar.tree()` | Get nested dict of key hierarchy |
 | `Registrar.bridge(external_cls)` | Create bridge for external class |
 | `Registrar.register(key)` | Manual registration decorator |
 | `discover(*package_paths)` | Import modules to trigger registration |
@@ -125,7 +161,7 @@ See the [Config Typing Guide](https://github.com/QLYYLQ/conscribe/blob/master/co
 | API | Purpose |
 |-----|---------|
 | `extract_config_schema(cls, mro_scope, mro_depth)` | Extract Pydantic model from `__init__` |
-| `build_layer_config(registrar)` | Build discriminated union for a layer |
+| `build_layer_config(registrar)` | Build discriminated union (flat or nested mode) |
 | `generate_layer_config_source(result)` | Generate Python stub source code |
 | `generate_layer_json_schema(result)` | Generate JSON Schema |
 | `compute_registry_fingerprint(registrar)` | Compute registry fingerprint hash |

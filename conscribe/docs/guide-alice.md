@@ -184,6 +184,101 @@ class SubExt(ExtAgent):  # auto-registered as "sub_ext"
     def step(self): ...
 ```
 
+## Advanced: Hierarchical Keys
+
+For layers with natural hierarchies (e.g., model_type → provider), use `key_separator` and `discriminator_fields`:
+
+```python
+LLM = create_registrar(
+    "llm", ChatModelProtocol,
+    discriminator_fields=["model_type", "provider"],
+    key_separator=".",
+)
+
+# Abstract parent defines level 0 params
+class OpenAIBase(metaclass=LLM.Meta):
+    __registry_key__ = "openai"
+    __abstract__ = True
+    def __init__(self, *, temperature: float = 0.7, max_tokens: int = 1000):
+        ...
+
+# Leaf children define level 1 params
+class AzureOpenAI(OpenAIBase):
+    __registry_key__ = "openai.azure"
+    def __init__(self, *, deployment: str, api_version: str = "2024-02", **kwargs):
+        super().__init__(**kwargs)
+
+class OfficialOpenAI(OpenAIBase):
+    __registry_key__ = "openai.official"
+    def __init__(self, *, endpoint: str, **kwargs):
+        super().__init__(**kwargs)
+```
+
+### Tree Queries
+
+```python
+LLM.children("openai")
+# → {"openai.azure": AzureOpenAI, "openai.official": OfficialOpenAI}
+
+LLM.tree()
+# → {"openai": {"azure": AzureOpenAI, "official": OfficialOpenAI}}
+```
+
+### Generated Nested Config
+
+Config stubs use compound discrimination with nested sub-models:
+
+```yaml
+# experiment.yaml (hybrid format)
+llm:
+  model_type: openai           # flat (level 0 discriminator)
+  temperature: 0.7             # flat (level 0 param)
+  max_tokens: 1000
+  provider:                    # nested (level 1)
+    name: azure
+    deployment: my-deployment
+    api_version: 2024-02
+```
+
+## Advanced: Cross-Registry Diamond Inheritance
+
+Register a class in multiple registries using the `|` operator:
+
+```python
+LLM = create_registrar("llm", LLMProtocol, discriminator_field="provider")
+Agent = create_registrar("agent", AgentProtocol, discriminator_field="name")
+
+CombinedMeta = LLM.Meta | Agent.Meta
+
+class LLMAgentBase(metaclass=CombinedMeta):
+    __abstract__ = True
+    # Implement both protocols...
+
+class MyLLMAgent(LLMAgentBase):
+    ...
+# MyLLMAgent is in BOTH LLM and Agent registries
+```
+
+### Selective Opt-Out
+
+```python
+class LLMOnly(LLMAgentBase):
+    __skip_registries__ = ["agent"]
+# Only in LLM registry
+```
+
+### Parent Registration Control
+
+```python
+class StrictBase(metaclass=LLM.Meta):
+    __abstract__ = True
+    __propagate_depth__ = 1  # only direct children register
+
+    @staticmethod
+    def __registration_filter__(child_cls):
+        return "Test" not in child_cls.__name__  # block test classes
+```
+
 ## Pydantic BaseModel + Generic[T]
 
 When Pydantic specializes `BaseModel[T]`, it creates real class objects that would pollute the registry. Conscribe filters these automatically (`skip_pydantic_generic=True` by default).

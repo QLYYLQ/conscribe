@@ -11,12 +11,21 @@ The recommended entry point. Creates a `LayerRegistrar` subclass with all compon
 ```python
 from conscribe import create_registrar
 
+# Flat mode (single discriminator)
 LLMRegistrar = create_registrar(
     "llm",
     ChatModelProtocol,
     discriminator_field="provider",
     strip_prefixes=["Chat"],
     mro_scope="local",
+)
+
+# Nested mode (compound discriminator)
+LLM = create_registrar(
+    "llm",
+    ChatModelProtocol,
+    discriminator_fields=["model_type", "provider"],
+    key_separator=".",
 )
 ```
 
@@ -26,7 +35,9 @@ LLMRegistrar = create_registrar(
 |------|------|---------|-------------|
 | `name` | `str` | required | Layer name (e.g. `"agent"`, `"llm"`) |
 | `protocol` | `type` | required | `@runtime_checkable` Protocol class |
-| `discriminator_field` | `str` | `""` | Config union discriminator field name |
+| `discriminator_field` | `str` | `""` | Config union discriminator field name (flat mode) |
+| `discriminator_fields` | `list[str] \| None` | `None` | Discriminator field names (nested mode). Mutually exclusive with `discriminator_field`. Requires `key_separator`. |
+| `key_separator` | `str` | `""` | Separator for hierarchical keys (e.g. `"."`) |
 | `strip_suffixes` | `list[str] \| None` | `None` | Suffixes to strip during key inference |
 | `strip_prefixes` | `list[str] \| None` | `None` | Prefixes to strip during key inference |
 | `key_transform` | `KeyTransform \| None` | `None` | Custom key inference function (overrides strip_*) |
@@ -38,7 +49,10 @@ LLMRegistrar = create_registrar(
 
 **Returns:** A `LayerRegistrar` subclass.
 
-**Raises:** `InvalidProtocolError` if protocol is not `@runtime_checkable`.
+**Raises:**
+- `InvalidProtocolError` if protocol is not `@runtime_checkable`.
+- `ValueError` if both `discriminator_field` and `discriminator_fields` are set.
+- `ValueError` if `discriminator_fields` is set without `key_separator`.
 
 ---
 
@@ -67,6 +81,24 @@ Return all registered keys.
 #### `LayerRegistrar.unregister(key: str) -> None`
 
 Remove a registration. Intended for test isolation.
+
+#### `LayerRegistrar.children(prefix: str) -> dict[str, type]`
+
+Return all entries whose key starts with `prefix + separator`. Only meaningful when `key_separator` is set.
+
+```python
+LLM.children("openai")
+# → {"openai.azure": AzureOpenAI, "openai.official": OfficialOpenAI}
+```
+
+#### `LayerRegistrar.tree() -> dict`
+
+Return a nested dict representing the key hierarchy. Only meaningful when `key_separator` is set.
+
+```python
+LLM.tree()
+# → {"openai": {"azure": AzureOpenAI, "official": OfficialOpenAI}}
+```
 
 #### `LayerRegistrar.bridge(external_class, *, name=None) -> type`
 
@@ -108,6 +140,21 @@ Get the config schema for a specific registered key.
 
 ---
 
+### `AutoRegistrarBase` (metaclass)
+
+Shared base for all conscribe AutoRegistrar metaclasses. Uses `MetaRegistrarType` as its meta-metaclass to support the `|` operator.
+
+```python
+from conscribe import AutoRegistrarBase
+
+# Cross-registry diamond:
+CombinedMeta = LLM.Meta | Agent.Meta
+class DualClass(metaclass=CombinedMeta):
+    ...  # registered in both
+```
+
+---
+
 ### `discover(*package_paths, **kwargs) -> list[str]`
 
 Recursively import all modules under the given packages to trigger registration.
@@ -129,8 +176,6 @@ imported = discover("my_app.agents", "my_app.llm_providers")
 
 **Returns:** List of successfully imported module names.
 
-**Raises:** `ModuleNotFoundError` if a top-level package doesn't exist.
-
 ---
 
 ### Supporting Types
@@ -148,7 +193,7 @@ Pure CamelCase -> snake_case conversion. Used when no key inference params are s
 
 #### `make_key_transform(*, suffixes=None, prefixes=None) -> KeyTransform`
 
-Factory for key transforms with suffix/prefix stripping. Suffix stripping happens first, then prefix, then CamelCase -> snake_case.
+Factory for key transforms with suffix/prefix stripping.
 
 ---
 
@@ -156,14 +201,7 @@ Factory for key transforms with suffix/prefix stripping. Suffix stripping happen
 
 ### `extract_config_schema(cls, mro_scope="local", mro_depth=None) -> type[BaseModel] | None`
 
-Extract a Pydantic model from a class's `__init__` signature.
-
-**Extraction priority:**
-1. `cls.__config_schema__` -> return directly (Tier 3)
-2. BaseModel subclass without custom `__init__` -> extract from `model_fields`
-3. Single-param BaseModel in `__init__` -> return that type (Tier 3 variant)
-4. `__init__` signature reflection -> dynamic Pydantic model (Tier 1/1.5/2)
-5. No extractable params -> `None`
+Extract a Pydantic model from a class's `__init__` signature. See [Config Typing Deep-Dive](config-typing.md) for extraction priority.
 
 **Parameters:**
 
@@ -173,25 +211,15 @@ Extract a Pydantic model from a class's `__init__` signature.
 | `mro_scope` | `MROScope` | `"local"` | Scope for MRO traversal (overridden by `__config_mro_scope__`) |
 | `mro_depth` | `int \| None` | `None` | Max MRO levels (overridden by `__config_mro_depth__`) |
 
-**Returns:** A Pydantic `BaseModel` subclass, or `None`.
-
 ---
 
 ### `build_layer_config(registrar) -> LayerConfigResult`
 
-Build a discriminated union from all registered classes.
-
-For each key: extract schema, inject `Literal[key]` discriminator, preserve extra policy. Single key -> model itself. Multiple keys -> `Annotated[Union[...], Field(discriminator=...)]`.
-
-**Parameters:**
-
-| Name | Type | Description |
-|------|------|-------------|
-| `registrar` | `type` | A `LayerRegistrar` subclass |
+Build a discriminated union from all registered classes. Dispatches to flat or nested mode based on `discriminator_fields`.
 
 **Returns:** `LayerConfigResult`
 
-**Raises:** `ValueError` if registrar has no `discriminator_field`.
+**Raises:** `ValueError` if registrar has no discriminator configuration.
 
 ---
 
@@ -200,34 +228,39 @@ For each key: extract schema, inject `Literal[key]` discriminator, preserve extr
 ```python
 @dataclass(frozen=True)
 class LayerConfigResult:
-    union_type: Any                              # The discriminated union type
-    per_key_models: dict[str, type[BaseModel]]   # Key -> per-key model
-    layer_name: str                              # Layer name
-    discriminator_field: str                     # Discriminator field name
-    degraded_fields: dict[str, list[DegradedField]]  # Key -> degraded fields (empty if none)
+    union_type: Any                                 # The discriminated union type
+    per_key_models: dict[str, type[BaseModel]]      # Key -> per-key model
+    layer_name: str                                 # Layer name
+    discriminator_field: str                        # Discriminator field name (flat mode)
+    degraded_fields: dict[str, list[DegradedField]] # Key -> degraded fields (empty if none)
+    # Nested mode fields:
+    discriminator_fields: list[str] | None = None   # Discriminator field names (nested mode)
+    key_separator: str = ""                         # Key separator
+    per_segment_models: dict[str, dict[str, type[BaseModel]]] | None = None
+    # e.g., {"provider": {"azure": AzureProviderConfig, "official": OfficialProviderConfig}}
 ```
 
 ---
 
 ### `generate_layer_config_source(result) -> str`
 
-Generate a self-contained Python source file from a `LayerConfigResult`.
-
-Output structure: header -> imports -> per-key classes -> model_rebuild() calls -> union alias.
+Generate a self-contained Python source file from a `LayerConfigResult`. Dispatches to flat or nested generation mode.
 
 ---
 
 ### `generate_layer_json_schema(result) -> dict`
 
-Generate a JSON Schema dict from a `LayerConfigResult`. Includes `x-discriminator` extension and `x-degraded-fields` when degradation occurred.
+Generate a JSON Schema dict. Includes:
+- `x-discriminator`: discriminator field name
+- `x-discriminator-fields`: list of discriminator field names (nested mode)
+- `x-key-separator`: the key separator (nested mode)
+- `x-degraded-fields`: degradation info (when applicable)
 
 ---
 
 ### `compute_registry_fingerprint(registrar) -> str`
 
-Compute a SHA-256 based fingerprint of all registered classes (keys, qualnames, signatures, docstrings). Returns a 16-character hex string. BaseModel-aware: hashes `model_fields` for BaseModel subclasses.
-
----
+Compute a 16-character hex fingerprint of all registered classes.
 
 ### `load_cached_fingerprint(fingerprint_path, layer_name) -> str | None`
 
@@ -235,7 +268,7 @@ Load a cached fingerprint from a JSON file.
 
 ### `save_fingerprint(fingerprint_path, layer_name, fingerprint) -> None`
 
-Save a fingerprint to a JSON cache file, preserving other layers.
+Save a fingerprint to a JSON cache file.
 
 ---
 
@@ -244,8 +277,6 @@ Save a fingerprint to a JSON cache file, preserving other layers.
 ```python
 MROScope = Literal["local", "third_party", "all"] | list[str]
 ```
-
----
 
 ### `DegradedField` (dataclass)
 
@@ -278,7 +309,12 @@ All inherit from `RegistryError`.
 | Attribute | Type | Purpose |
 |-----------|------|---------|
 | `__abstract__` | `bool` | Skip registration (checked via `namespace.get()`, not inherited) |
-| `__registry_key__` | `str` | Override inferred registry key |
+| `__registry_key__` | `str \| list[str]` | Override inferred registry key. List for multi-key registration |
+| `__registry_keys__` | `list[str]` | Set by metaclass when multi-key registration is used (read-only) |
+| `__skip_registries__` | `list[str]` | Skip registration in named registries |
+| `__registration_filter__` | `staticmethod` | Parent-level filter: called with child class, return `False` to block |
+| `__propagate__` | `bool` | If `False`, subclasses don't auto-register through this parent |
+| `__propagate_depth__` | `int` | Only N levels of subclasses auto-register |
 | `__config_schema__` | `type[BaseModel]` | Tier 3: explicit Pydantic model |
 | `__config_annotated_only__` | `bool` | Only include `Annotated[..., Field()]` params |
 | `__config_mro_scope__` | `MROScope` | Per-class MRO scope override |

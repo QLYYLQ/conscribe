@@ -6,9 +6,10 @@ This document covers the internals of `conscribe/registration/`. For usage, see 
 
 ```
 create_registrar(name, protocol, ...)
-    -> LayerRegistry(name, protocol)       # storage
-    -> create_auto_registrar(registry, kt) # metaclass
-    -> LayerRegistrar subclass             # facade
+    -> LayerRegistry(name, protocol, separator=...)  # storage
+    -> create_auto_registrar(registry, kt, ...)      # metaclass
+    -> build_filter_chain(...)                        # predicate filters
+    -> LayerRegistrar subclass                        # facade
 ```
 
 Three registration paths feed into the same `LayerRegistry`:
@@ -19,6 +20,61 @@ Three registration paths feed into the same `LayerRegistry`:
 | **B** (bridge) | `bridge()` creates abstract base, subclasses use Path A | No (same as A) |
 | **C** (manual) | `@register()` decorator calls `registry.add()` | Yes (explicit check) |
 
+## AutoRegistrarBase + MetaRegistrarType
+
+All conscribe metaclasses inherit from `AutoRegistrarBase`, which uses `MetaRegistrarType` as its meta-metaclass. This enables the `|` operator for cross-registry diamond inheritance:
+
+```python
+CombinedMeta = LLM.Meta | Agent.Meta  # combines two AutoRegistrar metaclasses
+
+class LLMAgent(metaclass=CombinedMeta):
+    ...  # registered in BOTH llm and agent registries
+```
+
+When `|` is applied:
+- If one is already a subclass of the other, returns the more specific one
+- Otherwise creates a new combined metaclass inheriting from both
+- The combined metaclass's MRO ensures both `__new__` methods fire via `super()` chain
+
+## Predicate Filter System
+
+`conscribe/registration/filters.py` replaces scattered `if/else` skip logic with composable filter objects. Each filter implements `should_skip(ctx) -> bool`.
+
+### RegistrationContext
+
+```python
+@dataclass(frozen=True)
+class RegistrationContext:
+    cls: type           # the class being registered
+    name: str           # class name
+    bases: tuple        # base classes
+    namespace: dict     # class __dict__
+    registry_name: str  # target registry name
+```
+
+### Built-in Filters
+
+| Filter | What it checks | Replaces |
+|--------|---------------|----------|
+| `RootFilter` | `not ctx.bases` | root base class check |
+| `PydanticGenericFilter` | `"[" in ctx.name` | Pydantic Generic intermediate |
+| `AbstractFilter` | `ctx.namespace.get("__abstract__")` | explicit abstract check |
+| `CustomCallableFilter(fn)` | `fn(ctx.cls)` | custom skip_filter |
+| `ChildSkipFilter` | `__skip_registries__` on class | **NEW** opt-out |
+| `ParentRegistrationFilter` | `__registration_filter__` on parents | **NEW** parent control |
+| `PropagationFilter` | `__propagate__` / `__propagate_depth__` on parents | **NEW** depth control |
+
+### Class-Level and Parent Control Attributes
+
+| Attribute | Location | Effect |
+|-----------|----------|--------|
+| `__skip_registries__ = ["agent"]` | Child class | Skip registration in named registries |
+| `__registration_filter__` | Parent class (`@staticmethod`) | Called with child class; return `False` to block |
+| `__propagate__ = False` | Parent class | Subclasses don't auto-register through this parent |
+| `__propagate_depth__ = N` | Parent class | Only N levels of subclasses auto-register |
+
+The same filter chain is used in both `AutoRegistrar.__new__` (Path A) and `_inject_auto_registration` (Path C), eliminating duplicated skip logic.
+
 ## LayerRegistry
 
 Thread-safe key-to-class mapping. One instance per layer.
@@ -28,6 +84,7 @@ Thread-safe key-to-class mapping. One instance per layer.
 ```python
 self._store: dict[str, type]  # strong references
 self._lock: threading.Lock     # thread safety (NOT RLock)
+self.separator: str            # key separator (e.g. "." or "")
 ```
 
 ### Protocol Check Caching
@@ -37,8 +94,6 @@ Inspired by CPython's `ABCMeta._abc_data`. Avoids re-checking Protocol complianc
 - **Positive cache** (`WeakSet`): classes that passed the check
 - **Negative cache** (`WeakSet`): classes that failed
 - **Invalidation counter** (class variable): incremented on `remove()`, invalidates all negative caches globally
-
-The negative cache uses a version number compared against the global counter. When a class is unregistered, the counter increments, and all registries discard stale negative caches on next access.
 
 ### Key Operations
 
@@ -50,32 +105,63 @@ The negative cache uses a version number compared against the global counter. Wh
 | `remove(key)` | Lock held + counter lock | Increments invalidation counter |
 | `keys()` | Lock held | Returns snapshot list |
 | `items()` | Lock held | Returns snapshot list of tuples |
+| `children(prefix)` | Lock held | Keys starting with `prefix + separator` |
+| `tree()` | Lock held | Nested dict from splitting keys by separator |
+
+### Hierarchical Key Queries
+
+When `separator` is set (e.g. `"."`):
+
+```python
+registry.children("openai")
+# → {"openai.azure": AzureOpenAI, "openai.official": OfficialOpenAI}
+
+registry.tree()
+# → {"openai": {"azure": AzureOpenAI, "official": OfficialOpenAI}}
+```
 
 ## AutoRegistrar Metaclass
 
-Created by `create_auto_registrar()` as a closure-based metaclass. Captures the registry and key transform function.
+Created by `create_auto_registrar()` as a closure-based metaclass. Captures the registry, key transform, and filter chain.
 
 ### `__new__` Flow
 
 ```
 1. Create class via super().__new__()
 2. Tag with __registry_name__
-3. Skip conditions:
-   a. No bases (root base class)
-   b. Name contains "[" (Pydantic Generic intermediate)
-   c. Custom skip_filter returns True
-   d. namespace.get("__abstract__") is True
-4. Infer key: namespace.get("__registry_key__") or key_transform(name)
-5. registry.add(key, cls, protocol_check=False)
-6. Set cls.__registry_key__ = key
+3. Build RegistrationContext, run filter chain
+4. Resolve keys:
+   a. __registry_key__ = "foo"       -> single explicit key
+   b. __registry_key__ = ["a", "b"]  -> multi-key registration
+   c. Hierarchical derivation         -> parent_key + separator + key_transform(name)
+   d. key_transform(name)             -> default
+5. registry.add(key, cls) for each key
+6. Set cls.__registry_key__ and cls.__registry_keys__ (if multi-key)
 7. Validate __config_schema__ if present
 ```
 
 Critical: uses `namespace.get()` instead of `getattr()` for `__abstract__` and `__registry_key__` to avoid inheriting parent values.
 
-### Pydantic Generic Filtering
+### Hierarchical Key Derivation
 
-When `skip_pydantic_generic=True` (default), any class whose `__name__` contains `[` is skipped. This filters Pydantic's runtime Generic specialization intermediates (e.g., `BaseEvent[str]`).
+When `key_separator` is set and no explicit `__registry_key__` is provided, the metaclass derives a hierarchical key by finding the nearest parent with `__registry_key__` set:
+
+```python
+# Parent: __registry_key__ = "openai" (abstract)
+# Child: AzureOpenAI -> derived key: "openai.azure_open_ai"
+```
+
+### Multi-Key Registration
+
+`__registry_key__` accepts `str | list[str]`:
+
+```python
+class Universal(Base):
+    __registry_key__ = ["openai.universal", "anthropic.universal"]
+# Registered under BOTH keys
+# cls.__registry_key__ = "openai.universal"  (primary)
+# cls.__registry_keys__ = ["openai.universal", "anthropic.universal"]  (all)
+```
 
 ## Key Transform
 
@@ -85,10 +171,7 @@ When `skip_pydantic_generic=True` (default), any class whose `__name__` contains
 
 1. Strip suffix (first match, if stripping wouldn't empty the string)
 2. Strip prefix (first match, if stripping wouldn't empty the string)
-3. Convert CamelCase to snake_case via two regex passes:
-   - Insert `_` between consecutive uppercase and uppercase+lowercase: `HTTPSHandler` -> `HTTPS_Handler`
-   - Insert `_` between lowercase/digit and uppercase: `browserUse` -> `browser_Use`
-   - Lowercase everything
+3. Convert CamelCase to snake_case via two regex passes
 
 ### Examples
 
@@ -129,9 +212,4 @@ The bridge class itself is created with `__abstract__ = True`, so it's not regis
 
 When `@register(propagate=True)` is used, `_inject_auto_registration()` replaces the target's `__init_subclass__` with a hook that auto-registers future subclasses. This enables inheritance-based registration without the metaclass.
 
-The injected hook:
-1. Calls the original `__init_subclass__` (if any)
-2. Applies the same skip conditions as AutoRegistrar (Pydantic generic, custom filter, abstract)
-3. Infers key and registers
-
-Uses `target_cls.__dict__.get("__init_subclass__")` (not `getattr`) to avoid inheriting the hook from a parent.
+The injected hook uses the same filter chain as AutoRegistrar, so `__skip_registries__`, `__registration_filter__`, `__propagate__`, and `__propagate_depth__` all work consistently across paths.

@@ -8,7 +8,7 @@ This document covers the internals of `conscribe/config/`. For usage, see [Guide
 extract_config_schema(cls)     # per-class: __init__ -> Pydantic model
     |
 build_layer_config(registrar)  # per-layer: models -> discriminated union
-    |
+    |                            (flat mode OR nested mode)
     +-> generate_layer_config_source(result)  # Python stub file
     +-> generate_layer_json_schema(result)    # JSON Schema dict
 ```
@@ -34,8 +34,6 @@ if issubclass(cls, BaseModel) and "__init__" not in cls.__dict__:
     # Extract from cls.model_fields instead of __init__
 ```
 
-This handles Pydantic models where fields are declared as class attributes, not `__init__` parameters.
-
 ### Priority 3: Single-Param BaseModel (Tier 3 variant)
 
 If `__init__` has exactly one named parameter whose type is a `BaseModel` subclass, return that type directly.
@@ -44,7 +42,7 @@ If `__init__` has exactly one named parameter whose type is a `BaseModel` subcla
 
 The main path:
 
-1. **Find `__init__` definer** via MRO walk (skip classes that don't define their own `__init__`)
+1. **Find `__init__` definer** via MRO walk
 2. **Get signature** via `inspect.signature()`
 3. **Filter params**: exclude `self`, `*args`, `**kwargs`
 4. **Get type hints**: try `get_type_hints(include_extras=True)`, fall back to raw `__annotations__`
@@ -54,18 +52,9 @@ The main path:
 8. **Determine extra policy**: `"forbid"` if no `**kwargs` or fully resolved MRO; `"allow"` if truncated
 9. **Create model**: `pydantic.create_model()` with try/degrade fallback
 
-### Field Definition Logic
+### `extract_own_init_params(cls)`
 
-For each parameter:
-
-- **Type**: from type hints (resolved via `get_type_hints`), falling back to raw annotation, then `Any`
-- **Default**: from `param.default`, or `...` (required)
-- **Description**: Tier 2 `FieldInfo.description` > Tier 1.5 docstring > none
-- **Constraints**: copied from `FieldInfo` attributes (`ge`, `gt`, `le`, `lt`, etc.)
-
-### Annotated-Only Mode
-
-When `cls.__config_annotated_only__ = True`, only parameters with `Annotated[..., Field(...)]` are included.
+Helper function that extracts parameters defined in `cls`'s own `__init__` (NOT inherited). Used by the nested config builder to split params by MRO level.
 
 ### Degradation Fallback
 
@@ -84,25 +73,75 @@ See [MRO and Degradation](mro-and-degradation.md) for details.
 
 ## Building (`builder.py`)
 
-`build_layer_config(registrar)` creates the discriminated union:
+`build_layer_config(registrar)` dispatches to one of two paths:
 
-1. For each registered key, call `extract_config_schema()` with registrar-level MRO settings
+### Flat Mode (`discriminator_field`)
+
+Original behavior. For each registered key:
+
+1. Call `extract_config_schema()` with registrar-level MRO settings
 2. If schema is `None`, create a discriminator-only model
 3. Inject `Literal[key]` discriminator field with `default=key`
-4. Preserve original `extra` policy from extracted schema
-5. Collect `__degraded_fields__` from each schema before rebuilding
+4. Preserve original `extra` policy
+5. Collect `__degraded_fields__` before rebuilding
 6. Build union: single key -> model itself; multiple -> `Annotated[Union[...], Field(discriminator=...)]`
+
+### Nested Mode (`discriminator_fields`)
+
+Activated when the registrar has `discriminator_fields` set. Generates **nested Pydantic models** where each hierarchy level is a separate sub-model.
+
+#### Algorithm
+
+1. Filter to leaf keys (segment count == `len(discriminator_fields)`)
+2. For each leaf key, call `_extract_params_by_level()` to split params by MRO level
+3. Build nested segment models (level 1+) with `name: Literal[segment]` discriminator
+4. Build combined models with level 0 params flat + level 1 as nested sub-model
+5. Build compound discriminator function + union with `Discriminator(callable)` + `Tag(key)`
+
+#### Param Splitting by MRO Level
+
+`_extract_params_by_level(cls, all_classes, separator)` walks the MRO from root to leaf. Each ancestor with `__registry_key__` maps to a key segment level. Params are assigned to the **first class that defines them** (root → leaf):
+
+```
+MRO:     object ← Base ← OpenAIProtocol ← RetryMixin ← AzureOpenAI
+Keys:                     "openai"                      "openai.azure"
+Level:                    0 (model_type)                 1 (provider)
+
+Params:  temperature → level 0 (from OpenAIProtocol)
+         max_retries → level 1 (from RetryMixin, unregistered → nearest leaf-ward)
+         deployment  → level 1 (from AzureOpenAI)
+```
+
+#### Generated Model Structure (Hybrid Format)
+
+Level 0 (first discriminator) and its params are **flat** at the top level. Level 1+ are **nested sub-models**:
+
+```python
+class OpenaiAzureLLMConfig(BaseModel):
+    model_type: Literal["openai"] = "openai"  # flat (level 0)
+    temperature: float = 0.7                    # flat (level 0 param)
+    provider: AzureProviderConfig               # nested (level 1)
+
+class AzureProviderConfig(BaseModel):
+    name: Literal["azure"] = "azure"
+    deployment: str
+    api_version: str = "2024-02"
+```
 
 ### Model Naming
 
 `_build_model_name(key, layer_name)` produces class names:
-- Key part: snake_case segments each title-cased (`browser_use` -> `BrowserUse`)
+- Key part: segments each title-cased (`browser_use` -> `BrowserUse`, `openai.azure` -> `OpenaiAzure`)
 - Layer part: <=3 chars -> ALL_CAPS (`llm` -> `LLM`); >3 chars -> Title (`agent` -> `Agent`)
-- Combined: `BrowserUseAgentConfig`, `OpenAiLLMConfig`
+- Combined: `BrowserUseAgentConfig`, `OpenaiAzureLLMConfig`
 
 ## Code Generation (`codegen.py`)
 
-`generate_layer_config_source(result)` outputs a self-contained Python file:
+`generate_layer_config_source(result)` dispatches to flat or nested generation.
+
+### Flat Mode Output
+
+Self-contained Python file:
 
 1. **Header**: auto-generated comment with layer info, degradation warnings
 2. **Future imports**: `from __future__ import annotations`
@@ -111,19 +150,23 @@ See [MRO and Degradation](mro-and-degradation.md) for details.
 5. **`model_rebuild()` calls**: needed because `from __future__ import annotations` defers type evaluation
 6. **Union alias**: `LayerConfig = Annotated[Union[...], Field(discriminator=...)]` (if multiple models)
 
-### Field Rendering
+### Nested Mode Output
 
-Each field is rendered as one of:
-- `name: type = value` (plain default)
-- `name: type = ...` (required)
-- `name: type = Field(default, description=..., ge=...)` (with metadata)
-- `name: type = value  # degraded from: original_type` (degraded)
+1. **Header**: includes `Discriminator fields:` and `Key separator:` metadata
+2. **Imports**: adds `Discriminator`, `Tag` from pydantic
+3. **Nested segment models** (level 1+): e.g., `AzureProviderConfig`
+4. **Combined models** (level 0 flat + level 1 nested): e.g., `OpenaiAzureLLMConfig`
+5. **`model_rebuild()` calls**
+6. **Compound discriminator function**: `_discriminate_{layer}(v)` that walks nested dicts/models
+7. **Union alias**: uses `Discriminator(fn)` + `Tag(key)` instead of `Field(discriminator=...)`
 
 ## JSON Schema (`json_schema.py`)
 
 `generate_layer_json_schema(result)` uses Pydantic's `TypeAdapter.json_schema()` and adds:
 
 - `x-discriminator`: the discriminator field name
+- `x-discriminator-fields`: list of discriminator field names (nested mode)
+- `x-key-separator`: the key separator (nested mode)
 - `x-degraded-fields`: top-level dict `{key: [{field, original_type}]}`
 - Per-property `x-degraded-from` and `description` annotations inside `$defs`
 

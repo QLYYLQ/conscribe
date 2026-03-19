@@ -19,6 +19,11 @@ from typing import (
 )
 
 from conscribe.registration.auto import create_auto_registrar
+from conscribe.registration.filters import (
+    RegistrationContext,
+    build_filter_chain,
+    should_skip_registration,
+)
 from conscribe.registration.key_transform import (
     KeyTransform,
     default_key_transform,
@@ -41,7 +46,9 @@ class LayerRegistrar(Generic[P]):
         _registry: The underlying LayerRegistry instance.
         Meta: The AutoRegistrar metaclass.
         _key_transform: Key inference function.
-        discriminator_field: Config union discriminator field name.
+        discriminator_field: Config union discriminator field name (flat mode).
+        discriminator_fields: Config union discriminator field names (nested mode).
+        _key_separator: Key separator for hierarchical keys.
         _skip_pydantic_generic: Whether to skip Pydantic Generic intermediates.
         _skip_filter: Optional custom skip filter callable.
     """
@@ -51,10 +58,13 @@ class LayerRegistrar(Generic[P]):
     Meta: type
     _key_transform: KeyTransform
     discriminator_field: str
+    discriminator_fields: Union[list[str], None]
+    _key_separator: str
     _mro_scope: Union[str, list[str]]
     _mro_depth: Union[int, None]
     _skip_pydantic_generic: bool
     _skip_filter: Union[Callable[[type], bool], None]
+    _filters: list
 
     # ── Query API ──
 
@@ -86,6 +96,24 @@ class LayerRegistrar(Generic[P]):
     def unregister(cls, key: str) -> None:
         """Remove a registration. Intended for test isolation."""
         cls._registry.remove(key)
+
+    # ── Hierarchical Query API ──
+
+    @classmethod
+    def children(cls, prefix: str) -> dict[str, type]:
+        """Return all entries whose key starts with ``prefix + separator``.
+
+        Only meaningful when ``key_separator`` is set.
+        """
+        return cls._registry.children(prefix)
+
+    @classmethod
+    def tree(cls) -> dict:
+        """Return a nested dict representing the key hierarchy.
+
+        Only meaningful when ``key_separator`` is set.
+        """
+        return cls._registry.tree()
 
     # ── Path B: bridge() ──
 
@@ -173,8 +201,7 @@ class LayerRegistrar(Generic[P]):
         """
         registry = cls._registry
         kt = cls._key_transform
-        skip_pg = cls._skip_pydantic_generic
-        skip_fn = cls._skip_filter
+        path_c_filters = cls._filters
 
         # Save the ORIGINAL __init_subclass__ from this class's own dict
         # (NOT inherited). Use __dict__.get(), NOT getattr().
@@ -188,17 +215,15 @@ class LayerRegistrar(Generic[P]):
             else:
                 super(target_cls, sub_cls).__init_subclass__(**kwargs)
 
-            # Skip Pydantic Generic specialization intermediates
-            if skip_pg and "[" in sub_cls.__name__:
-                return
-
-            # Skip classes rejected by custom filter
-            if skip_fn is not None and skip_fn(sub_cls):
-                return
-
-            # Skip abstract subclasses — use __dict__ NOT getattr
-            # to avoid inheriting parent's __abstract__=True
-            if sub_cls.__dict__.get("__abstract__", False):
+            # Build context and check filters
+            ctx = RegistrationContext(
+                cls=sub_cls,
+                name=sub_cls.__name__,
+                bases=sub_cls.__bases__,
+                namespace=sub_cls.__dict__,
+                registry_name=registry.name,
+            )
+            if should_skip_registration(path_c_filters, ctx):
                 return
 
             # Infer key from own __dict__, NOT getattr (avoid inheriting parent key)
@@ -258,6 +283,8 @@ def create_registrar(
     protocol: type,
     *,
     discriminator_field: str = "",
+    discriminator_fields: list[str] | None = None,
+    key_separator: str = "",
     strip_suffixes: Optional[list[str]] = None,
     strip_prefixes: Optional[list[str]] = None,
     key_transform: Optional[KeyTransform] = None,
@@ -274,7 +301,12 @@ def create_registrar(
     Args:
         name: Layer name (e.g. "agent", "llm", "provider").
         protocol: @runtime_checkable Protocol class for this layer.
-        discriminator_field: Config union discriminator field name.
+        discriminator_field: Config union discriminator field name (flat mode).
+        discriminator_fields: Config union discriminator field names (nested mode).
+            Mutually exclusive with ``discriminator_field``. When set,
+            ``key_separator`` must also be set.
+        key_separator: Separator for hierarchical keys (e.g. ``"."``).
+            Empty string means flat keys (backward compatible).
         strip_suffixes: Suffixes to strip during key inference.
         strip_prefixes: Prefixes to strip during key inference.
         key_transform: Fully custom key inference function (highest priority).
@@ -296,7 +328,22 @@ def create_registrar(
 
     Raises:
         InvalidProtocolError: If protocol is not @runtime_checkable.
+        ValueError: If ``discriminator_fields`` is set but ``key_separator``
+            is empty, or if both ``discriminator_field`` and
+            ``discriminator_fields`` are set.
     """
+    # Validate mutually exclusive discriminator params
+    if discriminator_fields and discriminator_field:
+        raise ValueError(
+            "Cannot set both discriminator_field and discriminator_fields. "
+            "Use discriminator_field for flat mode, discriminator_fields for nested mode."
+        )
+    if discriminator_fields and not key_separator:
+        raise ValueError(
+            "discriminator_fields requires key_separator to be set "
+            "(e.g. key_separator='.')."
+        )
+
     # 1. Determine key transform
     if key_transform is not None:
         kt: KeyTransform = key_transform
@@ -308,7 +355,7 @@ def create_registrar(
         kt = default_key_transform  # type: ignore[assignment]
 
     # 2. Create registry
-    registry = LayerRegistry(name, protocol)
+    registry = LayerRegistry(name, protocol, separator=key_separator)
 
     # 3. Create AutoRegistrar metaclass
     meta = create_auto_registrar(
@@ -317,9 +364,17 @@ def create_registrar(
         base_metaclass=base_metaclass,
         skip_pydantic_generic=skip_pydantic_generic,
         skip_filter=skip_filter,
+        key_separator=key_separator,
     )
 
-    # 4. Dynamically create LayerRegistrar subclass
+    # 4. Build filter chain (shared between Path A and Path C)
+    filters = build_filter_chain(
+        skip_pydantic_generic=skip_pydantic_generic,
+        skip_filter=skip_filter,
+        registry_name=name,
+    )
+
+    # 5. Dynamically create LayerRegistrar subclass
     registrar_cls = type(
         f"{name.title()}Registrar",
         (LayerRegistrar,),
@@ -329,10 +384,13 @@ def create_registrar(
             "Meta": meta,
             "_key_transform": staticmethod(kt),
             "discriminator_field": discriminator_field,
+            "discriminator_fields": discriminator_fields,
+            "_key_separator": key_separator,
             "_mro_scope": mro_scope,
             "_mro_depth": mro_depth,
             "_skip_pydantic_generic": skip_pydantic_generic,
             "_skip_filter": skip_filter,
+            "_filters": filters,
         },
     )
     return registrar_cls

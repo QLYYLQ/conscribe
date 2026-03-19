@@ -33,6 +33,12 @@ def generate_layer_json_schema(result: LayerConfigResult) -> dict[str, Any]:
     schema = adapter.json_schema()
     schema["x-discriminator"] = result.discriminator_field
 
+    # Nested mode extensions
+    if result.discriminator_fields:
+        schema["x-discriminator-fields"] = result.discriminator_fields
+    if result.key_separator:
+        schema["x-key-separator"] = result.key_separator
+
     degraded = result.degraded_fields
     if degraded:
         _inject_degraded_info(schema, result)

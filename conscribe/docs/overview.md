@@ -28,12 +28,20 @@ Handles class discovery and storage. Components:
 - **`create_registrar(name, protocol)`** -- creates a layer-specific registrar (the main entry point)
 - **`LayerRegistry`** -- thread-safe key-to-class storage with Protocol compliance caching
 - **`AutoRegistrar` metaclass** -- intercepts class creation to auto-register subclasses
+- **`AutoRegistrarBase`** -- shared metaclass base with `|` operator for cross-registry diamond inheritance
 - **Key transform** -- infers registry keys from class names (CamelCase -> snake_case)
+- **Predicate filters** -- composable skip conditions (abstract, Pydantic generic, custom, propagation control)
 
 Three registration paths:
 - **Path A (inheritance):** `class Foo(Base)` -- auto-registered via metaclass
 - **Path B (bridge):** `Registrar.bridge(ExternalClass)` -- one-time bridge for external classes
 - **Path C (manual):** `@Registrar.register("key")` -- decorator with protocol check
+
+Advanced features:
+- **Hierarchical keys:** dotted keys like `"openai.azure"` with configurable separator, tree queries
+- **Cross-registry diamond:** `metaclass=LLM.Meta | Agent.Meta` registers in both registries
+- **Multi-key registration:** `__registry_key__ = ["alias_a", "alias_b"]`
+- **Opt-out controls:** `__skip_registries__`, `__registration_filter__`, `__propagate__`, `__propagate_depth__`
 
 ### Config Typing (`conscribe/config/`)
 
@@ -41,6 +49,8 @@ Extracts config schemas and generates output. Pipeline: **extract -> build -> ge
 
 - **Extract:** `extract_config_schema(cls)` reflects `__init__` into a Pydantic model
 - **Build:** `build_layer_config(registrar)` creates discriminated unions with `Literal[key]` discriminators
+  - **Flat mode** (single discriminator): `Annotated[Union[...], Field(discriminator=...)]`
+  - **Nested mode** (compound discriminator): deeply nested sub-models with `Discriminator(callable)` + `Tag`
 - **Generate:** `generate_layer_config_source(result)` outputs Python stubs; `generate_layer_json_schema(result)` outputs JSON Schema
 - **Fingerprint:** `compute_registry_fingerprint(registrar)` hashes registry state for staleness detection
 
@@ -94,6 +104,33 @@ class ChatOpenAI(ChatBase):
 cls = LLMRegistrar.get("chat_open_ai")  # -> ChatOpenAI
 result = build_layer_config(LLMRegistrar)
 source = generate_layer_config_source(result)
+```
+
+### Nested Config Example (Hierarchical Keys)
+
+```python
+LLM = create_registrar(
+    "llm", ChatProto,
+    discriminator_fields=["model_type", "provider"],
+    key_separator=".",
+)
+
+class OpenAIBase(metaclass=LLM.Meta):
+    __registry_key__ = "openai"
+    __abstract__ = True
+    def __init__(self, temperature: float = 0.7): ...
+
+class AzureOpenAI(OpenAIBase):
+    __registry_key__ = "openai.azure"
+    def __init__(self, deployment: str, **kwargs): ...
+
+# YAML config (hybrid format):
+# llm:
+#   model_type: openai           # flat (level 0)
+#   temperature: 0.7             # flat (level 0 param)
+#   provider:                    # nested (level 1)
+#     name: azure
+#     deployment: my-deployment
 ```
 
 ## Dependencies

@@ -42,12 +42,14 @@ class LayerRegistry(Generic[P]):
     _invalidation_counter: int = 0
     _counter_lock: threading.Lock = threading.Lock()
 
-    def __init__(self, name: str, protocol: type) -> None:
+    def __init__(self, name: str, protocol: type, *, separator: str = "") -> None:
         """Initialize the registry.
 
         Args:
             name: Layer name, used in error messages and debug output.
             protocol: A @runtime_checkable Protocol subclass.
+            separator: Key separator for hierarchical keys (e.g. ``"."``).
+                Empty string means flat keys (backward compatible).
 
         Raises:
             InvalidProtocolError: If protocol is not @runtime_checkable.
@@ -57,6 +59,7 @@ class LayerRegistry(Generic[P]):
 
         self.name = name
         self.protocol = protocol
+        self.separator = separator
         self._store: dict[str, type] = {}
         self._lock = threading.Lock()
         self._check_cache: WeakSet = WeakSet()
@@ -195,6 +198,55 @@ class LayerRegistry(Generic[P]):
         """Return a snapshot list of all (key, class) pairs."""
         with self._lock:
             return list(self._store.items())
+
+    def children(self, prefix: str) -> dict[str, type]:
+        """Return all entries whose key starts with ``prefix + separator``.
+
+        Only meaningful when a ``separator`` is set.  Returns an empty
+        dict when the separator is empty.
+
+        Args:
+            prefix: The parent key prefix (e.g. ``"openai"``).
+
+        Returns:
+            Dict of matching keys to classes.
+        """
+        if not self.separator:
+            return {}
+        full_prefix = prefix + self.separator
+        with self._lock:
+            return {
+                k: v for k, v in self._store.items()
+                if k.startswith(full_prefix)
+            }
+
+    def tree(self) -> dict:
+        """Return a nested dict representing the key hierarchy.
+
+        Only meaningful when a ``separator`` is set.  Returns a flat
+        ``{key: class}`` dict when the separator is empty.
+
+        For separator ``"."``, the key ``"openai.azure"`` produces:
+        ``{"openai": {"azure": AzureOpenAI}}``
+
+        Leaf values are classes; intermediate nodes are dicts.
+        """
+        with self._lock:
+            items = list(self._store.items())
+
+        if not self.separator:
+            return dict(items)
+
+        result: dict = {}
+        for key, cls in items:
+            parts = key.split(self.separator)
+            node = result
+            for part in parts[:-1]:
+                if part not in node:
+                    node[part] = {}
+                node = node[part]
+            node[parts[-1]] = cls
+        return result
 
     def _dump_registry(self, file: Optional[IO[str]] = None) -> None:
         """Debug introspection. Inspired by ABCMeta._dump_registry().

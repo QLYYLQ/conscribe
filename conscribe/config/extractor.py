@@ -285,6 +285,56 @@ def _extract_from_pydantic_model(
     return _create_dynamic_model(model_name, field_definitions, extra)
 
 
+def extract_own_init_params(
+    cls: type,
+) -> tuple[list[inspect.Parameter], dict[str, Any] | None]:
+    """Extract parameters defined in ``cls``'s own ``__init__`` (NOT inherited).
+
+    Returns only the named parameters (excluding self, *args, **kwargs)
+    that are introduced by this class (not present in the immediate
+    parent's ``__init__``).
+
+    This is used by the nested config builder to split params by MRO level.
+
+    Args:
+        cls: The class to extract own init params from.
+
+    Returns:
+        A tuple of (params, hints) where params is a list of
+        ``inspect.Parameter`` objects and hints is a dict of type hints
+        (or None if unavailable).
+    """
+    if "__init__" not in cls.__dict__:
+        return [], None
+
+    init_method = cls.__init__  # type: ignore[misc]
+    try:
+        sig = inspect.signature(init_method)
+    except (ValueError, TypeError):
+        return [], None
+
+    own_params = _filter_named_params(sig)
+    hints = _safe_get_type_hints(init_method)
+
+    # Find parent params to exclude
+    parent_param_names: set[str] = set()
+    for base in cls.__mro__[1:]:
+        if base is object:
+            continue
+        if "__init__" in base.__dict__:
+            try:
+                parent_sig = inspect.signature(base.__init__)  # type: ignore[misc]
+                parent_params = _filter_named_params(parent_sig)
+                parent_param_names.update(p.name for p in parent_params)
+            except (ValueError, TypeError):
+                pass
+            break  # Only look at the nearest parent with __init__
+
+    # Filter to params unique to this class
+    unique_params = [p for p in own_params if p.name not in parent_param_names]
+    return unique_params, hints
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------

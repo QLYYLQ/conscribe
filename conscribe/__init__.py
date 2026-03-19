@@ -15,6 +15,7 @@ from conscribe.exceptions import (
 )
 from conscribe.discover import discover
 from conscribe.registration import (
+    AutoRegistrarBase,
     KeyTransform,
     LayerRegistrar,
     LayerRegistry,
@@ -36,10 +37,11 @@ from conscribe.config import (
     save_fingerprint,
 )
 
-__version__ = "0.4.1"
+__version__ = "0.5.0"
 
 __all__ = [
     # Registration API
+    "AutoRegistrarBase",
     "create_registrar",
     "create_auto_registrar",
     "LayerRegistrar",
