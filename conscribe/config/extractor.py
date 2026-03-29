@@ -14,7 +14,7 @@ See ``config-typing-design.md`` Section 4 for full specification.
 from __future__ import annotations
 
 import inspect
-from typing import Annotated, Any, Union, get_args, get_origin, get_type_hints
+from typing import Annotated, Any, Literal, Union, get_args, get_origin, get_type_hints
 
 from pydantic import BaseModel, ConfigDict, Field, create_model
 from pydantic.fields import FieldInfo
@@ -218,6 +218,9 @@ def extract_config_schema(
         else:
             field_definitions[param.name] = (base_type, default)
 
+    # -- Apply __wiring__ constraints / injection --
+    wired_fields = _apply_wiring(cls, field_definitions)
+
     # -- Determine extra policy --
     if has_var_kw and mro_result is not None and mro_result.params:
         # MRO collection happened — use fully_resolved to decide
@@ -243,6 +246,11 @@ def extract_config_schema(
         )
         model = _create_dynamic_model(model_name, field_definitions, extra)
         model.__degraded_fields__ = degraded  # type: ignore[attr-defined]
+
+    # Tag wired fields for codegen annotation
+    if wired_fields:
+        model.__wired_fields__ = wired_fields  # type: ignore[attr-defined]
+
     return model
 
 
@@ -338,6 +346,117 @@ def extract_own_init_params(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _apply_wiring(
+    cls: type,
+    field_definitions: dict[str, Any],
+) -> dict[str, str]:
+    """Apply ``__wiring__`` constraints and inject missing wired fields.
+
+    For each resolved wiring entry:
+    - If the param exists in ``field_definitions``: replace its type with
+      ``Literal[...keys...]``, preserving the original default/FieldInfo.
+      Handles ``Optional[str]`` → ``Optional[Literal[...]]``.
+    - If the param does NOT exist in ``field_definitions``: inject it as
+      a new required field with ``Literal[...keys...]`` type.
+
+    Args:
+        cls: The class being extracted.
+        field_definitions: The current field definitions dict (mutated in place).
+
+    Returns:
+        Dict mapping param names to registry names for codegen annotation
+        (e.g. ``{"loop": "agent_loop", "browser": ""}``).
+        Empty dict if no wiring was applied.
+    """
+    from conscribe.exceptions import WiringResolutionError
+    from conscribe.wiring import resolve_wiring
+
+    try:
+        resolved = resolve_wiring(cls)
+    except (WiringResolutionError, TypeError):
+        # WiringResolutionError: registry not yet populated or not found.
+        # TypeError: malformed __wiring__ declaration.
+        # Both can occur during partial extraction; skip gracefully.
+        return {}
+
+    if not resolved:
+        return {}
+
+    wired_fields: dict[str, str] = {}
+
+    for param_name, wiring in resolved.items():
+        literal_type = Literal[tuple(wiring.allowed_keys)]  # type: ignore[valid-type]
+
+        if param_name in field_definitions:
+            # Constrain existing field: replace type, preserve default
+            existing = field_definitions[param_name]
+            if isinstance(existing, tuple) and len(existing) == 2:
+                old_type, default_or_field = existing
+                # Handle Optional[str] → Optional[Literal[...]]
+                new_type = _replace_str_with_literal(old_type, literal_type)
+                field_definitions[param_name] = (new_type, default_or_field)
+            wiring.injected = False
+        else:
+            # Inject new required field
+            field_definitions[param_name] = (literal_type, ...)
+            wiring.injected = True
+
+        wired_fields[param_name] = wiring.registry_name or "literal"
+
+    return wired_fields
+
+
+def _replace_str_with_literal(original_type: Any, literal_type: Any) -> Any:
+    """Replace ``str`` in a type annotation with a ``Literal`` type.
+
+    Handles:
+    - ``str`` → ``Literal[...]``
+    - ``Optional[str]`` → ``Optional[Literal[...]]``
+    - ``Union[str, X]`` → ``Union[Literal[...], X]``
+    - ``Annotated[str, Field(...)]`` → ``Annotated[Literal[...], Field(...)]``
+    - Other types → replaced entirely with ``literal_type``
+
+    Args:
+        original_type: The existing type annotation.
+        literal_type: The Literal type to substitute.
+
+    Returns:
+        The updated type annotation.
+    """
+    origin = get_origin(original_type)
+
+    # Annotated[str, Field(...), ...] → Annotated[Literal[...], Field(...), ...]
+    if origin is Annotated:
+        args = get_args(original_type)
+        base = args[0]
+        metadata = args[1:]
+        replaced_base = _replace_str_with_literal(base, literal_type)
+        return Annotated[tuple([replaced_base] + list(metadata))]  # type: ignore[return-value]
+
+    # Optional[str] or Union[str, None]
+    if origin is Union:
+        args = get_args(original_type)
+        new_args = []
+        for arg in args:
+            if arg is str:
+                new_args.append(literal_type)
+            elif arg is type(None):
+                new_args.append(arg)
+            else:
+                new_args.append(arg)
+        if len(new_args) == 2 and type(None) in new_args:
+            non_none = [a for a in new_args if a is not type(None)][0]
+            return Union[non_none, None]  # type: ignore[return-value]
+        return Union[tuple(new_args)]  # type: ignore[return-value]
+
+    # Plain str or Any → just use the Literal type
+    if original_type is str or original_type is Any:
+        return literal_type
+
+    # For any other type, replace entirely
+    return literal_type
 
 
 def _find_init_definer(cls: type) -> Union[type, None]:

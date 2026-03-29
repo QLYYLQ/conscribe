@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import sys
 import threading
-from typing import TYPE_CHECKING, Generic, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, Optional, TypeVar
 
 if TYPE_CHECKING:
     from typing import IO
@@ -23,6 +23,30 @@ from conscribe.exceptions import (
 )
 
 P = TypeVar("P")
+
+# Global registry index: maps layer name -> LayerRegistry instance.
+# Enables cross-registry lookups for wiring resolution.
+_REGISTRY_INDEX: dict[str, "LayerRegistry[Any]"] = {}
+_REGISTRY_INDEX_LOCK = threading.Lock()
+
+
+def get_registry(name: str) -> "LayerRegistry[Any] | None":
+    """Look up a LayerRegistry by layer name.
+
+    Args:
+        name: The layer name (e.g. ``"agent_loop"``).
+
+    Returns:
+        The LayerRegistry instance, or ``None`` if not found.
+    """
+    with _REGISTRY_INDEX_LOCK:
+        return _REGISTRY_INDEX.get(name)
+
+
+def _deregister(name: str) -> None:
+    """Remove a registry from the global index. Intended for test cleanup."""
+    with _REGISTRY_INDEX_LOCK:
+        _REGISTRY_INDEX.pop(name, None)
 
 
 class LayerRegistry(Generic[P]):
@@ -70,6 +94,10 @@ class LayerRegistry(Generic[P]):
             if not name.startswith("_")
             and callable(getattr(protocol, name, None))
         )
+
+        # Register in the global index for cross-registry wiring lookups
+        with _REGISTRY_INDEX_LOCK:
+            _REGISTRY_INDEX[name] = self
 
     def runtime_check(self, cls: type) -> None:
         """Check whether cls satisfies this layer's Protocol.

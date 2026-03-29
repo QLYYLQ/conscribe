@@ -12,6 +12,7 @@ from conscribe.exceptions import (
     KeyNotFoundError,
     ProtocolViolationError,
     RegistryError,
+    WiringResolutionError,
 )
 from conscribe.discover import discover
 from conscribe.registration import (
@@ -24,6 +25,7 @@ from conscribe.registration import (
     default_key_transform,
     make_key_transform,
 )
+from conscribe.registration.registry import get_registry
 from conscribe.config import (
     DegradedField,
     LayerConfigResult,
@@ -37,7 +39,7 @@ from conscribe.config import (
     save_fingerprint,
 )
 
-__version__ = "0.5.3"
+__version__ = "0.6.0"
 
 __all__ = [
     # Registration API
@@ -61,6 +63,9 @@ __all__ = [
     "compute_registry_fingerprint",
     "load_cached_fingerprint",
     "save_fingerprint",
+    # Wiring API
+    "get_registry",
+    "WiringResolutionError",
     # Exceptions
     "RegistryError",
     "DuplicateKeyError",

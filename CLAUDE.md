@@ -4,11 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Conscribe** (`conscribe` package, v0.5.3) — A Python library for automatic class registration and config typing stub generation for layered Python architectures. It targets framework developers building config-driven frameworks with pluggable layers (agents, LLM providers, etc.).
+**Conscribe** (`conscribe` package, v0.6.0) — A Python library for automatic class registration and config typing stub generation for layered Python architectures. It targets framework developers building config-driven frameworks with pluggable layers (agents, LLM providers, etc.).
 
-Two core capabilities:
+Three core capabilities:
 1. **Auto-registration**: Classes inheriting a base are automatically registered in their layer's registry (via metaclass). Also supports bridging external classes and explicit `@register` decorators.
 2. **Config typing**: Extracts `__init__` signatures into Pydantic discriminated unions, generates Python stubs for IDE autocomplete of YAML configs, with fingerprint-based staleness detection.
+3. **Cross-registry wiring**: Classes declare `__wiring__` to reference other registries, constraining config fields to `Literal[...]` with auto-discovery or explicit subsets. Enables Spring IoC-style dependency declarations between layers.
 
 ## Commands
 
@@ -38,7 +39,7 @@ pytest is pre-configured in `pyproject.toml` with `--cov=conscribe --cov-report=
 
 **Registration** (`conscribe/registration/`):
 - `registrar.py` — `LayerRegistrar` facade created via `create_registrar(name, protocol)`. One instance per layer. Supports `key_separator` for hierarchical keys and `discriminator_fields` for nested config mode.
-- `registry.py` — `LayerRegistry` key→class storage with thread-safe access and Protocol compliance caching (positive/negative WeakSets inspired by CPython's ABCMeta). Supports `separator` param, `children(prefix)` and `tree()` for hierarchical key queries.
+- `registry.py` — `LayerRegistry` key→class storage with thread-safe access and Protocol compliance caching (positive/negative WeakSets inspired by CPython's ABCMeta). Supports `separator` param, `children(prefix)` and `tree()` for hierarchical key queries. Global `_REGISTRY_INDEX` enables cross-registry lookups for wiring resolution.
 - `auto.py` — `create_auto_registrar()` metaclass factory. Intercepts `__new__` to auto-register on class definition. Uses predicate filter chain for skip conditions. Supports hierarchical key derivation and multi-key registration (`__registry_key__ = [...]`).
 - `meta_base.py` — `AutoRegistrarBase` (shared metaclass base) + `MetaRegistrarType` (meta-metaclass). Enables `|` operator for cross-registry diamond inheritance: `metaclass=LLM.Meta | Agent.Meta`.
 - `filters.py` — Predicate-based filter system. Composable filters: `RootFilter`, `PydanticGenericFilter`, `AbstractFilter`, `CustomCallableFilter`, `ChildSkipFilter` (`__skip_registries__`), `ParentRegistrationFilter` (`__registration_filter__`), `PropagationFilter` (`__propagate__`, `__propagate_depth__`).
@@ -56,6 +57,13 @@ pytest is pre-configured in `pyproject.toml` with `--cov=conscribe --cov-report=
 - `json_schema.py` — `generate_layer_json_schema()` outputs JSON Schema dicts. Adds `x-discriminator-fields` and `x-key-separator` extensions in nested mode.
 - `fingerprint.py` — Hashes registry state for auto-freshness detection.
 
+**Wiring** (`conscribe/wiring.py`):
+- `WiringSpec` — Frozen dataclass for parsed `__wiring__` entries. Three modes: str (auto-discover all keys from registry), tuple (explicit subset from registry), list (literal list without registry).
+- `ResolvedWiring` — Concrete key list after registry lookup, with `injected` flag for fields not in `__init__`.
+- `collect_wiring_from_mro(cls)` — Walks MRO bottom-up to deep-merge `__wiring__` dicts. `None` value excludes inherited keys.
+- `parse_wiring(cls)` — Normalizes `__wiring__` dict to `WiringSpec` list.
+- `resolve_wiring(cls)` — Resolves specs to concrete key lists via `get_registry()`. Raises `WiringResolutionError` on failures.
+
 **Discovery** (`conscribe/discover.py`): Recursively imports modules to trigger metaclass registration. Optionally auto-regenerates stubs if fingerprint is stale.
 
 ### Key Class Attributes (non-obvious conventions)
@@ -72,6 +80,8 @@ pytest is pre-configured in `pyproject.toml` with `--cov=conscribe --cov-report=
 - `__config_mro_scope__` — Per-class override for MRO traversal scope (`"local"`, `"third_party"`, `"all"`).
 - `__config_mro_depth__` — Per-class override for MRO traversal depth (int or None).
 - `__degraded_fields__` — Attached to dynamically created models by `extract_config_schema()` when field types were degraded to `Any`. List of `DegradedField` instances. Only present when degradation occurred (zero overhead on happy path).
+- `__wiring__` — Cross-registry field constraints. Dict mapping param names to registry references. Three modes: `{"loop": "agent_loop"}` (all keys), `{"loop": ("agent_loop", ["react"])}` (subset), `{"browser": ["chromium"]}` (literal list). `None` value excludes inherited key. Deep-merged along MRO.
+- `__wired_fields__` — Attached to dynamically created models by `extract_config_schema()` when wiring was applied. Dict mapping field names to registry names. Used by codegen for `# wired from:` comments.
 
 ### Pydantic Generic Compatibility
 

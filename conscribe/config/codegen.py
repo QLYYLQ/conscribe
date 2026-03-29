@@ -475,6 +475,9 @@ def _generate_class(
         for df in degraded_list:
             degraded_lookup[df.field_name] = df.original_type_repr
 
+    # Build wired-from lookup for inline comments
+    wired_lookup: dict[str, str] = getattr(model, "__wired_fields__", {})
+
     lines = []
     lines.append(f"\nclass {model.__name__}(BaseModel):")
 
@@ -491,7 +494,12 @@ def _generate_class(
     # Fields
     for field_name, field_info in model.model_fields.items():
         degraded_from = degraded_lookup.get(field_name)
-        field_line = _render_field(field_name, field_info, degraded_from=degraded_from)
+        wired_from = wired_lookup.get(field_name)
+        field_line = _render_field(
+            field_name, field_info,
+            degraded_from=degraded_from,
+            wired_from=wired_from,
+        )
         lines.append(f"    {field_line}")
 
     lines.append("")
@@ -502,6 +510,7 @@ def _render_field(
     name: str,
     field_info: FieldInfo,
     degraded_from: str | None = None,
+    wired_from: str | None = None,
 ) -> str:
     """Render a single field definition line."""
     type_str = _type_to_source(field_info.annotation)
@@ -514,8 +523,12 @@ def _render_field(
         field_kwargs["description"] = field_info.description
     field_kwargs.update(_extract_constraints(field_info))
 
-    # Inline comment for degraded fields
-    comment = f"  # degraded from: {degraded_from}" if degraded_from else ""
+    # Inline comment for degraded or wired fields
+    comment = ""
+    if degraded_from:
+        comment = f"  # degraded from: {degraded_from}"
+    elif wired_from:
+        comment = f"  # wired from: {wired_from}"
 
     if field_kwargs:
         # Need Field()

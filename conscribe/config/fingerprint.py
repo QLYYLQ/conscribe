@@ -77,6 +77,10 @@ def compute_registry_fingerprint(registrar: type) -> str:
         else:
             hasher.update(b"<no-init>")
 
+        # Hash __wiring__ declarations so that changes in referenced
+        # registries trigger fingerprint invalidation.
+        _hash_wiring(hasher, cls)
+
     return hasher.hexdigest()[:16]
 
 
@@ -161,6 +165,35 @@ def _find_init_definer(cls: type) -> Union[type, None]:
     """Walk MRO to find the class that actually defines ``__init__``."""
     from conscribe.config._utils import find_init_definer
     return find_init_definer(cls)
+
+
+def _hash_wiring(hasher: hashlib._Hash, cls: type) -> None:
+    """Hash ``__wiring__`` resolved keys into the fingerprint.
+
+    This ensures that when a referenced registry changes (e.g., a new
+    class is registered in the "agent_loop" registry), the fingerprint
+    of the referencing registry invalidates, triggering stub regeneration.
+    """
+    from conscribe.exceptions import WiringResolutionError
+
+    try:
+        from conscribe.wiring import resolve_wiring
+        resolved = resolve_wiring(cls)
+    except (WiringResolutionError, TypeError):
+        # Wiring resolution can fail if referenced registries aren't
+        # populated yet. In that case, hash the raw __wiring__ dict
+        # to at least detect changes in the declaration itself.
+        from conscribe.wiring import collect_wiring_from_mro
+        raw = collect_wiring_from_mro(cls)
+        if raw:
+            hasher.update(f"wiring_raw:{sorted(raw.items())}".encode("utf-8"))
+        return
+
+    for param_name in sorted(resolved.keys()):
+        wiring = resolved[param_name]
+        hasher.update(
+            f"wiring:{param_name}:{sorted(wiring.allowed_keys)}".encode("utf-8")
+        )
 
 
 def _hash_mro_parent_signatures(

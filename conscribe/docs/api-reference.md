@@ -291,6 +291,54 @@ class DegradedField:
 
 ---
 
+## Wiring API
+
+### `get_registry(name: str) -> LayerRegistry | None`
+
+Look up a `LayerRegistry` by layer name. Used internally by wiring resolution, but also available for manual cross-registry queries.
+
+```python
+from conscribe import get_registry
+
+loop_reg = get_registry("agent_loop")
+if loop_reg:
+    print(loop_reg.keys())  # ["react", "codeact", ...]
+```
+
+---
+
+### `__wiring__` (class attribute)
+
+Declares cross-registry field constraints. Three grammar modes:
+
+```python
+class SWEAgent(BaseAgent):
+    __wiring__ = {
+        "loop": "agent_loop",                              # Mode 1: all keys from registry
+        "llm_provider": ("llm", ["openai", "anthropic"]),  # Mode 2: explicit subset
+        "browser": ["chromium", "firefox"],                # Mode 3: literal list
+    }
+```
+
+**Behavior during config generation:**
+- If the param exists in `__init__`: type is constrained from `str` to `Literal[...keys...]`
+- If the param does NOT exist in `__init__`: injected as a new required field with `Literal[...keys...]` type
+- Generated stubs annotate wired fields: `loop: Literal["react"] = ...  # wired from: agent_loop`
+
+**Inheritance:** Deep-merged along MRO. Child keys override parent keys. `None` excludes an inherited key:
+
+```python
+class BaseAgent:
+    __wiring__ = {"loop": "agent_loop", "llm": "llm"}
+
+class OfflineAgent(BaseAgent):
+    __wiring__ = {"llm": None}  # excludes llm, inherits loop
+```
+
+**Validation timing:** Resolved at `build_layer_config()` time (after `discover()`), not at class definition time. Raises `WiringResolutionError` if registry not found, is empty, or explicit keys are missing.
+
+---
+
 ## Exceptions
 
 All inherit from `RegistryError`.
@@ -303,6 +351,7 @@ All inherit from `RegistryError`.
 | `ProtocolViolationError` | `RegistryError`, `TypeError` | Class missing required protocol methods |
 | `InvalidConfigSchemaError` | `RegistryError`, `TypeError` | `__config_schema__` is not a BaseModel |
 | `InvalidProtocolError` | `RegistryError`, `TypeError` | Protocol not `@runtime_checkable` |
+| `WiringResolutionError` | `RegistryError` | `__wiring__` references missing registry, empty registry, or invalid keys |
 
 ### Class Attributes for Configuration
 
@@ -319,3 +368,5 @@ All inherit from `RegistryError`.
 | `__config_annotated_only__` | `bool` | Only include `Annotated[..., Field()]` params |
 | `__config_mro_scope__` | `MROScope` | Per-class MRO scope override |
 | `__config_mro_depth__` | `int \| None` | Per-class MRO depth override |
+| `__wiring__` | `dict[str, str \| tuple \| list \| None]` | Cross-registry field constraints (3 modes + None for exclusion) |
+| `__wired_fields__` | `dict[str, str]` | Set by extractor: maps wired field names to registry names (read-only) |

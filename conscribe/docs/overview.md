@@ -42,6 +42,7 @@ Advanced features:
 - **Cross-registry diamond:** `metaclass=LLM.Meta | Agent.Meta` registers in both registries
 - **Multi-key registration:** `__registry_key__ = ["alias_a", "alias_b"]`
 - **Opt-out controls:** `__skip_registries__`, `__registration_filter__`, `__propagate__`, `__propagate_depth__`
+- **Cross-registry wiring:** `__wiring__` declares field constraints referencing other registries, producing `Literal[...]` types in generated config stubs
 
 ### Config Typing (`conscribe/config/`)
 

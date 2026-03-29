@@ -137,3 +137,36 @@ class InvalidProtocolError(RegistryError, TypeError):
             f"Add @runtime_checkable above your Protocol class definition."
         )
         super().__init__(message)
+
+
+class WiringResolutionError(RegistryError):
+    """Raised when ``__wiring__`` cannot be resolved at config build time.
+
+    Possible causes:
+    - Referenced registry not found (not yet created or typo in name).
+    - Explicit key subset contains keys not present in the referenced registry.
+    - Referenced registry is empty (forgot to call ``discover()``).
+
+    Attributes:
+        cls_name: The class that declared the wiring.
+        param_name: The ``__init__`` parameter or injected field name.
+        registry_name: The referenced registry name (if any).
+        detail: Human-readable description of the problem.
+    """
+
+    def __init__(
+        self,
+        cls_name: str,
+        param_name: str,
+        registry_name: str,
+        detail: str,
+    ) -> None:
+        self.cls_name = cls_name
+        self.param_name = param_name
+        self.registry_name = registry_name
+        self.detail = detail
+        message = (
+            f"Wiring resolution failed for '{cls_name}.{param_name}' "
+            f"(registry: '{registry_name}'): {detail}"
+        )
+        super().__init__(message)

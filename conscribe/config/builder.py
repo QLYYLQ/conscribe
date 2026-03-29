@@ -122,12 +122,18 @@ def _build_flat_config(registrar: type) -> LayerConfigResult:
             # No extractable params — create discriminator-only model
             model = _create_discriminator_only_model(model_name, disc_field, key)
             schema_degraded = None
+            schema_wired = None
         else:
-            # Read degraded fields BEFORE _inject_discriminator (which
-            # rebuilds the model and would lose the custom attribute).
+            # Read custom attributes BEFORE _inject_discriminator (which
+            # rebuilds the model and would lose custom attributes).
             schema_degraded = getattr(schema, "__degraded_fields__", None)
+            schema_wired = getattr(schema, "__wired_fields__", None)
             # Inject discriminator into existing schema
             model = _inject_discriminator(schema, model_name, disc_field, key)
+
+        # Reattach custom attributes to the rebuilt model
+        if schema_wired:
+            model.__wired_fields__ = schema_wired  # type: ignore[attr-defined]
 
         per_key_models[key] = model
         if schema_degraded:

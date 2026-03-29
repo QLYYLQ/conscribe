@@ -128,6 +128,39 @@ llm:
     deployment: my-deploy
 ```
 
+### Cross-Registry Wiring
+
+Declare which values from other registries a class accepts. Conscribe constrains the config field to `Literal[...]`:
+
+```python
+# Given: LoopRegistrar with "react" and "codeact" registered
+
+class BaseAgent(metaclass=AgentRegistrar.Meta):
+    __abstract__ = True
+    __wiring__ = {"loop": "loop"}  # all keys from "loop" registry
+
+class SWEAgent(BaseAgent):
+    __wiring__ = {"loop": ("loop", ["react"])}  # narrows to subset
+
+    def __init__(self, *, max_steps: int = 10): ...
+```
+
+Generated config:
+
+```python
+class SweAgentConfig(BaseModel):
+    name: Literal["swe_agent"] = "swe_agent"
+    max_steps: int = 10
+    loop: Literal["react"] = ...  # wired from: loop
+```
+
+Three modes:
+- `"loop": "agent_loop"` — auto-discover all keys from registry
+- `"loop": ("agent_loop", ["react", "codeact"])` — explicit subset
+- `"browser": ["chromium", "firefox"]` — literal list (no registry)
+
+Inheritance: child `__wiring__` merges with parent (child keys override). Use `None` to exclude: `{"llm": None}`.
+
 ### Cross-Registry Diamond Inheritance
 
 Register a class in multiple registries:
@@ -165,6 +198,7 @@ class LLMAgent(metaclass=CombinedMeta):
 | `generate_layer_config_source(result)` | Generate Python stub source code |
 | `generate_layer_json_schema(result)` | Generate JSON Schema |
 | `compute_registry_fingerprint(registrar)` | Compute registry fingerprint hash |
+| `get_registry(name)` | Look up a registry by name (for wiring) |
 
 ---
 

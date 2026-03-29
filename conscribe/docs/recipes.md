@@ -322,6 +322,43 @@ config = adapter.validate_python({
 })
 ```
 
+## How do I constrain a config field to values from another registry?
+
+Use `__wiring__` to declare cross-registry constraints:
+
+```python
+# Setup: create a loop registry
+LoopRegistrar = create_registrar("loop", LoopProtocol, discriminator_field="name")
+
+class BaseLoop(metaclass=LoopRegistrar.Meta):
+    __abstract__ = True
+
+class ReactLoop(BaseLoop): ...
+class CodeactLoop(BaseLoop): ...
+
+# Agent registry with wiring
+AgentRegistrar = create_registrar("agent", AgentProtocol, discriminator_field="name")
+
+class BaseAgent(metaclass=AgentRegistrar.Meta):
+    __abstract__ = True
+    __wiring__ = {"loop": "loop"}  # auto-discover: all keys from "loop" registry
+
+class SWEAgent(BaseAgent):
+    __wiring__ = {"loop": ("loop", ["react_loop"])}  # narrow to subset
+    def __init__(self, *, max_steps: int = 10): ...
+
+# Generated config constrains loop to Literal["react_loop"]
+result = build_layer_config(AgentRegistrar)
+source = generate_layer_config_source(result)
+```
+
+Three modes:
+- `"field": "registry_name"` — all keys (auto-discovery)
+- `"field": ("registry_name", ["key1", "key2"])` — explicit subset
+- `"field": ["val1", "val2"]` — literal list (no registry)
+
+Use `None` to exclude an inherited wiring key: `__wiring__ = {"llm": None}`.
+
 ## How do I skip a class from registration?
 
 Mark it abstract:

@@ -49,8 +49,9 @@ The main path:
 5. **MRO collection**: if `**kwargs` present, walk MRO upward for parent params (see [MRO and Degradation](mro-and-degradation.md))
 6. **Get docstring descriptions**: parse Google/NumPy-style docstrings for Tier 1.5
 7. **Build field definitions**: for each param, extract type, default, FieldInfo, and description
-8. **Determine extra policy**: `"forbid"` if no `**kwargs` or fully resolved MRO; `"allow"` if truncated
-9. **Create model**: `pydantic.create_model()` with try/degrade fallback
+8. **Apply wiring**: resolve `__wiring__` declarations, constrain existing fields to `Literal[...]`, inject missing fields
+9. **Determine extra policy**: `"forbid"` if no `**kwargs` or fully resolved MRO; `"allow"` if truncated
+10. **Create model**: `pydantic.create_model()` with try/degrade fallback
 
 ### `extract_own_init_params(cls)`
 
@@ -179,6 +180,7 @@ Self-contained Python file:
 - Each class's `__init__` signature (or `model_fields` for BaseModel)
 - Each class's docstring
 - Parent class signatures when `**kwargs` is present (MRO chain)
+- Resolved `__wiring__` keys (so changes in referenced registries trigger regeneration)
 
 ### Caching
 
