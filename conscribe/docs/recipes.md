@@ -352,10 +352,13 @@ result = build_layer_config(AgentRegistrar)
 source = generate_layer_config_source(result)
 ```
 
-Three modes:
+Four modes:
 - `"field": "registry_name"` — all keys (auto-discovery)
 - `"field": ("registry_name", ["key1", "key2"])` — explicit subset
+- `"field": ("registry_name", ["required"], ["optional"])` — required + optional keys
 - `"field": ["val1", "val2"]` — literal list (no registry)
+
+The 3-element tuple distinguishes required and optional keys — both appear in `Literal[...]`, but the distinction is available as metadata for downstream negotiation logic.
 
 Use `None` to exclude an inherited wiring key: `__wiring__ = {"llm": None}`.
 

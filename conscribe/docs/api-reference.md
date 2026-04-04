@@ -309,16 +309,19 @@ if loop_reg:
 
 ### `__wiring__` (class attribute)
 
-Declares cross-registry field constraints. Three grammar modes:
+Declares cross-registry field constraints. Four grammar modes:
 
 ```python
 class SWEAgent(BaseAgent):
     __wiring__ = {
-        "loop": "agent_loop",                              # Mode 1: all keys from registry
-        "llm_provider": ("llm", ["openai", "anthropic"]),  # Mode 2: explicit subset
-        "browser": ["chromium", "firefox"],                # Mode 3: literal list
+        "loop": "agent_loop",                                    # Mode 1: all keys from registry
+        "llm_provider": ("llm", ["openai", "anthropic"]),        # Mode 2: explicit subset
+        "obs": ("observation", ["terminal"], ["filesystem"]),     # Mode 2: required + optional
+        "browser": ["chromium", "firefox"],                      # Mode 3: literal list
     }
 ```
+
+The 3-element tuple form `(registry, required_keys, optional_keys)` distinguishes required and optional keys. Both appear in the generated `Literal[...]` type, but the distinction is available as metadata (`WiringSpec.optional_keys`, `ResolvedWiring.optional_keys`) for downstream negotiation logic.
 
 **Behavior during config generation:**
 - If the param exists in `__init__`: type is constrained from `str` to `Literal[...keys...]`
@@ -368,5 +371,5 @@ All inherit from `RegistryError`.
 | `__config_annotated_only__` | `bool` | Only include `Annotated[..., Field()]` params |
 | `__config_mro_scope__` | `MROScope` | Per-class MRO scope override |
 | `__config_mro_depth__` | `int \| None` | Per-class MRO depth override |
-| `__wiring__` | `dict[str, str \| tuple \| list \| None]` | Cross-registry field constraints (3 modes + None for exclusion) |
+| `__wiring__` | `dict[str, str \| tuple \| list \| None]` | Cross-registry field constraints (4 modes + None for exclusion) |
 | `__wired_fields__` | `dict[str, str]` | Set by extractor: maps wired field names to registry names (read-only) |

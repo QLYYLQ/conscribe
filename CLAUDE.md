@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Conscribe** (`conscribe` package, v0.6.0) — A Python library for automatic class registration and config typing stub generation for layered Python architectures. It targets framework developers building config-driven frameworks with pluggable layers (agents, LLM providers, etc.).
+**Conscribe** (`conscribe` package, v0.6.1) — A Python library for automatic class registration and config typing stub generation for layered Python architectures. It targets framework developers building config-driven frameworks with pluggable layers (agents, LLM providers, etc.).
 
 Three core capabilities:
 1. **Auto-registration**: Classes inheriting a base are automatically registered in their layer's registry (via metaclass). Also supports bridging external classes and explicit `@register` decorators.
@@ -58,8 +58,8 @@ pytest is pre-configured in `pyproject.toml` with `--cov=conscribe --cov-report=
 - `fingerprint.py` — Hashes registry state for auto-freshness detection.
 
 **Wiring** (`conscribe/wiring.py`):
-- `WiringSpec` — Frozen dataclass for parsed `__wiring__` entries. Three modes: str (auto-discover all keys from registry), tuple (explicit subset from registry), list (literal list without registry).
-- `ResolvedWiring` — Concrete key list after registry lookup, with `injected` flag for fields not in `__init__`.
+- `WiringSpec` — Frozen dataclass for parsed `__wiring__` entries. Three modes: str (auto-discover all keys from registry), tuple (explicit subset from registry), list (literal list without registry). Mode 2 tuple supports 3-element form `(registry, required_keys, optional_keys)` to distinguish required vs optional keys. Fields: `allowed_keys` (required keys or all keys), `optional_keys` (optional subset, `None` for non-3-element modes).
+- `ResolvedWiring` — Concrete key list after registry lookup, with `injected` flag for fields not in `__init__`. `allowed_keys` contains required+optional combined for backward-compatible `Literal[...]` generation. `optional_keys` stores the optional subset (`None` when not using 3-element tuple mode).
 - `collect_wiring_from_mro(cls)` — Walks MRO bottom-up to deep-merge `__wiring__` dicts. `None` value excludes inherited keys.
 - `parse_wiring(cls)` — Normalizes `__wiring__` dict to `WiringSpec` list.
 - `resolve_wiring(cls)` — Resolves specs to concrete key lists via `get_registry()`. Raises `WiringResolutionError` on failures.
@@ -80,7 +80,7 @@ pytest is pre-configured in `pyproject.toml` with `--cov=conscribe --cov-report=
 - `__config_mro_scope__` — Per-class override for MRO traversal scope (`"local"`, `"third_party"`, `"all"`).
 - `__config_mro_depth__` — Per-class override for MRO traversal depth (int or None).
 - `__degraded_fields__` — Attached to dynamically created models by `extract_config_schema()` when field types were degraded to `Any`. List of `DegradedField` instances. Only present when degradation occurred (zero overhead on happy path).
-- `__wiring__` — Cross-registry field constraints. Dict mapping param names to registry references. Three modes: `{"loop": "agent_loop"}` (all keys), `{"loop": ("agent_loop", ["react"])}` (subset), `{"browser": ["chromium"]}` (literal list). `None` value excludes inherited key. Deep-merged along MRO.
+- `__wiring__` — Cross-registry field constraints. Dict mapping param names to registry references. Three modes: `{"loop": "agent_loop"}` (all keys), `{"loop": ("agent_loop", ["react"])}` (subset), `{"browser": ["chromium"]}` (literal list). Mode 2 also supports 3-element tuple: `{"obs": ("observation", ["terminal"], ["filesystem"])}` (required + optional). `None` value excludes inherited key. Deep-merged along MRO.
 - `__wired_fields__` — Attached to dynamically created models by `extract_config_schema()` when wiring was applied. Dict mapping field names to registry names. Used by codegen for `# wired from:` comments.
 
 ### Pydantic Generic Compatibility

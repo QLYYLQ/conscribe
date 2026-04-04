@@ -154,10 +154,13 @@ class SweAgentConfig(BaseModel):
     loop: Literal["react"] = ...  # wired from: loop
 ```
 
-Three modes:
+Four modes:
 - `"loop": "agent_loop"` — auto-discover all keys from registry
 - `"loop": ("agent_loop", ["react", "codeact"])` — explicit subset
+- `"obs": ("observation", ["terminal"], ["filesystem"])` — required + optional keys
 - `"browser": ["chromium", "firefox"]` — literal list (no registry)
+
+The 3-element tuple distinguishes required and optional keys — both appear in `Literal[...]`, but the distinction is available as metadata for downstream negotiation logic.
 
 Inheritance: child `__wiring__` merges with parent (child keys override). Use `None` to exclude: `{"llm": None}`.
 

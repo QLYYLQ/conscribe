@@ -10,7 +10,7 @@ Conscribe targets framework developers building config-driven frameworks with pl
 - Four config tiers: plain `__init__` -> docstring -> Annotated[Field] -> explicit BaseModel
 - Hierarchical keys with dotted segments (e.g., `"openai.azure"`) and tree queries
 - Cross-registry diamond inheritance via `|` operator (`metaclass=LLM.Meta | Agent.Meta`)
-- Cross-registry wiring via `__wiring__`: constrain config fields to `Literal[...]` from other registries (auto-discovery, explicit subset, or literal list modes)
+- Cross-registry wiring via `__wiring__`: constrain config fields to `Literal[...]` from other registries (auto-discovery, explicit subset, required+optional subset, or literal list modes)
 - Predicate-based filter system with opt-out controls (`__skip_registries__`, `__propagate__`, `__registration_filter__`)
 - Nested compound discrimination: each key segment maps to a nested Pydantic sub-model with params split by MRO level
 - Designed and tested for compatibility with mainstream Python frameworks: Pydantic, Django, SQLAlchemy, attrs, dataclasses, and any class hierarchy using standard Python MRO
