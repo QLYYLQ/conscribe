@@ -188,6 +188,43 @@ class TestParseWiring:
         with pytest.raises(TypeError, match="tuple mode expects"):
             parse_wiring(Bad)
 
+    def test_mode2_tuple_with_optional(self):
+        class Agent:
+            __wiring__ = {"obs": ("obs_reg", ["terminal"], ["filesystem"])}
+
+        specs = parse_wiring(Agent)
+        assert len(specs) == 1
+        assert specs[0] == WiringSpec(
+            param_name="obs",
+            registry_name="obs_reg",
+            allowed_keys=("terminal",),
+            optional_keys=("filesystem",),
+        )
+
+    def test_mode2_tuple_with_empty_optional(self):
+        class Agent:
+            __wiring__ = {"obs": ("obs_reg", ["terminal"], [])}
+
+        specs = parse_wiring(Agent)
+        assert len(specs) == 1
+        assert specs[0].allowed_keys == ("terminal",)
+        assert specs[0].optional_keys == ()
+
+    def test_mode2_backward_compat_no_optional(self):
+        """2-element tuple should have optional_keys=None."""
+        class Agent:
+            __wiring__ = {"llm": ("llm_reg", ["openai"])}
+
+        specs = parse_wiring(Agent)
+        assert specs[0].optional_keys is None
+
+    def test_invalid_3tuple_third_element_raises(self):
+        class Bad:
+            __wiring__ = {"x": ("reg", ["a"], "not_a_list")}
+
+        with pytest.raises(TypeError, match="third element.*must be list"):
+            parse_wiring(Bad)
+
     def test_empty_wiring(self):
         class Agent:
             __wiring__ = {}
@@ -295,3 +332,34 @@ class TestResolveWiring:
         resolved = resolve_wiring(Offline)
         assert "loop" in resolved
         assert "llm" not in resolved
+
+    def test_mode2_with_optional_keys(self):
+        _make_registry("test_obs", LoopProtocol, ["terminal", "filesystem", "browser"])
+
+        class Agent:
+            __wiring__ = {"obs": ("test_obs", ["terminal"], ["filesystem"])}
+
+        resolved = resolve_wiring(Agent)
+        assert resolved["obs"].allowed_keys == ["terminal", "filesystem"]
+        assert resolved["obs"].optional_keys == ["filesystem"]
+        assert resolved["obs"].registry_name == "test_obs"
+
+    def test_mode2_optional_key_missing_raises(self):
+        _make_registry("test_obs2", LoopProtocol, ["terminal"])
+
+        class Agent:
+            __wiring__ = {"obs": ("test_obs2", ["terminal"], ["nonexistent"])}
+
+        with pytest.raises(WiringResolutionError, match="Optional keys not found"):
+            resolve_wiring(Agent)
+
+    def test_mode2_backward_compat_resolved(self):
+        """2-element tuple should produce optional_keys=None in ResolvedWiring."""
+        _make_registry("test_llm_bc", LLMProtocol, ["openai", "anthropic"])
+
+        class Agent:
+            __wiring__ = {"llm": ("test_llm_bc", ["openai"])}
+
+        resolved = resolve_wiring(Agent)
+        assert resolved["llm"].optional_keys is None
+        assert resolved["llm"].allowed_keys == ["openai"]

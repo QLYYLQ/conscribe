@@ -194,6 +194,10 @@ def _hash_wiring(hasher: hashlib._Hash, cls: type) -> None:
         hasher.update(
             f"wiring:{param_name}:{sorted(wiring.allowed_keys)}".encode("utf-8")
         )
+        if wiring.optional_keys is not None:
+            hasher.update(
+                f"wiring_optional:{param_name}:{sorted(wiring.optional_keys)}".encode("utf-8")
+            )
 
 
 def _hash_mro_parent_signatures(

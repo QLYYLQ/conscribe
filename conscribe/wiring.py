@@ -6,9 +6,10 @@ and resolves registry references to concrete key lists for config generation.
 Three grammar modes are supported::
 
     __wiring__ = {
-        "loop": "agent_loop",                              # Mode 1: auto-discovery (all keys)
-        "llm_provider": ("llm", ["openai", "anthropic"]),  # Mode 2: explicit subset
-        "browser": ["chromium", "firefox"],                # Mode 3: literal list
+        "loop": "agent_loop",                                    # Mode 1: auto-discovery (all keys)
+        "llm_provider": ("llm", ["openai", "anthropic"]),        # Mode 2: explicit subset
+        "obs": ("observation", ["terminal"], ["filesystem"]),     # Mode 2: required + optional
+        "browser": ["chromium", "firefox"],                      # Mode 3: literal list
     }
 
 A ``None`` value excludes an inherited key::
@@ -29,10 +30,14 @@ class WiringSpec:
         param_name: The config field / ``__init__`` parameter name.
         registry_name: Target registry name (empty string for Mode 3).
         allowed_keys: Explicit key subset (``None`` = auto-discover all keys).
+            For 3-element tuple mode, these are the *required* keys.
+        optional_keys: Optional key subset for 3-element tuple mode
+            (``None`` for all other modes).
     """
     param_name: str
     registry_name: str = ""
     allowed_keys: tuple[str, ...] | None = field(default=None)
+    optional_keys: tuple[str, ...] | None = field(default=None)
 
 
 @dataclass
@@ -41,14 +46,19 @@ class ResolvedWiring:
 
     Attributes:
         param_name: The config field name.
-        allowed_keys: Concrete list of allowed key strings.
+        allowed_keys: Concrete list of allowed key strings.  When
+            ``optional_keys`` is set, this contains required + optional
+            combined (for backward-compatible ``Literal[...]`` generation).
         registry_name: Source registry name (``None`` for Mode 3 literal lists).
         injected: ``True`` if the param was NOT in ``__init__`` (field injection).
+        optional_keys: Optional key subset (``None`` when not using
+            3-element tuple mode).
     """
     param_name: str
     allowed_keys: list[str]
     registry_name: str | None = None
     injected: bool = False
+    optional_keys: list[str] | None = None
 
 
 def collect_wiring_from_mro(cls: type) -> dict[str, Any]:
@@ -97,18 +107,32 @@ def parse_wiring(cls: type) -> list[WiringSpec]:
         if isinstance(value, str):
             # Mode 1: all keys from registry
             specs.append(WiringSpec(param_name=param_name, registry_name=value))
-        elif isinstance(value, tuple) and len(value) == 2:
-            # Mode 2: (registry_name, [key_subset])
-            registry_name, key_subset = value
-            if not isinstance(registry_name, str) or not isinstance(key_subset, list):
+        elif isinstance(value, tuple) and len(value) in (2, 3):
+            # Mode 2: (registry_name, [key_subset]) or
+            #          (registry_name, [required_keys], [optional_keys])
+            registry_name = value[0]
+            required_keys = value[1]
+            optional_keys_raw = value[2] if len(value) == 3 else None
+
+            if not isinstance(registry_name, str) or not isinstance(required_keys, list):
+                type_strs = ", ".join(type(v).__name__ for v in value)
                 raise TypeError(
                     f"Invalid __wiring__ entry for '{param_name}': "
-                    f"tuple mode expects (str, list[str]), got ({type(registry_name).__name__}, {type(key_subset).__name__})"
+                    f"tuple mode expects (str, list[str]) or (str, list[str], list[str]), "
+                    f"got ({type_strs})"
                 )
+            if optional_keys_raw is not None and not isinstance(optional_keys_raw, list):
+                raise TypeError(
+                    f"Invalid __wiring__ entry for '{param_name}': "
+                    f"third element of tuple must be list[str], "
+                    f"got {type(optional_keys_raw).__name__}"
+                )
+
             specs.append(WiringSpec(
                 param_name=param_name,
                 registry_name=registry_name,
-                allowed_keys=tuple(key_subset),
+                allowed_keys=tuple(required_keys),
+                optional_keys=tuple(optional_keys_raw) if optional_keys_raw is not None else None,
             ))
         elif isinstance(value, list):
             # Mode 3: literal list (no registry reference)
@@ -120,7 +144,8 @@ def parse_wiring(cls: type) -> list[WiringSpec]:
         else:
             raise TypeError(
                 f"Invalid __wiring__ entry for '{param_name}': "
-                f"expected str, (str, list), or list, got {type(value).__name__}"
+                f"expected str, (str, list), (str, list, list), or list, "
+                f"got {type(value).__name__}"
             )
 
     return specs
@@ -183,7 +208,7 @@ def resolve_wiring(cls: type) -> dict[str, ResolvedWiring]:
                 )
 
             if spec.allowed_keys is not None:
-                # Mode 2: validate subset
+                # Mode 2: validate required subset
                 missing = [k for k in spec.allowed_keys if k not in registry_keys]
                 if missing:
                     raise WiringResolutionError(
@@ -191,20 +216,42 @@ def resolve_wiring(cls: type) -> dict[str, ResolvedWiring]:
                         param_name=spec.param_name,
                         registry_name=spec.registry_name,
                         detail=(
-                            f"Keys not found in '{spec.registry_name}' registry: "
+                            f"Required keys not found in '{spec.registry_name}' registry: "
                             f"{', '.join(sorted(missing))}. "
                             f"Available: {', '.join(sorted(registry_keys))}."
                         ),
                     )
-                allowed = list(spec.allowed_keys)
+
+                # Validate optional keys if present
+                optional_resolved: list[str] | None = None
+                if spec.optional_keys is not None:
+                    missing_opt = [k for k in spec.optional_keys if k not in registry_keys]
+                    if missing_opt:
+                        raise WiringResolutionError(
+                            cls_name=cls_name,
+                            param_name=spec.param_name,
+                            registry_name=spec.registry_name,
+                            detail=(
+                                f"Optional keys not found in '{spec.registry_name}' registry: "
+                                f"{', '.join(sorted(missing_opt))}. "
+                                f"Available: {', '.join(sorted(registry_keys))}."
+                            ),
+                        )
+                    optional_resolved = list(spec.optional_keys)
+                    # Combined: required + optional for Literal type generation
+                    allowed = list(spec.allowed_keys) + list(spec.optional_keys)
+                else:
+                    allowed = list(spec.allowed_keys)
             else:
                 # Mode 1: all keys
                 allowed = sorted(registry_keys)
+                optional_resolved = None
 
             result[spec.param_name] = ResolvedWiring(
                 param_name=spec.param_name,
                 allowed_keys=allowed,
                 registry_name=spec.registry_name,
+                optional_keys=optional_resolved,
             )
         else:
             # Mode 3: literal list

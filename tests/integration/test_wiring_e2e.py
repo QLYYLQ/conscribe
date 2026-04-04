@@ -440,3 +440,51 @@ class TestWiringE2E:
         narrow_model = result.per_key_models["narrow_agent"]
         narrow_literal = get_args(narrow_model.model_fields["loop"].annotation)
         assert narrow_literal == ("react_loop8",)
+
+    def test_full_pipeline_mode2_with_optional(self):
+        """Mode 2 with 3-element tuple: required + optional keys, both in Literal."""
+        Loop = create_registrar("e2e_loop9", LoopProtocol, discriminator_field="name")
+
+        class BaseLoop9(metaclass=Loop.Meta):
+            __abstract__ = True
+            def run(self) -> None: ...
+
+        class ReactLoop9(BaseLoop9):
+            def run(self) -> None: ...
+
+        class CodeactLoop9(BaseLoop9):
+            def run(self) -> None: ...
+
+        class PlanActLoop9(BaseLoop9):
+            def run(self) -> None: ...
+
+        Agent = create_registrar("e2e_agent10", AgentProtocol, discriminator_field="name")
+
+        class BaseAgent10(metaclass=Agent.Meta):
+            __abstract__ = True
+            def step(self, task: str) -> str: ...
+            def reset(self) -> None: ...
+
+        class OptAgent(BaseAgent10):
+            __wiring__ = {
+                "loop": ("e2e_loop9", ["react_loop9"], ["codeact_loop9"]),
+            }
+
+            def __init__(self, *, max_steps: int = 10):
+                self.max_steps = max_steps
+
+            def step(self, task: str) -> str:
+                return "opt"
+
+            def reset(self) -> None: ...
+
+        result = build_layer_config(Agent)
+        model = result.per_key_models["opt_agent"]
+
+        from typing import get_args
+        literal_args = get_args(model.model_fields["loop"].annotation)
+        # Both required and optional keys appear in the Literal
+        assert sorted(literal_args) == ["codeact_loop9", "react_loop9"]
+
+        # __wired_fields__ metadata preserved
+        assert model.__wired_fields__["loop"] == "e2e_loop9"
