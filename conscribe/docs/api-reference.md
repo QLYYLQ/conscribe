@@ -291,6 +291,97 @@ class DegradedField:
 
 ---
 
+## Stubs API
+
+### `write_layer_stubs(registrar, output_dir=None) -> list[Path]`
+
+Generate and write `.pyi` stubs for all classes in a layer that have injected wired attributes (wired fields not in `__init__`).
+
+```python
+from conscribe.stubs import write_layer_stubs
+
+written = write_layer_stubs(AgentRegistrar)
+# → [PosixPath('/path/to/my_app/agents/react.pyi'), ...]
+
+# Or write to a dedicated directory:
+written = write_layer_stubs(AgentRegistrar, output_dir="generated/stubs")
+```
+
+**Parameters:**
+
+| Name | Type | Default | Description |
+|------|------|---------|-------------|
+| `registrar` | `type` | required | A `LayerRegistrar` subclass |
+| `output_dir` | `str \| Path \| None` | `None` | Output directory. If `None`, writes `.pyi` alongside source `.py` files. |
+
+**Returns:** List of paths to written `.pyi` files.
+
+---
+
+### `collect_class_stub_info(cls) -> ClassStubInfo | None`
+
+Collect stub information for a single class. Returns `None` if the class has no injected wired fields.
+
+```python
+from conscribe.stubs import collect_class_stub_info
+
+info = collect_class_stub_info(MyAgent)
+if info:
+    for attr in info.injected_attrs:
+        print(f"{attr.name}: {attr.resolved_type.__name__}")
+```
+
+---
+
+### `generate_module_stub(module_name, classes) -> str`
+
+Generate `.pyi` source for a list of `ClassStubInfo` objects from the same module.
+
+---
+
+### `narrowest_common_base(classes, fallback) -> type`
+
+Find the most specific ancestor shared by all classes via MRO intersection. Used for type narrowing of wired attributes.
+
+```python
+from conscribe.stubs import narrowest_common_base
+
+# BashTerminal(Terminal) and ZshTerminal(Terminal) → Terminal
+narrowest_common_base([BashTerminal, ZshTerminal], EnvProtocol)  # → Terminal
+
+# Single class → exact type
+narrowest_common_base([BashTerminal], EnvProtocol)  # → BashTerminal
+```
+
+---
+
+### `ClassStubInfo` (dataclass)
+
+```python
+@dataclass(frozen=True)
+class ClassStubInfo:
+    cls: type                              # The original class
+    class_name: str                        # Class name
+    module: str                            # Module path (e.g. "my_app.agents.react")
+    source_file: str                       # Absolute path to .py file
+    bases: tuple[type, ...]                # Base classes
+    init_signature: str | None             # Own __init__ signature (None if not defined)
+    injected_attrs: tuple[InjectedAttr, ...] # Wired attributes not in __init__
+    methods: tuple[MethodStub, ...]        # Own methods (excluding __init__)
+```
+
+### `InjectedAttr` (dataclass)
+
+```python
+@dataclass(frozen=True)
+class InjectedAttr:
+    name: str                # Attribute name
+    resolved_type: type      # Narrowed type (protocol, common base, or str)
+    registry_name: str | None  # Source registry name (None for Mode 3)
+```
+
+---
+
 ## Wiring API
 
 ### `get_registry(name: str) -> LayerRegistry | None`

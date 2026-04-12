@@ -11,6 +11,7 @@ Conscribe targets framework developers building config-driven frameworks with pl
 - Hierarchical keys with dotted segments (e.g., `"openai.azure"`) and tree queries
 - Cross-registry diamond inheritance via `|` operator (`metaclass=LLM.Meta | Agent.Meta`)
 - Cross-registry wiring via `__wiring__`: constrain config fields to `Literal[...]` from other registries (auto-discovery, explicit subset, required+optional subset, or literal list modes)
+- `.pyi` stub generation for wired attributes: `generate-stubs` CLI command produces PEP 484 stubs so IDEs (PyCharm, VS Code, mypy) can see runtime-injected dependencies. Type narrowing resolves wired attributes to the most specific common ancestor of constrained classes (e.g., subset `["terminal.bash", "terminal.zsh"]` → type `Terminal`, not root protocol)
 - Predicate-based filter system with opt-out controls (`__skip_registries__`, `__propagate__`, `__registration_filter__`)
 - Nested compound discrimination: each key segment maps to a nested Pydantic sub-model with params split by MRO level
 - Designed and tested for compatibility with mainstream Python frameworks: Pydantic, Django, SQLAlchemy, attrs, dataclasses, and any class hierarchy using standard Python MRO
@@ -40,3 +41,6 @@ All paths are relative to this file's directory (`conscribe/`).
 - [Source: config/mro.py](config/mro.py): `collect_mro_params()` MRO walker.
 - [Source: config/degradation.py](config/degradation.py): Type degradation to `Any`.
 - [Source: wiring.py](wiring.py): Cross-registry wiring resolution (`__wiring__` → `Literal[...]`).
+- [Source: stubs/collector.py](stubs/collector.py): Stub data collection with type narrowing (`narrowest_common_base`).
+- [Source: stubs/generator.py](stubs/generator.py): `.pyi` source rendering (partial stubs with `__getattr__` fallback).
+- [Source: stubs/writer.py](stubs/writer.py): `write_layer_stubs()` file I/O.

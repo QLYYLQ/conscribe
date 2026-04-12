@@ -47,6 +47,20 @@ def main(argv: Union[list[str], None] = None) -> int:
         "--output", default=None, help="Output file path. Prints to stdout if omitted."
     )
 
+    # generate-stubs
+    stub_parser = subparsers.add_parser(
+        "generate-stubs",
+        help="Generate .pyi stubs for classes with wired attributes.",
+    )
+    stub_parser.add_argument(
+        "--layer", required=True, help="Layer name (e.g. 'llm', 'agent')."
+    )
+    stub_parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Output directory. If omitted, writes .pyi alongside source files.",
+    )
+
     # inspect
     inspect_parser = subparsers.add_parser(
         "inspect",
@@ -64,6 +78,8 @@ def main(argv: Union[list[str], None] = None) -> int:
 
     if args.command == "generate-config":
         return _cmd_generate_config(args.layer, args.output)
+    elif args.command == "generate-stubs":
+        return _cmd_generate_stubs(args.layer, args.output_dir)
     elif args.command == "inspect":
         return _cmd_inspect(args.layer)
 
@@ -89,6 +105,28 @@ def _cmd_generate_config(layer_name: str, output: Union[str, None]) -> int:
     else:
         print(source)
 
+    return 0
+
+
+def _cmd_generate_stubs(layer_name: str, output_dir: Union[str, None]) -> int:
+    """Handle the generate-stubs subcommand."""
+    from conscribe.stubs.writer import write_layer_stubs
+
+    try:
+        registrar = _get_registrar(layer_name)
+    except KeyError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    written = write_layer_stubs(registrar, output_dir)
+
+    if not written:
+        print("No classes with injected wired attributes found.", file=sys.stderr)
+        return 0
+
+    for path in written:
+        print(f"  {path}")
+    print(f"Generated {len(written)} stub file(s).")
     return 0
 
 

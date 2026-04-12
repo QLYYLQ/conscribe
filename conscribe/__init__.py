@@ -39,7 +39,7 @@ from conscribe.config import (
     save_fingerprint,
 )
 
-__version__ = "0.6.1"
+__version__ = "0.7.0"
 
 __all__ = [
     # Registration API
@@ -63,6 +63,9 @@ __all__ = [
     "compute_registry_fingerprint",
     "load_cached_fingerprint",
     "save_fingerprint",
+    # Stubs API (import from conscribe.stubs)
+    # write_layer_stubs, collect_class_stub_info, generate_module_stub,
+    # narrowest_common_base, ClassStubInfo, InjectedAttr
     # Wiring API
     "get_registry",
     "WiringResolutionError",

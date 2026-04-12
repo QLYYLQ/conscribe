@@ -362,6 +362,34 @@ The 3-element tuple distinguishes required and optional keys — both appear in 
 
 Use `None` to exclude an inherited wiring key: `__wiring__ = {"llm": None}`.
 
+## How do I get IDE autocomplete for wired attributes injected at runtime?
+
+If a class declares `__wiring__` for fields not in `__init__`, those attributes are invisible to the IDE. Use `generate-stubs` to create `.pyi` files:
+
+```bash
+conscribe generate-stubs \
+  --registrar "my_app.agents._registrar:AgentRegistrar" \
+  --discover "my_app.agents"
+```
+
+This writes `.pyi` alongside each source `.py`. The wired attribute type is **narrowed** automatically:
+
+```python
+# If __wiring__ = {"env": "environment"} (all keys) → type is EnvironmentProtocol
+# If __wiring__ = {"env": ("environment", ["terminal.bash", "terminal.zsh"])} → type is Terminal
+# If __wiring__ = {"env": ("environment", ["terminal.bash"])} → type is BashTerminal
+```
+
+Or programmatically:
+
+```python
+from conscribe.stubs import write_layer_stubs
+
+written = write_layer_stubs(AgentRegistrar, output_dir="generated/stubs")
+```
+
+See [CLI Reference — generate-stubs](cli.md#generate-stubs) for full options.
+
 ## How do I skip a class from registration?
 
 Mark it abstract:

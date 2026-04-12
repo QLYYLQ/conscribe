@@ -4,12 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Conscribe** (`conscribe` package, v0.6.1) — A Python library for automatic class registration and config typing stub generation for layered Python architectures. It targets framework developers building config-driven frameworks with pluggable layers (agents, LLM providers, etc.).
+**Conscribe** (`conscribe` package, v0.7.0) — A Python library for automatic class registration and config typing stub generation for layered Python architectures. It targets framework developers building config-driven frameworks with pluggable layers (agents, LLM providers, etc.).
 
-Three core capabilities:
+Four core capabilities:
 1. **Auto-registration**: Classes inheriting a base are automatically registered in their layer's registry (via metaclass). Also supports bridging external classes and explicit `@register` decorators.
 2. **Config typing**: Extracts `__init__` signatures into Pydantic discriminated unions, generates Python stubs for IDE autocomplete of YAML configs, with fingerprint-based staleness detection.
 3. **Cross-registry wiring**: Classes declare `__wiring__` to reference other registries, constraining config fields to `Literal[...]` with auto-discovery or explicit subsets. Enables Spring IoC-style dependency declarations between layers.
+4. **`.pyi` stub generation**: Generates PEP 484 `.pyi` files for classes with injected wired attributes. Enables IDE autocomplete (PyCharm, VS Code, mypy) for runtime-injected dependencies. Uses type narrowing: wired attributes are typed as the target registry's protocol/base class, narrowed to the most specific common ancestor when constrained to a subset.
 
 ## Commands
 
@@ -28,6 +29,7 @@ pip install -e ".[dev,docstring]"
 
 # CLI
 conscribe generate-config --layer <name> --output <path>
+conscribe generate-stubs --layer <name> --output-dir <path>
 conscribe inspect --layer <name>
 ```
 
@@ -63,6 +65,11 @@ pytest is pre-configured in `pyproject.toml` with `--cov=conscribe --cov-report=
 - `collect_wiring_from_mro(cls)` — Walks MRO bottom-up to deep-merge `__wiring__` dicts. `None` value excludes inherited keys.
 - `parse_wiring(cls)` — Normalizes `__wiring__` dict to `WiringSpec` list.
 - `resolve_wiring(cls)` — Resolves specs to concrete key lists via `get_registry()`. Raises `WiringResolutionError` on failures.
+
+**Stubs** (`conscribe/stubs/`):
+- `collector.py` — `collect_class_stub_info(cls)` reflects `__init__` signatures and wiring to produce `ClassStubInfo`. Only returns info for classes with *injected* wired fields (not in `__init__`). `narrowest_common_base(classes, fallback)` computes the most specific common ancestor via MRO intersection for type narrowing.
+- `generator.py` — `generate_module_stub(module_name, classes)` renders `.pyi` source. Uses `def __getattr__(name: str) -> Any: ...` partial-stub pattern. Instance attributes typed as registry protocol (Mode 1), narrowed common base (Mode 2), or `str` (Mode 3).
+- `writer.py` — `write_layer_stubs(registrar, output_dir)` groups classes by source module, generates and writes `.pyi` files. Default: alongside source `.py` files.
 
 **Discovery** (`conscribe/discover.py`): Recursively imports modules to trigger metaclass registration. Optionally auto-regenerates stubs if fingerprint is stale.
 
