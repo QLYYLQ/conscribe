@@ -171,6 +171,32 @@ Self-contained Python file:
 - `x-degraded-fields`: top-level dict `{key: [{field, original_type}]}`
 - Per-property `x-degraded-from` and `description` annotations inside `$defs`
 
+## Composed Config (`composed.py`)
+
+`build_composed_config(registrars, inline_wiring)` orchestrates multi-layer config generation with cross-layer inline wiring.
+
+### Algorithm
+
+1. **Build dependency graph**: for each registrar, parse all classes' `__wiring__` to find which registries they reference. Only edges where the target is in the `registrars` dict are included.
+2. **Topological sort** (Kahn's algorithm): produces leaves-first order. Raises `CircularWiringError` on cycles.
+3. **Build each layer**: calls `build_layer_config()` in dependency order.
+4. **Post-process** (when `inline_wiring=True`): for each per-key model with `__wired_fields__`, replaces `Literal[...]` fields with the target layer's discriminated union type. Mode 2 subset wiring inlines only the subset models. Mode 3 literal list stays as `Literal[...]`.
+5. **Build top-level model**: `create_model("ComposedConfig", llm=(list[LLMUnion], []), agent=(list[AgentUnion], []), ...)`.
+
+### Why Post-Process?
+
+The inline replacement happens **after** `build_layer_config()`, not inside `_apply_wiring()`. This avoids threading pre-built union types through `extract_config_schema` → `_apply_wiring` and keeps the per-layer pipeline unchanged.
+
+### Output
+
+`ComposedConfigResult` contains:
+- `layer_results`: per-layer `LayerConfigResult` objects (with rebuilt models)
+- `top_level_type`: Pydantic model with `list[union_type]` per layer
+- `dependency_order`: topological order for codegen
+- `inline_wiring`: whether replacement was applied
+
+Pydantic's `TypeAdapter(result.top_level_type).json_schema()` automatically produces nested `$defs` with `$ref` for all models across layers.
+
 ## Fingerprinting (`fingerprint.py`)
 
 `compute_registry_fingerprint(registrar)` produces a 16-char hex hash of:

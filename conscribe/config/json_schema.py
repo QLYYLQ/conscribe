@@ -46,6 +46,30 @@ def generate_layer_json_schema(result: LayerConfigResult) -> dict[str, Any]:
     return schema
 
 
+def generate_composed_json_schema(result: Any) -> dict[str, Any]:
+    """Serialize a ``ComposedConfigResult`` to a JSON Schema dict.
+
+    Uses Pydantic's ``TypeAdapter.json_schema()`` on the top-level model.
+    Pydantic automatically places nested models in ``$defs`` with ``$ref``.
+
+    Adds:
+    - ``x-composed-layers``: list of layer names in dependency order.
+    - ``x-inline-wiring``: whether inline wiring was applied.
+
+    Args:
+        result: The ``ComposedConfigResult`` from ``build_composed_config()``.
+
+    Returns:
+        A JSON Schema dict.
+    """
+    adapter = TypeAdapter(result.top_level_type)
+    schema = adapter.json_schema()
+    schema["x-composed-layers"] = result.dependency_order
+    schema["x-inline-wiring"] = result.inline_wiring
+
+    return schema
+
+
 def _inject_degraded_info(
     schema: dict[str, Any],
     result: LayerConfigResult,

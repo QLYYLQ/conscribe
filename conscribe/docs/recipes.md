@@ -390,6 +390,58 @@ written = write_layer_stubs(AgentRegistrar, output_dir="generated/stubs")
 
 See [CLI Reference — generate-stubs](cli.md#generate-stubs) for full options.
 
+## How do I compose multiple layers into a single config schema?
+
+Use `build_composed_config()` to combine layers. Wired fields become inline config objects:
+
+```python
+from conscribe import build_composed_config
+from conscribe import generate_composed_json_schema, generate_composed_config_source
+
+result = build_composed_config(
+    {"llm": LLMRegistrar, "loop": LoopRegistrar, "agent": AgentRegistrar},
+    inline_wiring=True,   # wired fields become target layer union types
+)
+
+# JSON Schema for YAML editors
+schema = generate_composed_json_schema(result)
+
+# Or Python source
+source = generate_composed_config_source(result)
+```
+
+The resulting YAML config supports inline wiring:
+
+```yaml
+agent:
+  - name: browser_use
+    use_vision: true
+    llm:                        # inline LLM config — full IDE autocompletion
+      provider: openai
+      model: gpt-4o
+      temperature: 0.7
+    loop:
+      name: react
+      max_steps: 20
+```
+
+Use `inline_wiring=False` to keep wired fields as `Literal[...]` key selectors.
+
+Or via CLI:
+
+```bash
+conscribe generate-composed-config \
+  --layers llm loop agent \
+  --format json-schema \
+  --output composed.schema.json
+```
+
+## How do I handle circular wiring in composed config?
+
+`build_composed_config()` raises `CircularWiringError` if layers have circular wiring dependencies (e.g., Agent wires → LLM and LLM wires → Agent).
+
+Fix by removing one direction of the cycle, or exclude the cyclical layer from the composed config.
+
 ## How do I skip a class from registration?
 
 Mark it abstract:

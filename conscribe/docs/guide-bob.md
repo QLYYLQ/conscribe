@@ -219,6 +219,31 @@ class AzureProviderConfig(BaseModel):
 
 Invalid combinations (e.g., `model_type: openai` + `provider.name: bedrock` when `"openai.bedrock"` isn't registered) are rejected at validation time.
 
+## Composed Config (Multi-Layer Inline Wiring)
+
+Some frameworks provide a composed config schema covering multiple layers. In this mode, wired fields (like `llm` in an agent config) accept a full inline config object instead of just a key name:
+
+```yaml
+# experiment.yaml (composed config)
+agent:
+  - name: browser_use
+    use_vision: true
+    llm:                          # inline LLM config — IDE autocompletes all fields
+      provider: openai
+      model_id: gpt-4o
+      temperature: 0.7
+    loop:
+      name: react
+      max_steps: 20
+  - name: swe_agent
+    llm:
+      provider: anthropic
+      model_id: claude-3
+      max_tokens: 4096
+```
+
+The IDE provides full autocompletion for nested config objects — typing `llm:` shows all available LLM providers and their parameters.
+
 ## Type Degradation
 
 When MRO traversal reaches third-party types that Pydantic can't serialize (e.g., `httpx.Auth`, `ssl.SSLContext`), conscribe degrades them to `Any`:

@@ -240,6 +240,47 @@ llm:
     api_version: 2024-02
 ```
 
+## Advanced: Composed Config (Multi-Layer Inline Wiring)
+
+When your framework has multiple layers wired together, generate a single composed schema. Wired fields become inline config objects instead of key selectors:
+
+```python
+from conscribe import build_composed_config, generate_composed_json_schema
+import json
+
+result = build_composed_config(
+    {"llm": LLMRegistrar, "agent": AgentRegistrar},
+    inline_wiring=True,
+)
+
+schema = generate_composed_json_schema(result)
+with open("generated/composed.schema.json", "w") as f:
+    json.dump(schema, f, indent=2)
+```
+
+Users can then write YAML with full IDE autocompletion across layers:
+
+```yaml
+agent:
+  - name: browser_use
+    use_vision: true
+    llm:                          # IDE autocompletes all LLM config fields
+      provider: openai
+      model_id: gpt-4o
+      temperature: 0.7
+```
+
+Layers are topologically sorted by wiring dependencies (leaves first). Circular wiring raises `CircularWiringError`.
+
+CLI equivalent:
+
+```bash
+conscribe generate-composed-config \
+  --layers llm agent \
+  --format json-schema \
+  --output generated/composed.schema.json
+```
+
 ## Advanced: Cross-Registry Diamond Inheritance
 
 Register a class in multiple registries using the `|` operator:

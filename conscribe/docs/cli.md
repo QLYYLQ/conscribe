@@ -25,6 +25,49 @@ conscribe generate-config \
 | `--json-schema` | No | Also generate JSON Schema to this path |
 | `--config` | No | Path to batch config YAML file |
 
+### `generate-composed-config`
+
+Generate a composed config schema from multiple registries. Wired fields become inline config objects (or `Literal[...]` with `--no-inline-wiring`).
+
+```bash
+conscribe generate-composed-config \
+  --layers "llm" "agent" \
+  --format json-schema \
+  --output "generated/composed_config.schema.json"
+```
+
+**Options:**
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--layers` | Yes | Layer names to include (space-separated) |
+| `--format` | No | Output format: `json-schema` (default) or `python` |
+| `--inline-wiring` | No | Inline wired fields as target layer union types (default) |
+| `--no-inline-wiring` | No | Keep wired fields as `Literal[...]` strings |
+| `--output` | No | Output file path (prints to stdout if omitted) |
+
+**Example output (JSON Schema):**
+
+The schema has a top-level property per layer, each as `list[union_type]`. Wired fields reference the target layer's models via `$defs`/`$ref`:
+
+```json
+{
+  "properties": {
+    "llm": {"type": "array", "items": {"oneOf": [...]}},
+    "agent": {"type": "array", "items": {"oneOf": [...]}}
+  },
+  "$defs": {
+    "OpenaiLLMConfig": {...},
+    "BrowserUseAgentConfig": {
+      "properties": {
+        "llm": {"$ref": "#/$defs/LLMConfig"},
+        ...
+      }
+    }
+  }
+}
+```
+
 ### `inspect`
 
 Display registry contents with config fields.
@@ -148,14 +191,22 @@ Every CLI command has a Python equivalent:
 ```python
 from conscribe import discover, build_layer_config
 from conscribe import generate_layer_config_source, generate_layer_json_schema
+from conscribe import build_composed_config, generate_composed_json_schema
 
 # discover
 discover("my_app.llm.providers")
 
-# generate-config
+# generate-config (single layer)
 result = build_layer_config(LLMRegistrar)
 source = generate_layer_config_source(result)
 schema = generate_layer_json_schema(result)
+
+# generate-composed-config (multi-layer)
+composed = build_composed_config(
+    {"llm": LLMRegistrar, "agent": AgentRegistrar},
+    inline_wiring=True,
+)
+composed_schema = generate_composed_json_schema(composed)
 
 # inspect
 for key in LLMRegistrar.keys():

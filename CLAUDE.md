@@ -4,13 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Conscribe** (`conscribe` package, v0.7.0) — A Python library for automatic class registration and config typing stub generation for layered Python architectures. It targets framework developers building config-driven frameworks with pluggable layers (agents, LLM providers, etc.).
+**Conscribe** (`conscribe` package, v0.8.0) — A Python library for automatic class registration and config typing stub generation for layered Python architectures. It targets framework developers building config-driven frameworks with pluggable layers (agents, LLM providers, etc.).
 
-Four core capabilities:
+Five core capabilities:
 1. **Auto-registration**: Classes inheriting a base are automatically registered in their layer's registry (via metaclass). Also supports bridging external classes and explicit `@register` decorators.
 2. **Config typing**: Extracts `__init__` signatures into Pydantic discriminated unions, generates Python stubs for IDE autocomplete of YAML configs, with fingerprint-based staleness detection.
 3. **Cross-registry wiring**: Classes declare `__wiring__` to reference other registries, constraining config fields to `Literal[...]` with auto-discovery or explicit subsets. Enables Spring IoC-style dependency declarations between layers.
 4. **`.pyi` stub generation**: Generates PEP 484 `.pyi` files for classes with injected wired attributes. Enables IDE autocomplete (PyCharm, VS Code, mypy) for runtime-injected dependencies. Uses type narrowing: wired attributes are typed as the target registry's protocol/base class, narrowed to the most specific common ancestor when constrained to a subset.
+5. **Composed config**: Combines multiple layers into a single JSON Schema / Python source with inline wiring — wired fields become the target layer's full discriminated union type instead of `Literal[...]`. Enables recursive IDE autocompletion across layers when editing YAML configs.
 
 ## Commands
 
@@ -29,6 +30,7 @@ pip install -e ".[dev,docstring]"
 
 # CLI
 conscribe generate-config --layer <name> --output <path>
+conscribe generate-composed-config --layers <name1> <name2> [--format json-schema|python] [--no-inline-wiring] --output <path>
 conscribe generate-stubs --layer <name> --output-dir <path>
 conscribe inspect --layer <name>
 ```
@@ -55,8 +57,9 @@ pytest is pre-configured in `pyproject.toml` with `--cov=conscribe --cov-report=
 - `builder.py` — Two builder paths:
   - **Flat mode** (`discriminator_field`): `Annotated[Union[...], Field(discriminator=...)]`. Original behavior.
   - **Nested mode** (`discriminator_fields`): Deeply nested compound discrimination. Each key segment maps to a nested Pydantic sub-model. Level 0 params are flat, level 1+ are nested. Uses `Discriminator(callable)` + `Tag(key)`. `_extract_params_by_level()` splits params by MRO level.
-- `codegen.py` — `generate_layer_config_source()` outputs self-contained `.py` stub files. Dispatches to flat or nested generation. Nested mode adds `Discriminator`, `Tag` imports and compound discriminator function.
-- `json_schema.py` — `generate_layer_json_schema()` outputs JSON Schema dicts. Adds `x-discriminator-fields` and `x-key-separator` extensions in nested mode.
+- `codegen.py` — `generate_layer_config_source()` outputs self-contained `.py` stub files. Dispatches to flat or nested generation. Nested mode adds `Discriminator`, `Tag` imports and compound discriminator function. Also `generate_composed_config_source()` for composed config.
+- `json_schema.py` — `generate_layer_json_schema()` outputs JSON Schema dicts. Adds `x-discriminator-fields` and `x-key-separator` extensions in nested mode. Also `generate_composed_json_schema()` for composed config.
+- `composed.py` — `build_composed_config(registrars, inline_wiring)` orchestrates multi-layer config. Builds dependency graph via wiring declarations, topologically sorts layers, builds each layer, then post-processes wired `Literal[...]` fields into target layer union types. Produces `ComposedConfigResult` with `top_level_type` (Pydantic model with `list[union]` per layer). Raises `CircularWiringError` on cycles.
 - `fingerprint.py` — Hashes registry state for auto-freshness detection.
 
 **Wiring** (`conscribe/wiring.py`):

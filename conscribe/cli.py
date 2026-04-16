@@ -13,6 +13,8 @@ import sys
 from pathlib import Path
 from typing import Union
 
+from conscribe.exceptions import CircularWiringError, RegistryError
+
 
 def _get_registrar(layer_name: str) -> type:
     """Look up a registrar by layer name.
@@ -61,6 +63,41 @@ def main(argv: Union[list[str], None] = None) -> int:
         help="Output directory. If omitted, writes .pyi alongside source files.",
     )
 
+    # generate-composed-config
+    composed_parser = subparsers.add_parser(
+        "generate-composed-config",
+        help="Generate composed config schema from multiple registries.",
+    )
+    composed_parser.add_argument(
+        "--layers",
+        required=True,
+        nargs="+",
+        help="Layer names to include (e.g. 'llm agent').",
+    )
+    composed_parser.add_argument(
+        "--inline-wiring",
+        action="store_true",
+        default=True,
+        help="Inline wired fields as target layer union types (default).",
+    )
+    composed_parser.add_argument(
+        "--no-inline-wiring",
+        dest="inline_wiring",
+        action="store_false",
+        help="Keep wired fields as Literal[...] strings.",
+    )
+    composed_parser.add_argument(
+        "--format",
+        choices=["python", "json-schema"],
+        default="json-schema",
+        help="Output format (default: json-schema).",
+    )
+    composed_parser.add_argument(
+        "--output",
+        default=None,
+        help="Output file path. Prints to stdout if omitted.",
+    )
+
     # inspect
     inspect_parser = subparsers.add_parser(
         "inspect",
@@ -78,6 +115,10 @@ def main(argv: Union[list[str], None] = None) -> int:
 
     if args.command == "generate-config":
         return _cmd_generate_config(args.layer, args.output)
+    elif args.command == "generate-composed-config":
+        return _cmd_generate_composed_config(
+            args.layers, args.inline_wiring, args.format, args.output,
+        )
     elif args.command == "generate-stubs":
         return _cmd_generate_stubs(args.layer, args.output_dir)
     elif args.command == "inspect":
@@ -104,6 +145,48 @@ def _cmd_generate_config(layer_name: str, output: Union[str, None]) -> int:
         Path(output).write_text(source, encoding="utf-8")
     else:
         print(source)
+
+    return 0
+
+
+def _cmd_generate_composed_config(
+    layer_names: list[str],
+    inline_wiring: bool,
+    output_format: str,
+    output: Union[str, None],
+) -> int:
+    """Handle the generate-composed-config subcommand."""
+    from conscribe.config.composed import build_composed_config
+
+    registrars: dict[str, type] = {}
+    for name in layer_names:
+        try:
+            registrars[name] = _get_registrar(name)
+        except KeyError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+
+    try:
+        result = build_composed_config(registrars, inline_wiring=inline_wiring)
+    except (CircularWiringError, RegistryError, ValueError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    if output_format == "json-schema":
+        import json
+
+        from conscribe.config.json_schema import generate_composed_json_schema
+
+        content = json.dumps(generate_composed_json_schema(result), indent=2)
+    else:
+        from conscribe.config.codegen import generate_composed_config_source
+
+        content = generate_composed_config_source(result)
+
+    if output is not None:
+        Path(output).write_text(content, encoding="utf-8")
+    else:
+        print(content)
 
     return 0
 

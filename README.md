@@ -164,6 +164,38 @@ The 3-element tuple distinguishes required and optional keys — both appear in 
 
 Inheritance: child `__wiring__` merges with parent (child keys override). Use `None` to exclude: `{"llm": None}`.
 
+### Composed Config (Multi-Layer Inline Wiring)
+
+Combine multiple layers into a single config schema. Wired fields become full inline config objects instead of key selectors — enabling recursive IDE autocompletion across layers:
+
+```python
+from conscribe import build_composed_config, generate_composed_json_schema
+
+result = build_composed_config(
+    {"llm": LLMRegistrar, "agent": AgentRegistrar},
+    inline_wiring=True,   # wired fields become target layer union types
+)
+schema = generate_composed_json_schema(result)
+```
+
+YAML config with inline wiring:
+
+```yaml
+agents:
+  - name: browser_use
+    use_vision: true
+    llm:                        # full LLM config inline — IDE autocompletes all fields
+      provider: openai
+      model: gpt-4o
+      temperature: 0.7
+  - name: react
+    llm:
+      provider: anthropic
+      model: claude-3
+```
+
+Use `inline_wiring=False` to keep wired fields as `Literal[...]` key selectors.
+
 ### Cross-Registry Diamond Inheritance
 
 Register a class in multiple registries:
@@ -200,6 +232,9 @@ class LLMAgent(metaclass=CombinedMeta):
 | `build_layer_config(registrar)` | Build discriminated union (flat or nested mode) |
 | `generate_layer_config_source(result)` | Generate Python stub source code |
 | `generate_layer_json_schema(result)` | Generate JSON Schema |
+| `build_composed_config(registrars, inline_wiring)` | Build multi-layer composed config |
+| `generate_composed_json_schema(result)` | Generate composed JSON Schema |
+| `generate_composed_config_source(result)` | Generate composed Python source |
 | `compute_registry_fingerprint(registrar)` | Compute registry fingerprint hash |
 | `get_registry(name)` | Look up a registry by name (for wiring) |
 

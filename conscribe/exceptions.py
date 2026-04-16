@@ -139,6 +139,23 @@ class InvalidProtocolError(RegistryError, TypeError):
         super().__init__(message)
 
 
+class CircularWiringError(RegistryError):
+    """Raised when composed config detects circular wiring dependencies.
+
+    Attributes:
+        cycle: The list of layer names forming the cycle.
+    """
+
+    def __init__(self, cycle: list[str]) -> None:
+        self.cycle = cycle
+        cycle_str = " -> ".join(cycle + [cycle[0]]) if cycle else "(empty)"
+        message = (
+            f"Circular wiring dependency detected: {cycle_str}. "
+            f"Composed config requires an acyclic dependency graph between layers."
+        )
+        super().__init__(message)
+
+
 class WiringResolutionError(RegistryError):
     """Raised when ``__wiring__`` cannot be resolved at config build time.
 

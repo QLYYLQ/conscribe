@@ -258,6 +258,61 @@ Generate a JSON Schema dict. Includes:
 
 ---
 
+### `build_composed_config(registrars, *, inline_wiring=True) -> ComposedConfigResult`
+
+Build a composed config from multiple layer registrars. Topologically sorts layers by wiring dependencies and builds each layer's config. When `inline_wiring=True`, post-processes wired `Literal[...]` fields into the target layer's discriminated union type.
+
+**Parameters:**
+
+| Name | Type | Default | Description |
+|------|------|---------|-------------|
+| `registrars` | `dict[str, LayerRegistrar]` | required | Dict mapping layer name to registrar |
+| `inline_wiring` | `bool` | `True` | Inline wired fields as target union types |
+
+**Returns:** `ComposedConfigResult`
+
+**Raises:** `CircularWiringError` if wiring dependencies form a cycle.
+
+```python
+from conscribe import build_composed_config
+
+result = build_composed_config(
+    {"llm": LLMRegistrar, "agent": AgentRegistrar},
+    inline_wiring=True,
+)
+```
+
+---
+
+### `ComposedConfigResult` (dataclass)
+
+```python
+@dataclass(frozen=True)
+class ComposedConfigResult:
+    layer_results: dict[str, LayerConfigResult]  # layer_name -> per-layer result
+    top_level_type: type[BaseModel]              # Pydantic model with list[union] per layer
+    dependency_order: list[str]                   # topological order (leaves first)
+    inline_wiring: bool                          # whether inline wiring was applied
+```
+
+---
+
+### `generate_composed_json_schema(result) -> dict`
+
+Generate a JSON Schema from a `ComposedConfigResult`. Includes:
+- `x-composed-layers`: list of layer names in dependency order
+- `x-inline-wiring`: whether inline wiring was applied
+
+Pydantic automatically places nested models in `$defs` with `$ref`.
+
+---
+
+### `generate_composed_config_source(result) -> str`
+
+Generate Python source from a `ComposedConfigResult`. Emits layer models in dependency order (leaves first), per-layer union aliases, and a top-level `ComposedConfig` class.
+
+---
+
 ### `compute_registry_fingerprint(registrar) -> str`
 
 Compute a 16-character hex fingerprint of all registered classes.
@@ -446,6 +501,7 @@ All inherit from `RegistryError`.
 | `InvalidConfigSchemaError` | `RegistryError`, `TypeError` | `__config_schema__` is not a BaseModel |
 | `InvalidProtocolError` | `RegistryError`, `TypeError` | Protocol not `@runtime_checkable` |
 | `WiringResolutionError` | `RegistryError` | `__wiring__` references missing registry, empty registry, or invalid keys |
+| `CircularWiringError` | `RegistryError` | Circular wiring dependencies in `build_composed_config()` |
 
 ### Class Attributes for Configuration
 

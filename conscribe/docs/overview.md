@@ -53,6 +53,7 @@ Extracts config schemas and generates output. Pipeline: **extract -> build -> ge
   - **Flat mode** (single discriminator): `Annotated[Union[...], Field(discriminator=...)]`
   - **Nested mode** (compound discriminator): deeply nested sub-models with `Discriminator(callable)` + `Tag`
 - **Generate:** `generate_layer_config_source(result)` outputs Python stubs; `generate_layer_json_schema(result)` outputs JSON Schema
+- **Compose:** `build_composed_config(registrars, inline_wiring)` combines multiple layers into a single schema — wired fields become inline config objects with recursive IDE autocompletion
 - **Fingerprint:** `compute_registry_fingerprint(registrar)` hashes registry state for staleness detection
 
 ## Config Tiers
@@ -74,6 +75,7 @@ Extracts config schemas and generates output. Pipeline: **extract -> build -> ge
 | Understand config pipeline internals | [Config Typing Deep-Dive](config-typing.md) |
 | Handle MRO chains and type degradation | [MRO and Degradation](mro-and-degradation.md) |
 | Look up exact API signatures | [API Reference](api-reference.md) |
+| Compose multiple layers into one schema | [Config Typing Deep-Dive — Composed Config](config-typing.md#composed-config-composedpy) |
 | Answer "how do I X?" | [Recipes](recipes.md) |
 | Use the CLI | [CLI Reference](cli.md) |
 

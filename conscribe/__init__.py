@@ -6,6 +6,7 @@ the class is automatically registered in the appropriate layer registry.
 from __future__ import annotations
 
 from conscribe.exceptions import (
+    CircularWiringError,
     DuplicateKeyError,
     InvalidConfigSchemaError,
     InvalidProtocolError,
@@ -27,19 +28,23 @@ from conscribe.registration import (
 )
 from conscribe.registration.registry import get_registry
 from conscribe.config import (
+    ComposedConfigResult,
     DegradedField,
     LayerConfigResult,
     MROScope,
+    build_composed_config,
     build_layer_config,
     compute_registry_fingerprint,
     extract_config_schema,
+    generate_composed_config_source,
+    generate_composed_json_schema,
     generate_layer_config_source,
     generate_layer_json_schema,
     load_cached_fingerprint,
     save_fingerprint,
 )
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 __all__ = [
     # Registration API
@@ -56,10 +61,14 @@ __all__ = [
     "MROScope",
     "extract_config_schema",
     "build_layer_config",
+    "build_composed_config",
     "LayerConfigResult",
+    "ComposedConfigResult",
     "DegradedField",
     "generate_layer_config_source",
+    "generate_composed_config_source",
     "generate_layer_json_schema",
+    "generate_composed_json_schema",
     "compute_registry_fingerprint",
     "load_cached_fingerprint",
     "save_fingerprint",
@@ -69,6 +78,7 @@ __all__ = [
     # Wiring API
     "get_registry",
     "WiringResolutionError",
+    "CircularWiringError",
     # Exceptions
     "RegistryError",
     "DuplicateKeyError",
