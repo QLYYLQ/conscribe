@@ -18,6 +18,7 @@ A ``None`` value excludes an inherited key::
 """
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -269,3 +270,95 @@ def resolve_wiring(cls: type) -> dict[str, ResolvedWiring]:
             )
 
     return result
+
+
+# ── WiredField descriptor ──────────────────────────────────────
+
+
+class WiredField:
+    """Non-data descriptor placeholder for wired attributes not in ``__init__``.
+
+    Set automatically by the metaclass / ``register()`` decorator when a
+    class declares ``__wiring__`` fields that are not ``__init__`` parameters.
+
+    Before injection (framework has not set the attribute)::
+
+        agent.env          # raises AttributeError with clear message
+        MyAgent.env        # returns the WiredField descriptor itself
+
+    After injection (framework sets instance attribute)::
+
+        agent.env = my_env
+        agent.env          # returns my_env (instance attr shadows descriptor)
+    """
+
+    __slots__ = ("name", "registry_name")
+
+    def __init__(self, name: str, registry_name: str = "") -> None:
+        self.name = name
+        self.registry_name = registry_name
+
+    def __repr__(self) -> str:
+        if self.registry_name:
+            return f"WiredField({self.name!r}, registry={self.registry_name!r})"
+        return f"WiredField({self.name!r})"
+
+    def __get__(self, obj: Any, objtype: type | None = None) -> Any:
+        if obj is None:
+            return self
+        msg = f"Wired attribute '{self.name}' on {type(obj).__name__} has not been injected yet."
+        if self.registry_name:
+            msg += f" Expected injection from registry '{self.registry_name}'."
+        raise AttributeError(msg)
+
+
+def inject_wired_descriptors(cls: type) -> None:
+    """Set :class:`WiredField` descriptors for injected wired attributes.
+
+    Called at class creation time (metaclass ``__new__``, ``register()``
+    decorator, or ``__init_subclass__`` propagation hook).
+
+    Only sets descriptors for wired fields that are **not** in the class's
+    ``__init__`` signature.  Uses :func:`collect_wiring_from_mro` (no
+    registry resolution needed, so no timing issues with unpopulated
+    registries).
+
+    Args:
+        cls: The newly created class.
+    """
+    merged = collect_wiring_from_mro(cls)
+    if not merged:
+        return
+
+    # Collect __init__ param names (including inherited)
+    init_param_names: set[str] = set()
+    try:
+        sig = inspect.signature(cls.__init__)  # type: ignore[misc]
+        init_param_names = {
+            p.name
+            for p in sig.parameters.values()
+            if p.name != "self"
+        }
+    except (ValueError, TypeError):
+        pass
+
+    for param_name, raw_value in merged.items():
+        if param_name in init_param_names:
+            continue  # already in __init__, not injected
+
+        # Skip if a WiredField already exists (own or inherited from parent)
+        if isinstance(getattr(cls, param_name, None), WiredField):
+            continue
+
+        # Extract registry name from raw wiring value
+        registry_name = _extract_registry_name(raw_value)
+        setattr(cls, param_name, WiredField(param_name, registry_name))
+
+
+def _extract_registry_name(raw_value: Any) -> str:
+    """Extract registry name from a raw ``__wiring__`` value."""
+    if isinstance(raw_value, str):
+        return raw_value
+    if isinstance(raw_value, tuple) and len(raw_value) >= 2 and isinstance(raw_value[0], str):
+        return raw_value[0]
+    return ""

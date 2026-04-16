@@ -27,6 +27,7 @@ from conscribe.registration import (
     make_key_transform,
 )
 from conscribe.registration.registry import get_registry
+from conscribe.wiring import WiredField, inject_wired_descriptors
 from conscribe.config import (
     ComposedConfigResult,
     DegradedField,
@@ -44,7 +45,7 @@ from conscribe.config import (
     save_fingerprint,
 )
 
-__version__ = "0.9.0"
+__version__ = "1.0.0"
 
 __all__ = [
     # Registration API
@@ -77,6 +78,8 @@ __all__ = [
     # narrowest_common_base, ClassStubInfo, InjectedAttr
     # Wiring API
     "get_registry",
+    "WiredField",
+    "inject_wired_descriptors",
     "WiringResolutionError",
     "CircularWiringError",
     # Exceptions

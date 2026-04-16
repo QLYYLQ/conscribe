@@ -4,14 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Conscribe** (`conscribe` package, v0.9.0) — A Python library for automatic class registration and config typing stub generation for layered Python architectures. It targets framework developers building config-driven frameworks with pluggable layers (agents, LLM providers, etc.).
+**Conscribe** (`conscribe` package, v1.0.0) — A Python library for automatic class registration and config typing stub generation for layered Python architectures. It targets framework developers building config-driven frameworks with pluggable layers (agents, LLM providers, etc.).
 
-Five core capabilities:
+Six core capabilities:
 1. **Auto-registration**: Classes inheriting a base are automatically registered in their layer's registry (via metaclass). Also supports bridging external classes and explicit `@register` decorators.
 2. **Config typing**: Extracts `__init__` signatures into Pydantic discriminated unions, generates Python stubs for IDE autocomplete of YAML configs, with fingerprint-based staleness detection.
 3. **Cross-registry wiring**: Classes declare `__wiring__` to reference other registries, constraining config fields to `Literal[...]` with auto-discovery or explicit subsets. Enables Spring IoC-style dependency declarations between layers.
-4. **`.pyi` stub generation**: Generates PEP 484 `.pyi` files for classes with injected wired attributes. Enables IDE autocomplete (PyCharm, VS Code, mypy) for runtime-injected dependencies. Uses type narrowing: wired attributes are typed as the target registry's protocol/base class, narrowed to the most specific common ancestor when constrained to a subset.
-5. **Composed config**: Combines multiple layers into a single JSON Schema / Python source with inline wiring — wired fields become the target layer's full discriminated union type instead of `Literal[...]`. Enables recursive IDE autocompletion across layers when editing YAML configs.
+4. **Wired field injection**: `WiredField` non-data descriptors are automatically set on classes at definition time for wired attributes not in `__init__`. Provides clear errors before framework injection and enables `isinstance` introspection. Instance assignment (`obj.attr = value`) naturally shadows the descriptor.
+5. **`.pyi` stub generation**: Generates PEP 484 `.pyi` files for classes with injected wired attributes. Enables IDE autocomplete (PyCharm, VS Code, mypy) for runtime-injected dependencies. Uses type narrowing: wired attributes are typed as the target registry's protocol/base class, narrowed to the most specific common ancestor when constrained to a subset.
+6. **Composed config**: Combines multiple layers into a single JSON Schema / Python source with inline wiring — wired fields become the target layer's full discriminated union type instead of `Literal[...]`. Enables recursive IDE autocompletion across layers when editing YAML configs.
 
 ## Commands
 
@@ -67,6 +68,8 @@ pytest is pre-configured in `pyproject.toml` with `--cov=conscribe --cov-report=
 **Wiring** (`conscribe/wiring.py`):
 - `WiringSpec` — Frozen dataclass for parsed `__wiring__` entries. Three modes: str (auto-discover all keys from registry), tuple (explicit subset from registry), list (literal list without registry). Mode 2 tuple supports 3-element form `(registry, required_keys, optional_keys)` to distinguish required vs optional keys. Fields: `allowed_keys` (required keys or all keys), `optional_keys` (optional subset, `None` for non-3-element modes).
 - `ResolvedWiring` — Concrete key list after registry lookup, with `injected` flag for fields not in `__init__`. `allowed_keys` contains required+optional combined for backward-compatible `Literal[...]` generation. `optional_keys` stores the optional subset (`None` when not using 3-element tuple mode).
+- `WiredField` — Non-data descriptor placeholder for wired attributes not in `__init__`. Set automatically at class creation time by the metaclass / `register()` decorator. `__get__` raises `AttributeError` with clear message before injection; instance assignment (`obj.attr = value`) shadows the descriptor. Class-level access returns the descriptor itself for introspection.
+- `inject_wired_descriptors(cls)` — Sets `WiredField` descriptors on `cls` for each wired field not in `__init__`. Called from `AutoRegistrar.__new__` (Path A), `register()` (Path C), and `_inject_auto_registration.__init_subclass__` (Path C propagate). Uses `collect_wiring_from_mro()` — no registry resolution needed, avoiding timing issues with unpopulated registries.
 - `collect_wiring_from_mro(cls)` — Walks MRO bottom-up to deep-merge `__wiring__` dicts. `None` value excludes inherited keys.
 - `parse_wiring(cls)` — Normalizes `__wiring__` dict to `WiringSpec` list.
 - `resolve_wiring(cls)` — Resolves specs to concrete key lists via `get_registry()`. Raises `WiringResolutionError` on failures.

@@ -189,6 +189,10 @@ class LayerRegistrar(Generic[P]):
             cls._registry.add(actual_key, target_cls, protocol_check=True)
             target_cls.__registry_key__ = actual_key  # type: ignore[attr-defined]
 
+            from conscribe.wiring import inject_wired_descriptors
+
+            inject_wired_descriptors(target_cls)
+
             if propagate:
                 cls._inject_auto_registration(target_cls)
 
@@ -240,6 +244,10 @@ class LayerRegistrar(Generic[P]):
             )
             registry.add(sub_key, sub_cls, protocol_check=True)
             sub_cls.__registry_key__ = sub_key  # type: ignore[attr-defined]
+
+            from conscribe.wiring import inject_wired_descriptors
+
+            inject_wired_descriptors(sub_cls)
 
         target_cls.__init_subclass__ = __init_subclass__  # type: ignore[attr-defined]
 

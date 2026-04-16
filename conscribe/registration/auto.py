@@ -83,6 +83,11 @@ def create_auto_registrar(
             # Step 1: Create the class — pass **kwargs through!
             cls = super().__new__(mcs, name, bases, namespace, **kwargs)
 
+            # Step 1.5: Set WiredField descriptors for injected wired attrs
+            from conscribe.wiring import inject_wired_descriptors
+
+            inject_wired_descriptors(cls)
+
             # Step 2: Tag with layer name
             cls.__registry_name__ = registry.name  # type: ignore[attr-defined]
 

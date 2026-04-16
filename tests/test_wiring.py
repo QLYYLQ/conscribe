@@ -8,8 +8,10 @@ from conscribe.exceptions import WiringResolutionError
 from conscribe.registration.registry import LayerRegistry, _REGISTRY_INDEX, _deregister
 from conscribe.wiring import (
     ResolvedWiring,
+    WiredField,
     WiringSpec,
     collect_wiring_from_mro,
+    inject_wired_descriptors,
     parse_wiring,
     resolve_wiring,
 )
@@ -363,3 +365,164 @@ class TestResolveWiring:
         resolved = resolve_wiring(Agent)
         assert resolved["llm"].optional_keys is None
         assert resolved["llm"].allowed_keys == ["openai"]
+
+
+# ---------------------------------------------------------------------------
+# Tests: WiredField descriptor
+# ---------------------------------------------------------------------------
+
+
+class TestWiredField:
+    def test_repr_with_registry(self):
+        wf = WiredField("env", registry_name="environment")
+        assert repr(wf) == "WiredField('env', registry='environment')"
+
+    def test_repr_without_registry(self):
+        wf = WiredField("browser")
+        assert repr(wf) == "WiredField('browser')"
+
+    def test_class_level_access_returns_descriptor(self):
+        class Foo:
+            env = WiredField("env", registry_name="environment")
+
+        assert isinstance(Foo.env, WiredField)
+        assert Foo.env.name == "env"
+
+    def test_instance_access_before_injection_raises(self):
+        class Foo:
+            env = WiredField("env", registry_name="environment")
+
+        with pytest.raises(AttributeError, match="not been injected yet"):
+            Foo().env
+
+    def test_error_message_includes_registry(self):
+        class Foo:
+            env = WiredField("env", registry_name="environment")
+
+        with pytest.raises(AttributeError, match="registry 'environment'"):
+            Foo().env
+
+    def test_instance_assignment_shadows_descriptor(self):
+        class Foo:
+            env = WiredField("env")
+
+        obj = Foo()
+        obj.env = "injected_value"
+        assert obj.env == "injected_value"
+        # Descriptor still on the class
+        assert isinstance(Foo.env, WiredField)
+
+    def test_different_instances_independent(self):
+        class Foo:
+            env = WiredField("env")
+
+        a, b = Foo(), Foo()
+        a.env = "env_a"
+        assert a.env == "env_a"
+        with pytest.raises(AttributeError):
+            b.env
+
+
+# ---------------------------------------------------------------------------
+# Tests: inject_wired_descriptors
+# ---------------------------------------------------------------------------
+
+
+class TestInjectWiredDescriptors:
+    def test_sets_descriptor_for_injected_field(self):
+        class Agent:
+            __wiring__ = {"env": "environment"}
+
+            def __init__(self, name: str = "default"):
+                self.name = name
+
+        inject_wired_descriptors(Agent)
+        assert isinstance(Agent.__dict__["env"], WiredField)
+        assert Agent.__dict__["env"].registry_name == "environment"
+
+    def test_skips_init_params(self):
+        class Agent:
+            __wiring__ = {"env": "environment", "llm": "llm_provider"}
+
+            def __init__(self, llm: str = "openai"):
+                self.llm = llm
+
+        inject_wired_descriptors(Agent)
+        # env is injected (not in __init__)
+        assert isinstance(Agent.__dict__["env"], WiredField)
+        # llm is NOT injected (in __init__)
+        assert "llm" not in Agent.__dict__ or not isinstance(
+            Agent.__dict__.get("llm"), WiredField
+        )
+
+    def test_no_wiring_is_noop(self):
+        class Plain:
+            pass
+
+        inject_wired_descriptors(Plain)
+        # No WiredField attributes added
+        assert not any(
+            isinstance(v, WiredField) for v in Plain.__dict__.values()
+        )
+
+    def test_inherits_parent_descriptors(self):
+        class Base:
+            __wiring__ = {"env": "environment"}
+
+        inject_wired_descriptors(Base)
+
+        class Child(Base):
+            __wiring__ = {"llm": "llm_provider"}
+
+        inject_wired_descriptors(Child)
+
+        # Child has its own llm descriptor
+        assert isinstance(Child.__dict__["llm"], WiredField)
+        # Child inherits env from Base (not in Child.__dict__)
+        assert "env" not in Child.__dict__
+        assert isinstance(Child.env, WiredField)  # class-level access
+
+    def test_mode2_tuple_registry_name(self):
+        class Agent:
+            __wiring__ = {"llm": ("llm_provider", ["openai"])}
+
+        inject_wired_descriptors(Agent)
+        assert Agent.__dict__["llm"].registry_name == "llm_provider"
+
+    def test_mode3_list_empty_registry_name(self):
+        class Agent:
+            __wiring__ = {"browser": ["chromium", "firefox"]}
+
+        inject_wired_descriptors(Agent)
+        assert Agent.__dict__["browser"].registry_name == ""
+
+    def test_via_metaclass(self):
+        """End-to-end: descriptors set automatically by create_registrar."""
+        from conscribe import create_registrar
+
+        Env = create_registrar("test_wf_env", protocol=LoopProtocol)
+        Agent = create_registrar("test_wf_agent", protocol=LoopProtocol)
+
+        class TerminalEnv(metaclass=Env.Meta):
+            def run(self) -> None: ...
+
+        class MyAgent(metaclass=Agent.Meta):
+            __wiring__ = {"env": "test_wf_env"}
+
+            def __init__(self, name: str = "default"):
+                self.name = name
+
+            def run(self) -> None: ...
+
+        # Descriptor exists on the class
+        assert isinstance(MyAgent.__dict__["env"], WiredField)
+
+        # Instance: before injection raises
+        agent = MyAgent()
+        with pytest.raises(AttributeError, match="not been injected"):
+            agent.env
+
+        # Instance: after injection works
+        env_instance = TerminalEnv()
+        agent.env = env_instance
+        assert agent.env is env_instance
