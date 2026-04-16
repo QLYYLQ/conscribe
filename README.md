@@ -223,6 +223,8 @@ class LLMAgent(metaclass=CombinedMeta):
 | `Registrar.bridge(external_cls)` | Create bridge for external class |
 | `Registrar.register(key)` | Manual registration decorator |
 | `discover(*package_paths)` | Import modules to trigger registration |
+| `scan_registrar_definitions(root)` | Static AST scan for registrar definitions |
+| `list_registries(root, ...)` | Runtime list of all registered content |
 
 ### Config Typing
 
@@ -265,7 +267,7 @@ Full documentation is shipped inside the package (accessible at `site-packages/c
 | [`docs/registration.md`](https://github.com/QLYYLQ/conscribe/blob/master/conscribe/docs/registration.md) | Registration subsystem internals |
 | [`docs/config-typing.md`](https://github.com/QLYYLQ/conscribe/blob/master/conscribe/docs/config-typing.md) | Config typing pipeline internals |
 | [`docs/mro-and-degradation.md`](https://github.com/QLYYLQ/conscribe/blob/master/conscribe/docs/mro-and-degradation.md) | MRO chains and type degradation |
-| [`docs/cli.md`](https://github.com/QLYYLQ/conscribe/blob/master/conscribe/docs/cli.md) | CLI reference |
+| [`docs/cli.md`](https://github.com/QLYYLQ/conscribe/blob/master/conscribe/docs/cli.md) | CLI reference (`scan`, `list`, `inspect`, `generate-*`) |
 
 ---
 

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Conscribe** (`conscribe` package, v0.8.0) — A Python library for automatic class registration and config typing stub generation for layered Python architectures. It targets framework developers building config-driven frameworks with pluggable layers (agents, LLM providers, etc.).
+**Conscribe** (`conscribe` package, v0.9.0) — A Python library for automatic class registration and config typing stub generation for layered Python architectures. It targets framework developers building config-driven frameworks with pluggable layers (agents, LLM providers, etc.).
 
 Five core capabilities:
 1. **Auto-registration**: Classes inheriting a base are automatically registered in their layer's registry (via metaclass). Also supports bridging external classes and explicit `@register` decorators.
@@ -33,6 +33,8 @@ conscribe generate-config --layer <name> --output <path>
 conscribe generate-composed-config --layers <name1> <name2> [--format json-schema|python] [--no-inline-wiring] --output <path>
 conscribe generate-stubs --layer <name> --output-dir <path>
 conscribe inspect --layer <name>
+conscribe scan [--path <dir>]
+conscribe list [--discover <pkg> ...] [--layer <name>] [--path <dir>]
 ```
 
 pytest is pre-configured in `pyproject.toml` with `--cov=conscribe --cov-report=term-missing --tb=short -q`.
@@ -75,6 +77,11 @@ pytest is pre-configured in `pyproject.toml` with `--cov=conscribe --cov-report=
 - `writer.py` — `write_layer_stubs(registrar, output_dir)` groups classes by source module, generates and writes `.pyi` files. Default: alongside source `.py` files.
 
 **Discovery** (`conscribe/discover.py`): Recursively imports modules to trigger metaclass registration. Optionally auto-regenerates stubs if fingerprint is stale.
+
+**Scanner** (`conscribe/scanner.py`):
+- `scan_registrar_definitions(root)` — Static AST analysis. Walks `.py` files (excluding site-packages, .venv, etc.) to find `create_registrar()` / `create_auto_registrar()` calls. Returns `RegistrarDefinition` (name, protocol, file, line, variable). No imports, no side effects.
+- `find_packages(root)` — Detects top-level Python packages (dirs with `__init__.py`) under root, excluding common non-project dirs.
+- `list_registries(root, discover_packages, layer_filter, path_filter)` — Runtime inspection. Imports packages via `discover()`, queries `_REGISTRY_INDEX`, returns `RegistrySummary` per registry with `RegistryEntry` per class (key, class name, source file, line). Filters entries to files under root by default (excludes site-packages). Supports `layer_filter` (single registry) and `path_filter` (source path prefix).
 
 ### Key Class Attributes (non-obvious conventions)
 

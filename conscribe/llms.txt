@@ -44,3 +44,4 @@ All paths are relative to this file's directory (`conscribe/`).
 - [Source: stubs/collector.py](stubs/collector.py): Stub data collection with type narrowing (`narrowest_common_base`).
 - [Source: stubs/generator.py](stubs/generator.py): `.pyi` source rendering (partial stubs with `__getattr__` fallback).
 - [Source: stubs/writer.py](stubs/writer.py): `write_layer_stubs()` file I/O.
+- [Source: scanner.py](scanner.py): AST-based registrar scanning and runtime registry listing (`scan`, `list` CLI).

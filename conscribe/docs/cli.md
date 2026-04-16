@@ -153,6 +153,66 @@ Force regenerate all stubs, ignoring the fingerprint cache.
 conscribe update-stubs --config conscribe.yaml
 ```
 
+### `scan`
+
+Scan Python files under the current directory for `create_registrar()` and `create_auto_registrar()` definitions using static AST analysis. No imports, no side effects.
+
+```bash
+conscribe scan
+conscribe scan --path src/my_app
+```
+
+**Options:**
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--path` | No | Root directory to scan (default: current directory) |
+
+Output:
+
+```
+Found 3 registrar(s):
+
+  agent           AgentProtocol       src/layers.py:12    (var: AgentRegistrar)
+  llm             LLMProtocol         src/layers.py:22    (var: LLMRegistrar)
+  evaluator       EvaluatorProtocol   src/layers.py:32    (var: EvaluatorRegistrar)
+```
+
+Excluded directories: `site-packages`, `.venv`, `venv`, `.git`, `__pycache__`, `.eggs`, `.tox`, `node_modules`, `build`, `dist`, `.mypy_cache`, `.pytest_cache`, `.ruff_cache`.
+
+### `list`
+
+Import packages to trigger registration, then list all registered content from runtime registries. Auto-detects top-level packages under the current directory if `--discover` is not specified.
+
+```bash
+conscribe list --discover my_app
+conscribe list --discover my_app --layer agent
+conscribe list --discover my_app --path my_app/agents
+```
+
+**Options:**
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--discover` | No | Packages to import for registration (auto-detected if omitted) |
+| `--layer` | No | Show only this registry (by name) |
+| `--path` | No | Filter entries by source file path prefix |
+
+Output:
+
+```
+Registry: agent (AgentProtocol) — 3 entries
+  browser_use         BrowserUseAgent         my_app/agents/browser_use.py:17
+  skyvern             SkyvernAgent            my_app/agents/skyvern.py:7
+  custom_v2           CustomAgent             my_app/agents/custom.py:7
+
+Registry: llm (LLMProtocol) — 2 entries
+  openai              OpenAIProvider          my_app/llm/openai.py:14
+  anthropic           AnthropicProvider       my_app/llm/anthropic.py:7
+```
+
+By default, only entries whose source file is under the current directory are shown (site-packages entries are excluded). When `--path` is given, empty registries are hidden.
+
 ## Batch Config File
 
 For projects with multiple layers, use a YAML config file:

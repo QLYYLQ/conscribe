@@ -5,6 +5,8 @@ Provides commands for generating config stubs and inspecting registries.
 Commands:
     generate-config --layer <name> [--output <path>]
     inspect --layer <name>
+    scan [--path <dir>]
+    list [--discover <pkg> ...] [--layer <name>] [--path <dir>]
 """
 from __future__ import annotations
 
@@ -107,6 +109,40 @@ def main(argv: Union[list[str], None] = None) -> int:
         "--layer", required=True, help="Layer name (e.g. 'llm', 'agent')."
     )
 
+    # scan
+    scan_parser = subparsers.add_parser(
+        "scan",
+        help="Scan Python files for registrar definitions (static analysis).",
+    )
+    scan_parser.add_argument(
+        "--path",
+        default=".",
+        help="Root directory to scan (default: current directory).",
+    )
+
+    # list
+    list_parser = subparsers.add_parser(
+        "list",
+        help="List registered content from runtime registries.",
+    )
+    list_parser.add_argument(
+        "--discover",
+        nargs="+",
+        dest="discover_packages",
+        default=None,
+        help="Packages to import for registration (auto-detected if omitted).",
+    )
+    list_parser.add_argument(
+        "--layer",
+        default=None,
+        help="Show only this registry (by name).",
+    )
+    list_parser.add_argument(
+        "--path",
+        default=None,
+        help="Filter entries by source file path prefix.",
+    )
+
     args = parser.parse_args(argv)
 
     if args.command is None:
@@ -123,6 +159,10 @@ def main(argv: Union[list[str], None] = None) -> int:
         return _cmd_generate_stubs(args.layer, args.output_dir)
     elif args.command == "inspect":
         return _cmd_inspect(args.layer)
+    elif args.command == "scan":
+        return _cmd_scan(args.path)
+    elif args.command == "list":
+        return _cmd_list(args.discover_packages, args.layer, args.path)
 
     return 1
 
@@ -210,6 +250,116 @@ def _cmd_generate_stubs(layer_name: str, output_dir: Union[str, None]) -> int:
     for path in written:
         print(f"  {path}")
     print(f"Generated {len(written)} stub file(s).")
+    return 0
+
+
+def _cmd_scan(path: str) -> int:
+    """Handle the scan subcommand."""
+    from conscribe.scanner import scan_registrar_definitions
+
+    root = Path(path).resolve()
+
+    if not root.is_dir():
+        print(f"Error: {root} is not a directory.", file=sys.stderr)
+        return 1
+
+    definitions = scan_registrar_definitions(root)
+
+    if not definitions:
+        print(f"No registrar definitions found under {root}.")
+        return 0
+
+    print(f"Found {len(definitions)} registrar(s):\n")
+    for defn in definitions:
+        rel_path = defn.file_path
+        try:
+            rel_path = str(Path(defn.file_path).relative_to(root))
+        except ValueError:
+            pass
+        var_part = f"  (var: {defn.variable_name})" if defn.variable_name else ""
+        print(
+            f"  {defn.name:<16}"
+            f"{defn.protocol_name:<20}"
+            f"{rel_path}:{defn.line_number}"
+            f"{var_part}"
+        )
+
+    return 0
+
+
+def _cmd_list(
+    discover_packages: Union[list[str], None],
+    layer: Union[str, None],
+    path: Union[str, None],
+) -> int:
+    """Handle the list subcommand."""
+    from conscribe.scanner import find_packages, list_registries
+
+    root = Path.cwd()
+
+    if discover_packages is None:
+        detected = find_packages(root)
+        if not detected:
+            print(
+                "Error: no Python packages found under current directory.\n"
+                "Use --discover to specify packages explicitly.",
+                file=sys.stderr,
+            )
+            return 1
+        discover_packages = detected
+
+    try:
+        summaries = list_registries(
+            root,
+            discover_packages=discover_packages,
+            layer_filter=layer,
+            path_filter=path,
+        )
+    except ModuleNotFoundError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    if not summaries:
+        if layer is not None:
+            # Try to list available registries
+            all_summaries = list_registries(root, discover_packages=discover_packages)
+            available = [s.name for s in all_summaries]
+            if available:
+                print(
+                    f"Registry '{layer}' not found. "
+                    f"Available: {', '.join(available)}.",
+                    file=sys.stderr,
+                )
+            else:
+                print("No registries found.", file=sys.stderr)
+            return 1
+        print("No registries found.")
+        return 0
+
+    for summary in summaries:
+        # Hide empty registries when filtering by path
+        if path is not None and summary.entry_count == 0:
+            continue
+        print(
+            f"Registry: {summary.name} ({summary.protocol_name})"
+            f" \u2014 {summary.entry_count} entries"
+        )
+        if not summary.entries:
+            print("  (empty)")
+        else:
+            for entry in summary.entries:
+                loc = ""
+                if entry.file_path is not None:
+                    loc = entry.file_path
+                    if entry.line_number is not None:
+                        loc += f":{entry.line_number}"
+                print(
+                    f"  {entry.key:<20}"
+                    f"{entry.class_name:<24}"
+                    f"{loc}"
+                )
+        print()
+
     return 0
 
 
