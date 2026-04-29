@@ -249,3 +249,48 @@ class TestCollectClassStubInfo:
         assert len(info.methods) == 1
         assert info.methods[0].name == "step"
         assert "task" in info.methods[0].signature
+
+    def test_class_attrs_captured(self):
+        """Public class-level annotated attrs appear in class_attrs."""
+        _make_env_registry()
+
+        class Agent:
+            __wiring__ = {"env": "test_env"}
+            max_steps: int = 10
+            use_vision: bool = False
+
+        info = collect_class_stub_info(Agent)
+        assert info is not None
+        names = {ca.name for ca in info.class_attrs}
+        assert {"max_steps", "use_vision"} <= names
+
+    def test_class_attrs_skip_dunders(self):
+        """Dunder annotations like ``__wiring__`` don't bleed into class_attrs."""
+        _make_env_registry()
+
+        class Agent:
+            __wiring__: dict = {"env": "test_env"}
+            visible: int = 0
+
+        info = collect_class_stub_info(Agent)
+        assert info is not None
+        names = {ca.name for ca in info.class_attrs}
+        assert "__wiring__" not in names
+        assert "visible" in names
+
+    def test_class_attrs_skip_injected_names(self):
+        """Wired-injected names aren't duplicated into class_attrs."""
+        _make_env_registry()
+
+        class Agent:
+            __wiring__ = {"env": "test_env"}
+            # ``env`` is injected (not in __init__) — it must not appear
+            # in class_attrs since it's already rendered as a wired attr.
+            env: str = ""
+
+        info = collect_class_stub_info(Agent)
+        assert info is not None
+        injected = {a.name for a in info.injected_attrs}
+        attr_names = {ca.name for ca in info.class_attrs}
+        assert "env" in injected
+        assert "env" not in attr_names

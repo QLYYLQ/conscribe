@@ -218,6 +218,8 @@ class TestGenerateModuleStub:
 
 def _stub_for(cls: type) -> str:
     """Wrap *cls* in a ClassStubInfo and render through generate_module_stub."""
+    from conscribe.stubs.collector import _collect_class_attrs
+
     info = ClassStubInfo(
         cls=cls,
         class_name=cls.__name__,
@@ -229,6 +231,7 @@ def _stub_for(cls: type) -> str:
             InjectedAttr(name="_dummy", resolved_type=str, registry_name=None),
         ),
         methods=_methods_for(cls),
+        class_attrs=_collect_class_attrs(cls, skip_names={"_dummy"}),
     )
     return generate_module_stub(info.module, [info])
 
@@ -310,6 +313,57 @@ class TestStringAnnotations:
 
         # And no spurious import was emitted for the unknown name.
         assert "import NeverDefined" not in source
+
+
+class TestAliasedImports:
+    def test_pydantic_field_alias_preserved(self):
+        """``from pydantic import Field as PydanticField`` round-trips faithfully.
+
+        Regression test for v1.1.0 → v1.1.1: previously the stub emitted
+        ``from pydantic.fields import PydanticField`` (using the alias as
+        the *imported* name and the runtime ``__module__`` instead of the
+        user's source module), which doesn't resolve.
+        """
+        from tests.stubs.fixtures.aliased_import import AliasedDataclass
+
+        source = _stub_for(AliasedDataclass)
+
+        # Faithful aliased import — original name + alias preserved.
+        assert "from pydantic import Field as PydanticField" in source
+
+        # Negative: the broken form must not appear.
+        assert "from pydantic.fields import PydanticField" not in source
+
+        # Stub must compile.
+        compile(source, "<test>", "exec")
+
+
+class TestClassAttrRendering:
+    def test_dataclass_fields_appear_in_class_body(self):
+        """Public dataclass fields render as class-level annotations."""
+        from tests.stubs.fixtures.aliased_import import AliasedDataclass
+
+        source = _stub_for(AliasedDataclass)
+
+        # All three public fields must appear as class-level attrs.
+        assert "max_steps:" in source
+        assert "use_vision:" in source
+        assert "vision_detail:" in source
+
+        # The Annotated[...] metadata is preserved verbatim.
+        assert "Annotated[int, PydanticField" in source
+
+    def test_class_attrs_rendered_before_init(self):
+        """Class attrs appear in the body, separated from __init__."""
+        from tests.stubs.fixtures.aliased_import import AliasedDataclass
+
+        source = _stub_for(AliasedDataclass)
+        # Find the class body region.
+        class_idx = source.index("class AliasedDataclass")
+        init_idx = source.index("def __init__", class_idx)
+        body_before_init = source[class_idx:init_idx]
+        assert "max_steps:" in body_before_init
+        assert "use_vision:" in body_before_init
 
 
 class TestPartialClassFallback:

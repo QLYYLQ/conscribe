@@ -6,7 +6,8 @@ import functools
 import importlib
 import inspect
 import sys
-from typing import Annotated, Any, ForwardRef, get_args, get_origin
+from dataclasses import dataclass, field
+from typing import Annotated, Any, ForwardRef, Optional, get_args, get_origin
 
 from conscribe.stubs.collector import ClassStubInfo
 
@@ -38,6 +39,48 @@ _TYPING_NAMES: frozenset[str] = frozenset(
 )
 
 
+# ── Imports data structure ───────────────────────────────────────
+#
+# ``ExtraImports`` maps a source module name to its imported symbols.
+# Each symbol entry is ``orig_name → asname_or_None``: a ``None`` asname
+# emits ``from M import N``; a non-None asname emits ``from M import N as A``.
+# This shape preserves user-written import aliases like
+# ``from pydantic import Field as PydanticField`` instead of mangling them
+# into ``from pydantic.fields import PydanticField`` (which doesn't exist).
+ExtraImports = dict[str, dict[str, Optional[str]]]
+
+
+@dataclass(frozen=True)
+class _ImportRecord:
+    """How a name was imported in the source file."""
+
+    module: str
+    orig_name: str  # the actual name in the source module
+    asname: Optional[str]  # the local alias, or None if not aliased
+
+
+@dataclass
+class _ResolutionContext:
+    """Per-class context for resolving annotation strings to imports."""
+
+    ns: dict[str, Any] = field(default_factory=dict)
+    aliases: dict[str, _ImportRecord] = field(default_factory=dict)
+
+
+def _add_import(
+    extra_imports: ExtraImports,
+    module: str,
+    orig_name: str,
+    asname: Optional[str],
+) -> None:
+    """Record ``from <module> import <orig_name> [as <asname>]``."""
+    bucket = extra_imports.setdefault(module, {})
+    # Prefer the more-specific (aliased) form when both are recorded.
+    existing = bucket.get(orig_name, ...)
+    if existing is ... or existing is None:
+        bucket[orig_name] = asname
+
+
 def generate_module_stub(
     module_name: str,
     classes: list[ClassStubInfo],
@@ -62,11 +105,11 @@ def generate_module_stub(
         return ""
 
     typing_imports: set[str] = {"Any"}  # always needed for module __getattr__
-    extra_imports: dict[str, set[str]] = {}  # {module: {name, ...}}
+    extra_imports: ExtraImports = {}
 
     if partial_class_fallback:
         # Incomplete is only available in stub files via _typeshed.
-        extra_imports.setdefault("_typeshed", set()).add("Incomplete")
+        _add_import(extra_imports, "_typeshed", "Incomplete", None)
 
     # Collect all imports first ────────────────────────────────────
     for info in classes:
@@ -90,8 +133,7 @@ def generate_module_stub(
 
     # external imports
     for mod in sorted(extra_imports):
-        names = ", ".join(sorted(extra_imports[mod]))
-        parts.append(f"from {mod} import {names}")
+        parts.append(_render_import_line(mod, extra_imports[mod]))
 
     parts.append("")
 
@@ -104,6 +146,18 @@ def generate_module_stub(
         parts.append(_render_class(info, partial_class_fallback))
 
     return "\n".join(parts) + "\n"
+
+
+def _render_import_line(module: str, names: dict[str, Optional[str]]) -> str:
+    """Render a single ``from <module> import N1, N2 as A2, ...`` line."""
+    pieces: list[str] = []
+    for orig_name in sorted(names):
+        asname = names[orig_name]
+        if asname and asname != orig_name:
+            pieces.append(f"{orig_name} as {asname}")
+        else:
+            pieces.append(orig_name)
+    return f"from {module} import {', '.join(pieces)}"
 
 
 # ── Class rendering ──────────────────────────────────────────────
@@ -132,9 +186,16 @@ def _render_class(info: ClassStubInfo, partial_class_fallback: bool) -> str:
             comment = f"  # wired from: {attr.registry_name}"
         body_lines.append(f"    {attr.name}: {type_name}{comment}")
 
+    # Class-level annotated attributes (dataclass-style fields, etc.)
+    if info.class_attrs:
+        if body_lines:
+            body_lines.append("")
+        for ca in info.class_attrs:
+            body_lines.append(f"    {ca.name}: {ca.annotation}")
+
     has_members = info.init_signature or info.methods or partial_class_fallback
     if body_lines and has_members:
-        body_lines.append("")  # blank line after attrs
+        body_lines.append("")  # blank line before init/methods
 
     # __init__
     if info.init_signature is not None:
@@ -166,9 +227,11 @@ def _render_class(info: ClassStubInfo, partial_class_fallback: bool) -> str:
 def _collect_class_imports(
     info: ClassStubInfo,
     typing_imports: set[str],
-    extra_imports: dict[str, set[str]],
+    extra_imports: ExtraImports,
 ) -> None:
     """Populate import sets from a single ClassStubInfo."""
+    ctx = _build_resolution_context(info.cls)
+
     # Base classes
     for base in info.bases:
         if base is object:
@@ -181,14 +244,21 @@ def _collect_class_imports(
             continue  # builtin
         _add_type_import(attr.resolved_type, extra_imports)
 
+    # Class-level annotated attribute annotations
+    for ca in info.class_attrs:
+        _collect_from_annotation_string(
+            ca.annotation, ctx, typing_imports, extra_imports
+        )
+
     # Type annotations inside __init__ and method signatures
-    _collect_signature_imports(info.cls, typing_imports, extra_imports)
+    _collect_signature_imports(info.cls, ctx, typing_imports, extra_imports)
 
 
 def _collect_signature_imports(
     cls: type,
+    ctx: _ResolutionContext,
     typing_imports: set[str],
-    extra_imports: dict[str, set[str]],
+    extra_imports: ExtraImports,
 ) -> None:
     """Walk own methods (including __init__) and collect annotation imports.
 
@@ -196,10 +266,11 @@ def _collect_signature_imports(
     (from ``from __future__ import annotations`` or explicit forward
     references). For string annotations, names are resolved against a
     namespace that merges runtime ``cls.__module__`` globals with names
-    imported under ``if TYPE_CHECKING:`` blocks in the source file.
+    imported under ``if TYPE_CHECKING:`` blocks in the source file. The
+    alias map records the *exact* form each name was imported as, so the
+    stub can faithfully reproduce ``from pydantic import Field as
+    PydanticField``.
     """
-    ns = _build_resolution_namespace(cls)
-
     for obj in cls.__dict__.values():
         func: Any = None
         if isinstance(obj, classmethod):
@@ -223,19 +294,19 @@ def _collect_signature_imports(
 
         for param in sig.parameters.values():
             _collect_annotation(
-                param.annotation, ns, typing_imports, extra_imports
+                param.annotation, ctx, typing_imports, extra_imports
             )
 
         _collect_annotation(
-            sig.return_annotation, ns, typing_imports, extra_imports
+            sig.return_annotation, ctx, typing_imports, extra_imports
         )
 
 
 def _collect_annotation(
     ann: Any,
-    ns: dict[str, Any],
+    ctx: _ResolutionContext,
     typing_imports: set[str],
-    extra_imports: dict[str, set[str]],
+    extra_imports: ExtraImports,
 ) -> None:
     """Collect imports needed to render a single annotation."""
     if ann is inspect.Parameter.empty:
@@ -244,12 +315,12 @@ def _collect_annotation(
     # Forward references and PEP 563 string annotations.
     if isinstance(ann, str):
         _collect_from_annotation_string(
-            ann, ns, typing_imports, extra_imports
+            ann, ctx, typing_imports, extra_imports
         )
         return
     if isinstance(ann, ForwardRef):
         _collect_from_annotation_string(
-            ann.__forward_arg__, ns, typing_imports, extra_imports
+            ann.__forward_arg__, ctx, typing_imports, extra_imports
         )
         return
 
@@ -261,7 +332,12 @@ def _collect_annotation(
     )
 
     _collect_type_imports(ann, typing_imports)
-    _collect_non_builtin_types(ann, extra_imports)
+
+    # Codegen helpers expect ``dict[str, set[str]]``; adapt by collecting
+    # into a temp dict and merging with no asname (these come from the
+    # runtime type, not the user's source — no alias to preserve).
+    temp: dict[str, set[str]] = {}
+    _collect_non_builtin_types(ann, temp)
 
     # ``_collect_type_imports`` doesn't add ``Annotated`` itself to the
     # typing import set, and never walks metadata args. Stubs render the
@@ -271,22 +347,27 @@ def _collect_annotation(
         typing_imports.add("Annotated")
         for meta in get_args(ann)[1:]:
             meta_cls = meta if inspect.isclass(meta) else type(meta)
-            _check_type_module(meta_cls, extra_imports)
+            _check_type_module(meta_cls, temp)
+
+    for module, names in temp.items():
+        for name in names:
+            _add_import(extra_imports, module, name, None)
 
 
 def _collect_from_annotation_string(
     ann_str: str,
-    ns: dict[str, Any],
+    ctx: _ResolutionContext,
     typing_imports: set[str],
-    extra_imports: dict[str, set[str]],
+    extra_imports: ExtraImports,
 ) -> None:
     """Walk an annotation string with AST and collect imports for names.
 
     Builtin names are skipped, ``typing`` names go to ``typing_imports``,
-    and any other identifier is resolved via *ns* to derive the source
-    module for its import. Names that cannot be resolved are skipped
-    silently — the stub will still ``compile()`` and the IDE will simply
-    fall back to ``Any`` for the unresolved reference.
+    and any other identifier is resolved via the alias map (preferred) or
+    the runtime namespace to derive the source module. Names that cannot
+    be resolved are skipped silently — the stub will still ``compile()``
+    and the IDE will simply fall back to ``Any`` for the unresolved
+    reference.
     """
     if not ann_str or not ann_str.strip():
         return
@@ -297,33 +378,36 @@ def _collect_from_annotation_string(
 
     seen: set[str] = set()
     for node in ast.walk(tree):
-        # Plain identifier — resolves to a class/type.
         if isinstance(node, ast.Name):
             _resolve_name(
-                node.id, ns, typing_imports, extra_imports, seen
+                node.id, ctx, typing_imports, extra_imports, seen
             )
-        # Callable in metadata: e.g. ``Field(...)`` inside Annotated.
-        # The ``Name`` walk above already covers ``Field``; nothing extra
-        # is needed here, but we keep the branch for clarity / future use.
         elif isinstance(node, ast.Call):
             continue
-        # Attribute access like ``typing.Annotated`` — import the root.
         elif isinstance(node, ast.Attribute):
             root = _attribute_root(node)
             if root is not None:
                 _resolve_name(
-                    root, ns, typing_imports, extra_imports, seen
+                    root, ctx, typing_imports, extra_imports, seen
                 )
 
 
 def _resolve_name(
     name: str,
-    ns: dict[str, Any],
+    ctx: _ResolutionContext,
     typing_imports: set[str],
-    extra_imports: dict[str, set[str]],
+    extra_imports: ExtraImports,
     seen: set[str],
 ) -> None:
-    """Try to attribute *name* to typing or a third-party module."""
+    """Try to attribute *name* to typing or a third-party module.
+
+    Resolution order:
+    1. Builtin / typing — handled inline.
+    2. Source-file alias map — preserves the exact ``from M import N as A``
+       the user wrote.
+    3. Runtime namespace — fallback when the name isn't a top-level import
+       (e.g., transitively re-exported, defined in the same file, etc.).
+    """
     if name in seen:
         return
     seen.add(name)
@@ -334,7 +418,19 @@ def _resolve_name(
         typing_imports.add(name)
         return
 
-    obj = ns.get(name)
+    # Prefer the alias map: it captures both the user's chosen module
+    # and the original symbol name.
+    record = ctx.aliases.get(name)
+    if record is not None:
+        if record.module == "typing":
+            typing_imports.add(record.orig_name)
+        elif record.module not in ("builtins",):
+            _add_import(
+                extra_imports, record.module, record.orig_name, record.asname
+            )
+        return
+
+    obj = ctx.ns.get(name)
     if obj is None:
         return  # silently unresolved — IDE will degrade to Any
 
@@ -344,7 +440,7 @@ def _resolve_name(
         # Use the *referenced* name from the source so the stub matches
         # what the user wrote, even if the imported alias differs from
         # the underlying class's ``__name__``.
-        extra_imports.setdefault(module, set()).add(name)
+        _add_import(extra_imports, module, name, None)
 
 
 def _attribute_root(node: ast.Attribute) -> str | None:
@@ -357,66 +453,93 @@ def _attribute_root(node: ast.Attribute) -> str | None:
     return None
 
 
-# ── TYPE_CHECKING + module-globals namespace ─────────────────────
+# ── Source-file scanning: namespace + alias map ──────────────────
 
 
 @functools.lru_cache(maxsize=None)
-def _build_resolution_namespace(cls: type) -> dict[str, Any]:
-    """Return a name → object mapping for resolving string annotations.
+def _build_resolution_context(cls: type) -> _ResolutionContext:
+    """Return a name-resolution context for *cls*'s source file.
 
-    Combines runtime ``cls.__module__`` globals with names imported
-    under ``if TYPE_CHECKING:`` blocks in the source file. The latter
-    are not visible at runtime (since ``TYPE_CHECKING`` is ``False``),
-    but stubs need their referents to emit imports.
+    The context combines:
+    - Runtime ``cls.__module__`` globals (so locally defined names are
+      resolvable to their ``__module__`` / ``__name__``).
+    - Names imported under ``if TYPE_CHECKING:`` blocks (invisible at
+      runtime since ``TYPE_CHECKING`` is ``False``).
+    - An alias map of every top-level ``import``/``from``-import in the
+      source file, including aliased forms — used to faithfully emit
+      ``from pkg import Name as Alias`` in generated stubs.
 
-    Cached per ``__module__``; safe because the underlying source file
-    rarely changes during a single conscribe run.
+    Cached per-class; safe because the source file rarely changes
+    during a single conscribe run.
     """
-    ns: dict[str, Any] = {}
+    ctx = _ResolutionContext()
 
     module = sys.modules.get(cls.__module__)
     if module is not None:
-        ns.update(module.__dict__)
+        ctx.ns.update(module.__dict__)
 
-    type_checking_names = _scan_type_checking_imports(cls)
+    type_checking_names, alias_map = _scan_source_imports(cls)
     for name, value in type_checking_names.items():
-        ns.setdefault(name, value)
+        ctx.ns.setdefault(name, value)
+    ctx.aliases = alias_map
+    return ctx
 
-    return ns
+
+# Backwards-compatible shim for callers that may still import the
+# previous helper name.
+def _build_resolution_namespace(cls: type) -> dict[str, Any]:
+    return _build_resolution_context(cls).ns
 
 
-def _scan_type_checking_imports(cls: type) -> dict[str, Any]:
-    """Parse the source file of *cls* and import names from ``TYPE_CHECKING`` blocks."""
+def _scan_source_imports(
+    cls: type,
+) -> tuple[dict[str, Any], dict[str, _ImportRecord]]:
+    """Parse *cls*'s source file for imports.
+
+    Returns ``(type_checking_names, alias_map)`` where:
+    - ``type_checking_names``: name → resolved object, drawn from
+      ``if TYPE_CHECKING:`` blocks (these are imported now so we can
+      resolve their ``__module__`` for runtime-style lookups).
+    - ``alias_map``: name → ImportRecord, covering *all* top-level
+      imports in the file (TYPE_CHECKING and non-TYPE_CHECKING). Used
+      to emit imports in the exact form the user wrote them.
+    """
     try:
         source_path = inspect.getsourcefile(cls)
     except TypeError:
-        return {}
+        return {}, {}
     if source_path is None:
-        return {}
+        return {}, {}
 
     try:
         with open(source_path, "r", encoding="utf-8") as fh:
             source = fh.read()
     except (OSError, UnicodeDecodeError):
-        return {}
+        return {}, {}
 
     try:
         tree = ast.parse(source)
     except SyntaxError:
-        return {}
+        return {}, {}
 
-    result: dict[str, Any] = {}
+    type_checking_names: dict[str, Any] = {}
+    alias_map: dict[str, _ImportRecord] = {}
+
     for node in tree.body:
-        if not isinstance(node, ast.If):
-            continue
-        if not _is_type_checking_test(node.test):
-            continue
-        for child in node.body:
-            if isinstance(child, ast.ImportFrom):
-                _import_from(child, result)
-            elif isinstance(child, ast.Import):
-                _import_plain(child, result)
-    return result
+        if isinstance(node, ast.ImportFrom):
+            _record_from(node, alias_map)
+        elif isinstance(node, ast.Import):
+            _record_plain(node, alias_map)
+        elif isinstance(node, ast.If) and _is_type_checking_test(node.test):
+            for child in node.body:
+                if isinstance(child, ast.ImportFrom):
+                    _record_from(child, alias_map)
+                    _import_from(child, type_checking_names)
+                elif isinstance(child, ast.Import):
+                    _record_plain(child, alias_map)
+                    _import_plain(child, type_checking_names)
+
+    return type_checking_names, alias_map
 
 
 def _is_type_checking_test(test: ast.expr) -> bool:
@@ -433,11 +556,53 @@ def _is_type_checking_test(test: ast.expr) -> bool:
     return False
 
 
-def _import_from(node: ast.ImportFrom, result: dict[str, Any]) -> None:
-    """Run ``from M import N as A`` and stash resolved objects in *result*."""
+def _record_from(node: ast.ImportFrom, alias_map: dict[str, _ImportRecord]) -> None:
+    """Record ``from M import N [as A]`` entries into the alias map."""
     if node.module is None or node.level:
         # Skip relative imports — resolving them requires the importing
         # module's package, which gets fragile across edge cases.
+        return
+    for alias in node.names:
+        if alias.name == "*":
+            continue
+        local = alias.asname or alias.name
+        alias_map.setdefault(
+            local,
+            _ImportRecord(
+                module=node.module,
+                orig_name=alias.name,
+                asname=alias.asname,
+            ),
+        )
+
+
+def _record_plain(node: ast.Import, alias_map: dict[str, _ImportRecord]) -> None:
+    """Record ``import M [as A]`` entries.
+
+    For the alias map, we treat ``import M`` as binding the top-level
+    package and ``import M as A`` as binding ``A`` to the same. The
+    ``orig_name`` for plain imports is the module's last segment
+    rendered as a top-level name when no asname is given — but since
+    annotations more commonly use these via attribute access (``M.X``),
+    the AST collector sees the root binding (``M`` or ``A``), which we
+    keep here for completeness even though a stub typically wouldn't
+    re-emit a bare ``import M``.
+    """
+    for alias in node.names:
+        local = alias.asname or alias.name.split(".", 1)[0]
+        alias_map.setdefault(
+            local,
+            _ImportRecord(
+                module=alias.name,
+                orig_name=alias.name,
+                asname=alias.asname,
+            ),
+        )
+
+
+def _import_from(node: ast.ImportFrom, result: dict[str, Any]) -> None:
+    """Run ``from M import N as A`` and stash resolved objects in *result*."""
+    if node.module is None or node.level:
         return
     try:
         module = importlib.import_module(node.module)
@@ -460,7 +625,6 @@ def _import_plain(node: ast.Import, result: dict[str, Any]) -> None:
             module = importlib.import_module(alias.name)
         except Exception:
             continue
-        # ``import a.b.c`` with no asname binds ``a`` (the top-level pkg).
         if alias.asname:
             result[alias.asname] = module
         else:
@@ -481,8 +645,8 @@ def _type_display_name(tp: type) -> str:
     return name if name else repr(tp)
 
 
-def _add_type_import(tp: type, extra_imports: dict[str, set[str]]) -> None:
+def _add_type_import(tp: type, extra_imports: ExtraImports) -> None:
     mod = getattr(tp, "__module__", None)
     name = getattr(tp, "__name__", None)
     if mod and name and mod not in ("builtins", "typing"):
-        extra_imports.setdefault(mod, set()).add(name)
+        _add_import(extra_imports, mod, name, None)

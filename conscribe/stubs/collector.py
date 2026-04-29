@@ -25,6 +25,19 @@ class MethodStub:
 
 
 @dataclass(frozen=True)
+class ClassAttrStub:
+    """Class-level annotated attribute for .pyi rendering.
+
+    Captures dataclass-style fields and other class-body annotations so
+    IDEs can resolve ``obj.attr`` against the stub even when the
+    attribute is also an ``__init__`` parameter.
+    """
+
+    name: str
+    annotation: str  # rendered annotation text (string under PEP 563)
+
+
+@dataclass(frozen=True)
 class ClassStubInfo:
     """Everything needed to render a class in a .pyi stub."""
 
@@ -36,6 +49,7 @@ class ClassStubInfo:
     init_signature: str | None  # None if no own __init__
     injected_attrs: tuple[InjectedAttr, ...]
     methods: tuple[MethodStub, ...]
+    class_attrs: tuple[ClassAttrStub, ...] = ()
 
 
 # ── Type narrowing ──────────────────────────────────────────────
@@ -124,6 +138,9 @@ def collect_class_stub_info(cls: type) -> ClassStubInfo | None:
     except (TypeError, OSError):
         return None
 
+    injected_names = {attr.name for attr in injected_attrs}
+    class_attrs = _collect_class_attrs(cls, skip_names=injected_names)
+
     return ClassStubInfo(
         cls=cls,
         class_name=cls.__name__,
@@ -133,6 +150,7 @@ def collect_class_stub_info(cls: type) -> ClassStubInfo | None:
         init_signature=init_signature,
         injected_attrs=tuple(injected_attrs),
         methods=_collect_own_methods(cls),
+        class_attrs=class_attrs,
     )
 
 
@@ -234,3 +252,41 @@ def _collect_own_methods(cls: type) -> tuple[MethodStub, ...]:
         )
 
     return tuple(methods)
+
+
+def _collect_class_attrs(
+    cls: type, *, skip_names: set[str]
+) -> tuple[ClassAttrStub, ...]:
+    """Collect own class-level annotated attributes for stub rendering.
+
+    Reads ``cls.__dict__["__annotations__"]`` (own annotations only, not
+    inherited) and produces a ``ClassAttrStub`` per non-dunder, non-injected
+    name. Skips names already represented as injected wired fields (those
+    are rendered separately with a ``# wired from:`` comment).
+
+    Annotations are kept as strings under ``from __future__ import
+    annotations``; resolved type objects are rendered via ``__name__`` or
+    ``repr`` as a best-effort fallback.
+    """
+    annotations = cls.__dict__.get("__annotations__")
+    if not annotations:
+        return ()
+
+    out: list[ClassAttrStub] = []
+    for name, ann in annotations.items():
+        if name.startswith("__") and name.endswith("__"):
+            continue
+        if name in skip_names:
+            continue
+        out.append(ClassAttrStub(name=name, annotation=_render_annotation(ann)))
+    return tuple(out)
+
+
+def _render_annotation(ann: Any) -> str:
+    """Render an annotation as a stub-safe string."""
+    if isinstance(ann, str):
+        return ann
+    name = getattr(ann, "__name__", None)
+    if isinstance(name, str):
+        return name
+    return repr(ann)
