@@ -112,6 +112,7 @@ conscribe generate-stubs \
 | `--registrar` | Yes | Dotted path to registrar (`module:attribute`) |
 | `--discover` | No | Package paths to import before generation |
 | `--output-dir` | No | Output directory. If omitted, writes `.pyi` alongside source `.py` files. |
+| `--partial-class-fallback` | No | Emit class-level `__getattr__` returning `Incomplete` so IDEs tolerate dynamic instance attributes. Off by default for strict type checking. |
 
 **How it works:**
 
@@ -123,6 +124,14 @@ conscribe generate-stubs \
    - Mode 2 (single key): exact class (e.g., `BashTerminal`)
    - Mode 3 (literal list): `str`
 4. Generates `.pyi` with injected attributes, own `__init__` signature, and own methods.
+5. **Resolves names inside string annotations** (PEP 563 / `from __future__ import annotations`):
+   - Walks each annotation with `ast.parse(..., mode="eval")` and emits imports for every referenced identifier.
+   - Names from `typing` (e.g., `Annotated`, `Literal`, `Optional`) go to `from typing import …`.
+   - Third-party callables like `pydantic.Field` (used inside `Annotated[int, Field(...)]`) get imported from their source module so PyCharm/Pylance can resolve them.
+   - Names imported under `if TYPE_CHECKING:` blocks are picked up by AST-scanning the source file (otherwise they are invisible at runtime).
+   - Unresolvable names are skipped silently — the stub still compiles; the IDE simply degrades that reference to `Any`.
+
+**Why this matters:** PEP 561 mandates that PyCharm and Pylance treat `.pyi` as authoritative and ignore the sibling `.py` for type analysis. If signatures reference names that aren't imported in the stub header, the IDE cannot resolve them and falls back to `Any`, losing type information.
 
 **Example output** (`my_app/agents/react.pyi`):
 

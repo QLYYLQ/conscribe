@@ -348,7 +348,7 @@ class DegradedField:
 
 ## Stubs API
 
-### `write_layer_stubs(registrar, output_dir=None) -> list[Path]`
+### `write_layer_stubs(registrar, output_dir=None, *, partial_class_fallback=False) -> list[Path]`
 
 Generate and write `.pyi` stubs for all classes in a layer that have injected wired attributes (wired fields not in `__init__`).
 
@@ -360,6 +360,9 @@ written = write_layer_stubs(AgentRegistrar)
 
 # Or write to a dedicated directory:
 written = write_layer_stubs(AgentRegistrar, output_dir="generated/stubs")
+
+# Loosen IDE type checking for classes with dynamic instance attributes:
+written = write_layer_stubs(AgentRegistrar, partial_class_fallback=True)
 ```
 
 **Parameters:**
@@ -368,6 +371,7 @@ written = write_layer_stubs(AgentRegistrar, output_dir="generated/stubs")
 |------|------|---------|-------------|
 | `registrar` | `type` | required | A `LayerRegistrar` subclass |
 | `output_dir` | `str \| Path \| None` | `None` | Output directory. If `None`, writes `.pyi` alongside source `.py` files. |
+| `partial_class_fallback` | `bool` | `False` | When `True`, each generated class includes `def __getattr__(self, name: str) -> Incomplete: ...` so IDEs tolerate undeclared instance attributes. Off by default for strict type checking. |
 
 **Returns:** List of paths to written `.pyi` files.
 
@@ -388,9 +392,13 @@ if info:
 
 ---
 
-### `generate_module_stub(module_name, classes) -> str`
+### `generate_module_stub(module_name, classes, *, partial_class_fallback=False) -> str`
 
 Generate `.pyi` source for a list of `ClassStubInfo` objects from the same module.
+
+Resolves names referenced in string annotations (PEP 563 / `from __future__ import annotations`) by AST-walking each annotation against a namespace built from `cls.__module__` runtime globals merged with names imported under `if TYPE_CHECKING:` blocks. `Annotated` metadata callables (e.g., `pydantic.Field`) get imported from their source module so the literal `Annotated[int, Field(...)]` text in the stub resolves correctly in PyCharm/Pylance. Unresolvable names are skipped silently — the stub still compiles.
+
+`partial_class_fallback=True` adds a class-level `def __getattr__(self, name: str) -> Incomplete: ...` to each generated class, plus `from _typeshed import Incomplete` to the imports.
 
 ---
 

@@ -12,6 +12,8 @@ from conscribe.stubs.generator import generate_module_stub
 def write_layer_stubs(
     registrar: type,
     output_dir: Union[str, Path, None] = None,
+    *,
+    partial_class_fallback: bool = False,
 ) -> list[Path]:
     """Generate and write ``.pyi`` stubs for all wired classes in a layer.
 
@@ -19,6 +21,10 @@ def write_layer_stubs(
         registrar: A ``LayerRegistrar`` subclass (from ``create_registrar``).
         output_dir: If given, mirror module paths under this directory.
             Otherwise write each ``.pyi`` alongside its source ``.py``.
+        partial_class_fallback: When ``True``, each generated class
+            includes a ``__getattr__`` returning ``Incomplete`` so IDEs
+            tolerate dynamic instance attributes. Defaults to ``False``
+            for strict type checking.
 
     Returns:
         List of paths to the written ``.pyi`` files.
@@ -45,7 +51,11 @@ def write_layer_stubs(
     written: list[Path] = []
 
     for module_name, classes in sorted(by_module.items()):
-        source = generate_module_stub(module_name, classes)
+        source = generate_module_stub(
+            module_name,
+            classes,
+            partial_class_fallback=partial_class_fallback,
+        )
         if not source:
             continue
 

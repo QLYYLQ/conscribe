@@ -211,3 +211,149 @@ class TestGenerateModuleStub:
         source = generate_module_stub("mymod", [info1, info2])
         assert "class Foo:" in source
         assert "class Bar:" in source
+
+
+# ── Annotation resolution (string + Annotated metadata) ──────────
+
+
+def _stub_for(cls: type) -> str:
+    """Wrap *cls* in a ClassStubInfo and render through generate_module_stub."""
+    info = ClassStubInfo(
+        cls=cls,
+        class_name=cls.__name__,
+        module=cls.__module__,
+        source_file=cls.__module__,
+        bases=tuple(b for b in cls.__bases__ if b is not object),
+        init_signature=_init_sig_str(cls),
+        injected_attrs=(
+            InjectedAttr(name="_dummy", resolved_type=str, registry_name=None),
+        ),
+        methods=_methods_for(cls),
+    )
+    return generate_module_stub(info.module, [info])
+
+
+def _init_sig_str(cls: type):
+    import inspect as _inspect
+
+    if "__init__" not in cls.__dict__:
+        return None
+    sig = _inspect.signature(cls.__init__)
+    text = str(sig)
+    if sig.return_annotation is _inspect.Parameter.empty:
+        text += " -> None"
+    return text
+
+
+def _methods_for(cls: type) -> tuple[MethodStub, ...]:
+    import inspect as _inspect
+
+    out: list[MethodStub] = []
+    for name, obj in cls.__dict__.items():
+        if name in {"__init__", "__module__", "__qualname__", "__doc__", "__dict__", "__weakref__"}:
+            continue
+        if not callable(obj):
+            continue
+        try:
+            sig = _inspect.signature(obj)
+        except (TypeError, ValueError):
+            continue
+        out.append(MethodStub(name=name, signature=str(sig), decorators=()))
+    return tuple(out)
+
+
+class TestStringAnnotations:
+    def test_annotated_metadata_imports_resolved(self):
+        from tests.stubs.fixtures.string_annotated import StringAnnotated
+
+        source = _stub_for(StringAnnotated)
+
+        # Annotated and Literal must be imported from typing
+        assert "from typing import" in source
+        assert "Annotated" in source
+        assert "Literal" in source
+
+        # `Field` is the pydantic callable the user wrote — must be
+        # imported from its source module so PyCharm/Pylance can resolve.
+        assert "Field" in source
+        assert "from pydantic" in source  # accepts pydantic or pydantic.fields
+
+        # The literal Annotated[...] text must remain in __init__.
+        assert "Annotated[int, Field" in source
+
+        # Stub must compile.
+        compile(source, "<test>", "exec")
+
+    def test_type_checking_imports_resolved(self):
+        from tests.stubs.fixtures.type_checking_imports import UsesTypeChecking
+
+        source = _stub_for(UsesTypeChecking)
+
+        # OrderedDict comes from a TYPE_CHECKING block; AST scan must
+        # surface it into the import set.
+        assert "from collections import" in source
+        assert "OrderedDict" in source
+
+        # Stub must compile.
+        compile(source, "<test>", "exec")
+
+    def test_unresolvable_name_does_not_crash(self):
+        from tests.stubs.fixtures.unresolved_name import HasUnresolved
+
+        # Should not raise.
+        source = _stub_for(HasUnresolved)
+
+        # Stub must still compile (the unresolved name is in a string
+        # annotation, which Python parses lazily under
+        # ``from __future__ import annotations``).
+        compile(source, "<test>", "exec")
+
+        # And no spurious import was emitted for the unknown name.
+        assert "import NeverDefined" not in source
+
+
+class TestPartialClassFallback:
+    def test_fallback_off_by_default(self):
+        info = ClassStubInfo(
+            cls=type("Foo", (), {}),
+            class_name="Foo",
+            module="mymod",
+            source_file="/tmp/mymod.py",
+            bases=(object,),
+            init_signature=None,
+            injected_attrs=(
+                InjectedAttr(name="x", resolved_type=str, registry_name=None),
+            ),
+            methods=(),
+        )
+        source = generate_module_stub("mymod", [info])
+
+        assert "Incomplete" not in source
+        # Module-level __getattr__ stays; no class-level one.
+        assert source.count("__getattr__") == 1
+        assert "(self, name: str) -> Incomplete" not in source
+
+    def test_fallback_on_emits_class_getattr(self):
+        info = ClassStubInfo(
+            cls=type("Foo", (), {}),
+            class_name="Foo",
+            module="mymod",
+            source_file="/tmp/mymod.py",
+            bases=(object,),
+            init_signature=None,
+            injected_attrs=(
+                InjectedAttr(name="x", resolved_type=str, registry_name=None),
+            ),
+            methods=(),
+        )
+        source = generate_module_stub(
+            "mymod", [info], partial_class_fallback=True,
+        )
+
+        assert "from _typeshed import Incomplete" in source
+        assert "def __getattr__(self, name: str) -> Incomplete: ..." in source
+        # Module-level + one class-level => two __getattr__ lines.
+        assert source.count("__getattr__") == 2
+
+        # Stub must compile.
+        compile(source, "<test>", "exec")

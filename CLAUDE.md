@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Conscribe** (`conscribe` package, v1.0.0) — A Python library for automatic class registration and config typing stub generation for layered Python architectures. It targets framework developers building config-driven frameworks with pluggable layers (agents, LLM providers, etc.).
+**Conscribe** (`conscribe` package, v1.1.0) — A Python library for automatic class registration and config typing stub generation for layered Python architectures. It targets framework developers building config-driven frameworks with pluggable layers (agents, LLM providers, etc.).
 
 Six core capabilities:
 1. **Auto-registration**: Classes inheriting a base are automatically registered in their layer's registry (via metaclass). Also supports bridging external classes and explicit `@register` decorators.
@@ -32,7 +32,7 @@ pip install -e ".[dev,docstring]"
 # CLI
 conscribe generate-config --layer <name> --output <path>
 conscribe generate-composed-config --layers <name1> <name2> [--format json-schema|python] [--no-inline-wiring] --output <path>
-conscribe generate-stubs --layer <name> --output-dir <path>
+conscribe generate-stubs --layer <name> --output-dir <path> [--partial-class-fallback]
 conscribe inspect --layer <name>
 conscribe scan [--path <dir>]
 conscribe list [--discover <pkg> ...] [--layer <name>] [--path <dir>]
@@ -76,7 +76,7 @@ pytest is pre-configured in `pyproject.toml` with `--cov=conscribe --cov-report=
 
 **Stubs** (`conscribe/stubs/`):
 - `collector.py` — `collect_class_stub_info(cls)` reflects `__init__` signatures and wiring to produce `ClassStubInfo`. Only returns info for classes with *injected* wired fields (not in `__init__`). `narrowest_common_base(classes, fallback)` computes the most specific common ancestor via MRO intersection for type narrowing.
-- `generator.py` — `generate_module_stub(module_name, classes)` renders `.pyi` source. Uses `def __getattr__(name: str) -> Any: ...` partial-stub pattern. Instance attributes typed as registry protocol (Mode 1), narrowed common base (Mode 2), or `str` (Mode 3).
+- `generator.py` — `generate_module_stub(module_name, classes, *, partial_class_fallback=False)` renders `.pyi` source. Uses `def __getattr__(name: str) -> Any: ...` module-level partial-stub pattern. Instance attributes typed as registry protocol (Mode 1), narrowed common base (Mode 2), or `str` (Mode 3). Resolves string annotations (PEP 563 / `ForwardRef`) via AST walk against a namespace built from `cls.__module__` runtime globals merged with names imported under `if TYPE_CHECKING:` blocks. Annotated metadata callables (e.g., `Field`) get imported from their source module so the literal `Annotated[int, Field(...)]` text in the stub resolves in IDEs. `partial_class_fallback=True` adds class-level `def __getattr__(self, name: str) -> Incomplete: ...` to tolerate dynamic instance attributes (off by default for strict type checking).
 - `writer.py` — `write_layer_stubs(registrar, output_dir)` groups classes by source module, generates and writes `.pyi` files. Default: alongside source `.py` files.
 
 **Discovery** (`conscribe/discover.py`): Recursively imports modules to trigger metaclass registration. Optionally auto-regenerates stubs if fingerprint is stale.

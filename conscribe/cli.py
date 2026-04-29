@@ -64,6 +64,15 @@ def main(argv: Union[list[str], None] = None) -> int:
         default=None,
         help="Output directory. If omitted, writes .pyi alongside source files.",
     )
+    stub_parser.add_argument(
+        "--partial-class-fallback",
+        action="store_true",
+        default=False,
+        help=(
+            "Emit class-level __getattr__ returning Incomplete to tolerate "
+            "dynamic instance attributes (loosens strict type checking)."
+        ),
+    )
 
     # generate-composed-config
     composed_parser = subparsers.add_parser(
@@ -156,7 +165,9 @@ def main(argv: Union[list[str], None] = None) -> int:
             args.layers, args.inline_wiring, args.format, args.output,
         )
     elif args.command == "generate-stubs":
-        return _cmd_generate_stubs(args.layer, args.output_dir)
+        return _cmd_generate_stubs(
+            args.layer, args.output_dir, args.partial_class_fallback,
+        )
     elif args.command == "inspect":
         return _cmd_inspect(args.layer)
     elif args.command == "scan":
@@ -231,7 +242,11 @@ def _cmd_generate_composed_config(
     return 0
 
 
-def _cmd_generate_stubs(layer_name: str, output_dir: Union[str, None]) -> int:
+def _cmd_generate_stubs(
+    layer_name: str,
+    output_dir: Union[str, None],
+    partial_class_fallback: bool,
+) -> int:
     """Handle the generate-stubs subcommand."""
     from conscribe.stubs.writer import write_layer_stubs
 
@@ -241,7 +256,11 @@ def _cmd_generate_stubs(layer_name: str, output_dir: Union[str, None]) -> int:
         print(f"Error: {e}", file=sys.stderr)
         return 1
 
-    written = write_layer_stubs(registrar, output_dir)
+    written = write_layer_stubs(
+        registrar,
+        output_dir,
+        partial_class_fallback=partial_class_fallback,
+    )
 
     if not written:
         print("No classes with injected wired attributes found.", file=sys.stderr)

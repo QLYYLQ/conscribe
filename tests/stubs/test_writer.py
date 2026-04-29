@@ -87,3 +87,25 @@ class TestWriteLayerStubs:
         assert len(written) == 1
         # Path should be under tmp_path, ending with .pyi
         assert str(written[0]).startswith(str(tmp_path))
+
+    def test_partial_class_fallback_passed_through(self, env_registrar, tmp_path):
+        """``partial_class_fallback=True`` reaches the generator."""
+
+        class Base(metaclass=env_registrar.Meta):
+            __abstract__ = True
+            def setup(self) -> None: ...
+
+        class WiredImpl3(Base):
+            __wiring__ = {"dep": ["val"]}
+
+            def setup(self) -> None: ...
+
+        written = write_layer_stubs(
+            env_registrar,
+            output_dir=tmp_path,
+            partial_class_fallback=True,
+        )
+        assert len(written) == 1
+        content = written[0].read_text()
+        assert "from _typeshed import Incomplete" in content
+        assert "def __getattr__(self, name: str) -> Incomplete: ..." in content
