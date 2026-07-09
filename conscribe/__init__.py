@@ -45,7 +45,7 @@ from conscribe.config import (
     save_fingerprint,
 )
 
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 
 __all__ = [
     # Registration API

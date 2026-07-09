@@ -503,6 +503,116 @@ class TestComposedCodegen:
 
 
 # ---------------------------------------------------------------------------
+# TestComposedNestedSource — nested/compound discriminator layers
+# ---------------------------------------------------------------------------
+
+
+class TestComposedNestedSource:
+    """Composed Python source for a nested-discriminator layer must exec and
+    build the compound union, including same-named provider submodels that
+    differ in fields (regression for the four defects: undefined submodels,
+    name collision, rebuild ordering, flat-discriminator on a nested layer).
+    """
+
+    @staticmethod
+    def _nested_registrar():
+        reg = create_registrar(
+            "comp_nllm", LLMProtocol,
+            discriminator_fields=["model_type", "provider"],
+            key_separator=".",
+        )
+
+        class _AnthropicBase(metaclass=reg.Meta):
+            __registry_key__ = "anthropic"
+            __abstract__ = True
+
+            async def chat(self, messages: list[dict]) -> str:
+                return ""
+
+            def __init__(self, model: str = "claude-3"):
+                self.model = model
+
+        class AnthropicDirect(_AnthropicBase):
+            __registry_key__ = "anthropic.direct"
+
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+
+        class AnthropicAws(_AnthropicBase):
+            __registry_key__ = "anthropic.aws"
+
+            def __init__(self, aws_region: str = "us-east-1", **kwargs):
+                super().__init__(**kwargs)
+                self.aws_region = aws_region
+
+        class _OpenAIBase(metaclass=reg.Meta):
+            __registry_key__ = "openai"
+            __abstract__ = True
+
+            async def chat(self, messages: list[dict]) -> str:
+                return ""
+
+            def __init__(self, model: str = "gpt-4"):
+                self.model = model
+
+        # Same provider segment "direct" as anthropic, but DIFFERENT fields —
+        # both synthesize a class named ``DirectProviderConfig``.
+        class OpenAIDirect(_OpenAIBase):
+            __registry_key__ = "openai.direct"
+
+            def __init__(self, organization: str = "", project: str = "", **kwargs):
+                super().__init__(**kwargs)
+                self.organization = organization
+                self.project = project
+
+        return reg
+
+    def test_nested_composed_source_execs(self):
+        reg = self._nested_registrar()
+        result = build_composed_config({"comp_nllm": reg}, inline_wiring=True)
+        source = generate_composed_config_source(result)
+
+        # Bug A (undefined nested submodels) + Bug C (rebuild ordering under
+        # ``from __future__ import annotations``): exec must not raise.
+        ns: dict = {}
+        exec(compile(source, "<composed-nested>", "exec"), ns)  # noqa: S102
+
+        assert "ComposedConfig" in ns
+        # Bug D: a flat ``Field(discriminator="model_type")`` alias would reject
+        # the repeated ``openai``/``anthropic`` discriminator values; the
+        # compound ``Discriminator`` callable must build cleanly.
+        TypeAdapter(ns["ComposedConfig"])
+
+    def test_colliding_provider_submodels_are_distinct(self):
+        reg = self._nested_registrar()
+        result = build_composed_config({"comp_nllm": reg}, inline_wiring=True)
+        source = generate_composed_config_source(result)
+
+        ns: dict = {}
+        exec(compile(source, "<composed-nested>", "exec"), ns)  # noqa: S102
+
+        # Bug B: the two same-named ``direct`` provider classes must both be
+        # emitted, disambiguated, with their own (different) field sets.
+        assert "DirectProviderConfig" in ns
+        assert "DirectProviderConfig2" in ns
+        fields_a = set(ns["DirectProviderConfig"].model_fields)
+        fields_b = set(ns["DirectProviderConfig2"].model_fields)
+        assert fields_a != fields_b
+        # exactly one variant carries the openai-only fields
+        assert ("organization" in fields_a) != ("organization" in fields_b)
+
+    def test_source_has_compound_discriminator(self):
+        reg = self._nested_registrar()
+        result = build_composed_config({"comp_nllm": reg}, inline_wiring=True)
+        source = generate_composed_config_source(result)
+        # Nested layer emits a compound discriminator function + Tag union,
+        # not a flat Field(discriminator=...).
+        assert "def _discriminate_comp_nllm(" in source
+        assert "Discriminator(_discriminate_comp_nllm)" in source
+        assert 'Tag("anthropic.direct")' in source
+
+
+# ---------------------------------------------------------------------------
 # TestValidation
 # ---------------------------------------------------------------------------
 

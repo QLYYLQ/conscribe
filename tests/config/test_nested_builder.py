@@ -341,8 +341,8 @@ class TestNestedCodegen:
         result = R.build_config()
         source = generate_layer_config_source(result)
 
-        # Should have nested segment model section
-        assert "Nested segment models" in source
+        # Should have nested submodel section
+        assert "Nested submodels" in source
         # Should have combined model section
         assert "Combined models" in source
 

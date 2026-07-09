@@ -94,54 +94,65 @@ def _generate_flat_source(result: LayerConfigResult) -> str:
 
 def _generate_nested_source(result: LayerConfigResult) -> str:
     """Generate nested mode source code with compound discriminator."""
-    parts: list[str] = []
     degraded = result.degraded_fields
     disc_fields = result.discriminator_fields
-    separator = result.key_separator
 
-    # 1. Header
-    parts.append(_generate_nested_header(result, degraded_fields=degraded))
+    # Collect nested segment submodels from the combined models' own field
+    # annotations (not per_segment_models, which is keyed by segment value and
+    # collapses distinct same-named classes), de-duplicate, and disambiguate.
+    per_key = list(result.per_key_models.values())
+    exclude_ids = {id(m) for m in per_key}
+    submodels = _collect_referenced_submodels(per_key, exclude_ids)
 
-    # 2. Future annotations
-    parts.append("from __future__ import annotations\n")
+    restore: dict[type, tuple[str, str]] = {}
+    try:
+        emit_list = _disambiguate_submodel_names(submodels, restore)
+        parts: list[str] = []
 
-    # 3. Imports (nested mode needs Discriminator and Tag)
-    parts.append(_generate_nested_imports(result, has_degraded=bool(degraded)))
+        # 1. Header
+        parts.append(_generate_nested_header(result, degraded_fields=degraded))
 
-    # 4. Nested segment models (level 1+)
-    all_model_names: list[str] = []
-    if result.per_segment_models:
-        parts.append("# ── Nested segment models (level 1+) ──")
-        for field_name in disc_fields[1:]:
-            segment_models = result.per_segment_models.get(field_name, {})
-            for seg in sorted(segment_models.keys()):
-                model = segment_models[seg]
-                parts.append(_generate_class(model, "name"))
-                all_model_names.append(model.__name__)
+        # 2. Future annotations
+        parts.append("from __future__ import annotations\n")
 
-    # 5. Combined models (level 0 flat + level 1 nested)
-    parts.append("# ── Combined models (level 0 flat + level 1 nested) ──")
-    for key in sorted(result.per_key_models.keys()):
-        model = result.per_key_models[key]
-        key_degraded = degraded.get(key, [])
-        parts.append(_generate_class(model, disc_fields[0], degraded_list=key_degraded))
-        all_model_names.append(model.__name__)
+        # 3. Imports (nested mode needs Discriminator and Tag)
+        parts.append(
+            _generate_nested_imports(
+                result, has_degraded=bool(degraded), submodels=emit_list,
+            )
+        )
 
-    # 6. model_rebuild() calls
-    rebuild_lines = [f"\n# Rebuild models for deferred annotation resolution"]
-    for name in all_model_names:
-        rebuild_lines.append(f"{name}.model_rebuild()")
-    rebuild_lines.append("")
-    parts.append("\n".join(rebuild_lines))
+        # 4. Nested segment submodels (deepest first), each with model_rebuild()
+        submodel_block = _generate_submodels_block(emit_list)
+        if submodel_block:
+            parts.append(submodel_block)
 
-    # 7. Discriminator function
-    parts.append(_generate_discriminator_fn(result))
+        # 5. Combined models (level 0 flat + level 1 nested)
+        parts.append("# ── Combined models (level 0 flat + level 1 nested) ──")
+        all_model_names: list[str] = []
+        for key in sorted(result.per_key_models.keys()):
+            model = result.per_key_models[key]
+            key_degraded = degraded.get(key, [])
+            parts.append(_generate_class(model, disc_fields[0], degraded_list=key_degraded))
+            all_model_names.append(model.__name__)
 
-    # 8. Union
-    if len(result.per_key_models) > 1:
-        parts.append(_generate_nested_union_alias(result))
+        # 6. model_rebuild() calls (combined models)
+        rebuild_lines = ["\n# Rebuild models for deferred annotation resolution"]
+        for name in all_model_names:
+            rebuild_lines.append(f"{name}.model_rebuild()")
+        rebuild_lines.append("")
+        parts.append("\n".join(rebuild_lines))
 
-    return "\n".join(parts)
+        # 7. Discriminator function
+        parts.append(_generate_discriminator_fn(result))
+
+        # 8. Union
+        if len(result.per_key_models) > 1:
+            parts.append(_generate_nested_union_alias(result))
+
+        return "\n".join(parts)
+    finally:
+        _restore_submodel_names(restore)
 
 
 def _generate_nested_header(
@@ -180,8 +191,14 @@ def _generate_nested_header(
 def _generate_nested_imports(
     result: LayerConfigResult,
     has_degraded: bool = False,
+    submodels: list[type[BaseModel]] | None = None,
 ) -> str:
-    """Generate imports for nested mode."""
+    """Generate imports for nested mode.
+
+    Scans both the combined per-key models and the emitted nested submodels
+    (``submodels``) so extra-type/enum imports referenced only inside a nested
+    submodel are not missed.
+    """
     typing_imports = {"Annotated", "Literal", "Union"}
     pydantic_imports = {"BaseModel", "ConfigDict", "Discriminator", "Tag"}
 
@@ -192,9 +209,8 @@ def _generate_nested_imports(
     has_field = False
     extra_imports: dict[str, set[str]] = {}
     all_models = list(result.per_key_models.values())
-    if result.per_segment_models:
-        for seg_models in result.per_segment_models.values():
-            all_models.extend(seg_models.values())
+    if submodels:
+        all_models.extend(submodels)
 
     for model in all_models:
         for field_info in model.model_fields.values():
@@ -619,6 +635,196 @@ def _value_to_source(value: Any) -> str:
     return r
 
 
+# ---------------------------------------------------------------------------
+# Nested submodel emission (shared by composed + single-layer nested source)
+# ---------------------------------------------------------------------------
+
+# Builder-synthesized models (per-key models and nested segment submodels)
+# all live in this module. User-defined Pydantic types keep their own module
+# and are referenced by import/annotation, never re-defined in a stub.
+_BUILDER_MODULE = LayerConfigResult.__module__
+
+
+def _iter_field_model_types(annotation: Any):
+    """Yield ``BaseModel`` subclasses referenced within a type annotation.
+
+    Descends through ``Optional``/``Union``, ``list``/``dict``/other generics,
+    and ``Annotated`` so a nested model wrapped in any of these is still found.
+    """
+    origin = get_origin(annotation)
+    if origin is Annotated:
+        args = get_args(annotation)
+        if args:
+            yield from _iter_field_model_types(args[0])
+        return
+    if origin in _UNION_TYPES:
+        for arg in get_args(annotation):
+            if arg is not type(None):
+                yield from _iter_field_model_types(arg)
+        return
+    if origin is Literal:
+        return
+    if origin is not None:
+        for arg in get_args(annotation):
+            yield from _iter_field_model_types(arg)
+        return
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        yield annotation
+
+
+def _collect_referenced_submodels(
+    per_key_models: list[type[BaseModel]],
+    exclude_ids: set[int],
+) -> list[type[BaseModel]]:
+    """Collect builder-synthesized nested submodels referenced as field types.
+
+    Nested/compound-discriminator layers give per-key models fields whose type
+    is a synthesized segment submodel (e.g. ``provider: AwsProviderConfig``)
+    with an eager instance default.  Those classes are referenced but not
+    importable, so they must be emitted as class definitions.
+
+    The result is de-duplicated by identity and ordered **post-order (deepest
+    first)** so each submodel is defined before any shallower model that
+    constructs it.  The per-key models themselves (``exclude_ids``) and any
+    user-defined model (different ``__module__``) are skipped — the builder's
+    ``per_segment_models`` is *not* used because it is keyed by segment value
+    alone and collapses distinct same-named classes.
+    """
+    ordered: list[type[BaseModel]] = []
+    seen: set[int] = set(exclude_ids)
+
+    def visit(model: type[BaseModel]) -> None:
+        for field_info in model.model_fields.values():
+            for sub in _iter_field_model_types(field_info.annotation):
+                if id(sub) in seen:
+                    continue
+                if getattr(sub, "__module__", None) != _BUILDER_MODULE:
+                    continue  # user-defined model — referenced, not re-defined
+                seen.add(id(sub))
+                visit(sub)  # recurse first → post-order (deepest first)
+                ordered.append(sub)
+
+    for model in per_key_models:
+        visit(model)
+    return ordered
+
+
+def _model_signature(model: type[BaseModel]) -> tuple:
+    """Structural signature (extra policy + rendered fields) for de-duplication."""
+    extra = model.model_config.get("extra", "forbid")
+    fields = tuple(
+        (name, _type_to_source(fi.annotation), _value_to_source(fi.default))
+        for name, fi in model.model_fields.items()
+    )
+    return (extra, fields)
+
+
+def _disambiguate_submodel_names(
+    submodels: list[type[BaseModel]],
+    restore: dict[type, tuple[str, str]],
+) -> list[type[BaseModel]]:
+    """Give synthesized submodels unique names for emission.
+
+    The builder names segment submodels by their segment value alone (e.g.
+    ``DirectProviderConfig``), so two different level-0 types can produce
+    distinct classes sharing a name but differing in fields.  Structurally
+    identical same-name classes are de-duplicated (emitted once); genuinely
+    different ones are suffixed with the next globally-unused integer
+    (``DirectProviderConfig``, ``DirectProviderConfig2`` …).
+
+    Names are mutated in place on the throwaway builder classes so that field
+    annotations *and* eager-default ``repr`` render the emitted name.  Each
+    mutation is recorded in the caller-owned ``restore`` map *before* the
+    mutation, so a caller ``finally`` unwinds every rename even if this
+    function raises partway through.
+    """
+    emit_list: list[type[BaseModel]] = []
+    reps_by_name: dict[str, list[tuple[tuple, str]]] = {}
+    used_names: set[str] = {m.__name__ for m in submodels}
+
+    def _rename(model: type[BaseModel], new_name: str) -> None:
+        restore[model] = (model.__name__, model.__qualname__)
+        model.__name__ = new_name
+        model.__qualname__ = new_name
+
+    for model in submodels:
+        name = model.__name__
+        signature = _model_signature(model)
+        reps = reps_by_name.setdefault(name, [])
+        match = next((en for sig, en in reps if sig == signature), None)
+
+        if match is not None:
+            # Structurally identical to an already-emitted class; only ensure
+            # references render the emitted name.
+            if match != model.__name__:
+                _rename(model, match)
+            continue
+
+        if not reps:
+            emit_name = name
+        else:
+            i = len(reps) + 1
+            emit_name = f"{name}{i}"
+            while emit_name in used_names:
+                i += 1
+                emit_name = f"{name}{i}"
+            used_names.add(emit_name)
+        reps.append((signature, emit_name))
+        if emit_name != model.__name__:
+            _rename(model, emit_name)
+        emit_list.append(model)
+
+    return emit_list
+
+
+def _restore_submodel_names(restore: dict[type, tuple[str, str]]) -> None:
+    """Undo the in-place ``__name__``/``__qualname__`` mutation."""
+    for model, (name, qualname) in restore.items():
+        model.__name__ = name
+        model.__qualname__ = qualname
+
+
+def _generate_submodels_block(emit_list: list[type[BaseModel]]) -> str:
+    """Emit nested submodel classes, each followed by ``model_rebuild()``.
+
+    Interleaving ``class`` + ``model_rebuild()`` in deepest-first order is
+    required: ``from __future__ import annotations`` defers field resolution,
+    yet a shallower model constructs the submodel as an eager default in its
+    class body — so the submodel must be fully built beforehand.
+    """
+    if not emit_list:
+        return ""
+    parts: list[str] = ["\n# ── Nested submodels ──"]
+    for model in emit_list:
+        parts.append(_generate_class(model, "name"))
+        parts.append(f"{model.__name__}.model_rebuild()")
+    parts.append("")
+    return "\n".join(parts)
+
+
+def _composed_alias_name(layer_name: str) -> str:
+    """Union alias name for a layer: ``llm`` → ``LLMConfig``, ``foo_bar`` → ``FooBarConfig``."""
+    if len(layer_name) <= 3:
+        return f"{layer_name.upper()}Config"
+    return "".join(seg.title() for seg in layer_name.split("_")) + "Config"
+
+
+def _compound_union_alias(alias_name: str, lr: LayerConfigResult) -> str:
+    """Compound (``Discriminator`` callable + ``Tag``) union alias for a nested layer."""
+    members = [
+        f'        Annotated[{lr.per_key_models[key].__name__}, Tag("{key}")]'
+        for key in sorted(lr.per_key_models.keys())
+    ]
+    members_str = ",\n".join(members)
+    fn_name = f"_discriminate_{lr.layer_name}"
+    return (
+        f'\n{alias_name} = Annotated[\n'
+        f'    Union[\n{members_str},\n    ],\n'
+        f'    Discriminator({fn_name}),\n'
+        f']\n'
+    )
+
+
 def generate_composed_config_source(result: Any) -> str:
     """Serialize a ``ComposedConfigResult`` to Python source code.
 
@@ -626,9 +832,11 @@ def generate_composed_config_source(result: Any) -> str:
     1. Header comment
     2. ``from __future__ import annotations``
     3. Imports
-    4. Per-layer class definitions (in dependency order, leaves first)
-    5. Per-layer union aliases
-    6. Top-level ``ComposedConfig`` class with ``list[UnionType]`` fields
+    4. Nested submodels (deepest first) with ``model_rebuild()``
+    5. Per-layer class definitions (in dependency order, leaves first)
+    6. Per-layer union aliases (flat ``Field(discriminator=...)`` or, for
+       nested layers, a compound ``Discriminator`` callable + ``Tag``)
+    7. Top-level ``ComposedConfig`` class with ``list[UnionType]`` fields
 
     Args:
         result: The ``ComposedConfigResult`` from ``build_composed_config()``.
@@ -636,28 +844,45 @@ def generate_composed_config_source(result: Any) -> str:
     Returns:
         A string containing valid Python source code.
     """
-    parts: list[str] = []
-    layer_names_str = ", ".join(result.dependency_order)
+    # Collect nested submodels referenced across ALL layers' per-key models.
+    per_key_all: list[type[BaseModel]] = [
+        model
+        for layer_name in result.dependency_order
+        for model in result.layer_results[layer_name].per_key_models.values()
+    ]
+    exclude_ids = {id(m) for m in per_key_all}
+    submodels = _collect_referenced_submodels(per_key_all, exclude_ids)
 
-    # 1. Header
-    parts.append(
-        f"# Auto-generated by conscribe. DO NOT EDIT.\n"
-        f"# Composed config: {layer_names_str}\n"
-        f"# Inline wiring: {result.inline_wiring}\n"
+    has_nested = any(
+        result.layer_results[ln].discriminator_fields
+        for ln in result.dependency_order
     )
 
-    # 2. Future annotations
-    parts.append("from __future__ import annotations\n")
+    restore: dict[type, tuple[str, str]] = {}
+    try:
+        emit_list = _disambiguate_submodel_names(submodels, restore)
+        parts: list[str] = []
+        layer_names_str = ", ".join(result.dependency_order)
 
-    # 3. Imports — scan all models for needed imports
-    typing_imports: set[str] = {"Annotated", "Literal", "Union"}
-    pydantic_imports: set[str] = {"BaseModel", "ConfigDict", "Field"}
-    extra_imports: dict[str, set[str]] = {}
-    has_field = False
+        # 1. Header
+        parts.append(
+            f"# Auto-generated by conscribe. DO NOT EDIT.\n"
+            f"# Composed config: {layer_names_str}\n"
+            f"# Inline wiring: {result.inline_wiring}\n"
+        )
 
-    for layer_name in result.dependency_order:
-        lr = result.layer_results[layer_name]
-        for model in lr.per_key_models.values():
+        # 2. Future annotations
+        parts.append("from __future__ import annotations\n")
+
+        # 3. Imports — scan all models (per-key + nested submodels)
+        typing_imports: set[str] = {"Annotated", "Literal", "Union"}
+        pydantic_imports: set[str] = {"BaseModel", "ConfigDict", "Field"}
+        if has_nested:
+            pydantic_imports.update({"Discriminator", "Tag"})
+        extra_imports: dict[str, set[str]] = {}
+        has_field = False
+
+        for model in [*per_key_all, *emit_list]:
             for field_info in model.model_fields.values():
                 if _needs_field(field_info):
                     has_field = True
@@ -671,71 +896,76 @@ def generate_composed_config_source(result: Any) -> str:
                     if mod and mod != "builtins":
                         extra_imports.setdefault(mod, set()).add(name)
 
-    if has_field:
-        pydantic_imports.add("Field")
-    typing_imports.add("Any")  # for potential complex types
+        if has_field:
+            pydantic_imports.add("Field")
+        typing_imports.add("Any")  # for potential complex types
 
-    lines: list[str] = []
-    lines.append(f"from typing import {', '.join(sorted(typing_imports))}")
-    lines.append("")
-    lines.append(f"from pydantic import {', '.join(sorted(pydantic_imports))}")
-    for mod in sorted(extra_imports.keys()):
-        names = ", ".join(sorted(extra_imports[mod]))
-        lines.append(f"from {mod} import {names}")
-    lines.append("")
-    parts.append("\n".join(lines))
+        lines: list[str] = []
+        lines.append(f"from typing import {', '.join(sorted(typing_imports))}")
+        lines.append("")
+        lines.append(f"from pydantic import {', '.join(sorted(pydantic_imports))}")
+        for mod in sorted(extra_imports.keys()):
+            names = ", ".join(sorted(extra_imports[mod]))
+            lines.append(f"from {mod} import {names}")
+        lines.append("")
+        parts.append("\n".join(lines))
 
-    # 4. Per-layer class definitions and union aliases (dependency order)
-    all_model_names: list[str] = []
-    alias_map: dict[str, str] = {}  # layer_name -> alias_name
+        # 4. Nested submodels (deepest first), each followed by model_rebuild()
+        submodel_block = _generate_submodels_block(emit_list)
+        if submodel_block:
+            parts.append(submodel_block)
 
-    for layer_name in result.dependency_order:
-        lr = result.layer_results[layer_name]
-        parts.append(f"\n# ── Layer: {layer_name} ──\n")
+        # 5. Per-layer class definitions and union aliases (dependency order)
+        alias_map: dict[str, str] = {}  # layer_name -> alias_name
 
-        model_names: list[str] = []
-        for key in sorted(lr.per_key_models.keys()):
-            model = lr.per_key_models[key]
-            wired_lookup: dict[str, str] = getattr(model, "__wired_fields__", {})
-            parts.append(_generate_class(model, lr.discriminator_field))
-            model_names.append(model.__name__)
-            all_model_names.append(model.__name__)
+        for layer_name in result.dependency_order:
+            lr = result.layer_results[layer_name]
+            parts.append(f"\n# ── Layer: {layer_name} ──\n")
 
-        # model_rebuild() calls
-        rebuild_lines = ["\n# Rebuild models for deferred annotation resolution"]
-        for name in model_names:
-            rebuild_lines.append(f"{name}.model_rebuild()")
-        rebuild_lines.append("")
-        parts.append("\n".join(rebuild_lines))
+            model_names: list[str] = []
+            for key in sorted(lr.per_key_models.keys()):
+                model = lr.per_key_models[key]
+                parts.append(_generate_class(model, lr.discriminator_field))
+                model_names.append(model.__name__)
 
-        # Union alias
-        if len(lr.per_key_models) > 1:
-            if len(layer_name) <= 3:
-                alias_name = f"{layer_name.upper()}Config"
+            # model_rebuild() calls
+            rebuild_lines = ["\n# Rebuild models for deferred annotation resolution"]
+            for name in model_names:
+                rebuild_lines.append(f"{name}.model_rebuild()")
+            rebuild_lines.append("")
+            parts.append("\n".join(rebuild_lines))
+
+            # Union alias
+            if len(lr.per_key_models) > 1:
+                alias_name = _composed_alias_name(layer_name)
+                alias_map[layer_name] = alias_name
+                if lr.discriminator_fields:
+                    # Nested layer: compound discriminator (callable + Tag).
+                    parts.append(_generate_discriminator_fn(lr))
+                    parts.append(_compound_union_alias(alias_name, lr))
+                else:
+                    union_members = ", ".join(model_names)
+                    parts.append(
+                        f'\n{alias_name} = Annotated[\n'
+                        f'    Union[{union_members}],\n'
+                        f'    Field(discriminator="{lr.discriminator_field}"),\n'
+                        f']\n'
+                    )
             else:
-                alias_name = "".join(seg.title() for seg in layer_name.split("_")) + "Config"
-            alias_map[layer_name] = alias_name
+                alias_name = model_names[0] if model_names else "Any"
+                alias_map[layer_name] = alias_name
 
-            union_members = ", ".join(model_names)
-            parts.append(
-                f'\n{alias_name} = Annotated[\n'
-                f'    Union[{union_members}],\n'
-                f'    Field(discriminator="{lr.discriminator_field}"),\n'
-                f']\n'
-            )
-        else:
-            alias_name = model_names[0] if model_names else "Any"
-            alias_map[layer_name] = alias_name
+        # 6. Top-level ComposedConfig class
+        parts.append("\n# ── Composed Config ──\n")
+        parts.append("\nclass ComposedConfig(BaseModel):")
+        for layer_name in result.dependency_order:
+            type_name = alias_map.get(layer_name, "Any")
+            parts.append(f"    {layer_name}: list[{type_name}] = []")
+        parts.append("")
 
-    # 5. Top-level ComposedConfig class
-    parts.append("\n# ── Composed Config ──\n")
-    parts.append("\nclass ComposedConfig(BaseModel):")
-    for layer_name in result.dependency_order:
-        type_name = alias_map.get(layer_name, "Any")
-        parts.append(f"    {layer_name}: list[{type_name}] = []")
-    parts.append("")
-
-    return "\n".join(parts)
+        return "\n".join(parts)
+    finally:
+        _restore_submodel_names(restore)
 
 
 def _generate_union_alias(result: LayerConfigResult) -> str:
