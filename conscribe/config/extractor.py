@@ -13,13 +13,33 @@ See ``config-typing-design.md`` Section 4 for full specification.
 """
 from __future__ import annotations
 
+import ast
+import collections.abc as _c_abc
 import inspect
-from typing import Annotated, Any, Literal, Union, get_args, get_origin, get_type_hints
+import sys
+import types
+from typing import (
+    Annotated,
+    Any,
+    ClassVar,
+    Literal,
+    Union,
+    get_args,
+    get_origin,
+    get_type_hints,
+)
 
 from pydantic import BaseModel, ConfigDict, Field, create_model
 from pydantic.fields import FieldInfo
 
 from conscribe.config.docstring import parse_param_descriptions
+
+# ``types.UnionType`` backs PEP 604 ``X | Y`` (3.10+).  ``get_origin()``
+# returns it *instead of* ``typing.Union``, so any check that only looks
+# for ``Union`` silently misses ``dict[str, X] | None``.
+_UNION_ORIGINS: tuple[Any, ...] = (Union,)
+if sys.version_info >= (3, 10):
+    _UNION_ORIGINS = (Union, types.UnionType)
 
 
 def extract_config_schema(
@@ -357,9 +377,16 @@ def _apply_wiring(
     For each resolved wiring entry:
     - If the param exists in ``field_definitions``: replace its type with
       ``Literal[...keys...]``, preserving the original default/FieldInfo.
-      Handles ``Optional[str]`` → ``Optional[Literal[...]]``.
-    - If the param does NOT exist in ``field_definitions``: inject it as
-      a new required field with ``Literal[...keys...]`` type.
+      Handles ``Optional[str]`` → ``Optional[Literal[...]]`` and
+      ``dict[str, X] | None`` → ``Optional[list[Literal[...]]]``.
+    - If the param has a *runtime slot* (an ``__init__`` parameter or a
+      non-``ClassVar`` class-level annotation) but no config field yet:
+      inject it as a new **required** field.
+    - If the param has no runtime slot at all: inject it as an
+      **optional** field (``Optional[Literal[...]] = None``).  Such an
+      entry is a purely declarative constraint — nothing can receive a
+      value for it, so demanding one in every config file is noise.  The
+      ``Literal`` still applies whenever a value *is* supplied.
 
     Args:
         cls: The class being extracted.
@@ -385,6 +412,8 @@ def _apply_wiring(
         return {}
 
     wired_fields: dict[str, str] = {}
+    slot_annotations = _collect_slot_annotations(cls)
+    init_param_names = _collect_init_param_names(cls)
 
     for param_name, wiring in resolved.items():
         literal_type = Literal[tuple(wiring.allowed_keys)]  # type: ignore[valid-type]
@@ -398,14 +427,166 @@ def _apply_wiring(
                 new_type = _replace_str_with_literal(old_type, literal_type)
                 field_definitions[param_name] = (new_type, default_or_field)
             wiring.injected = False
+        elif param_name in init_param_names or param_name in slot_annotations:
+            # A runtime slot exists (``__init__`` param that was filtered out
+            # of the schema, or a class-level annotation the framework injects
+            # into).  Keep it required, but honour a container annotation.
+            target_type = literal_type
+            if _annotation_is_container(slot_annotations.get(param_name)):
+                target_type = list[literal_type]  # type: ignore[valid-type]
+            field_definitions[param_name] = (target_type, ...)
+            wiring.injected = True
         else:
-            # Inject new required field
-            field_definitions[param_name] = (literal_type, ...)
+            # Slot-less: declaration-only constraint. Optional, not required.
+            field_definitions[param_name] = (Union[literal_type, None], None)
             wiring.injected = True
 
         wired_fields[param_name] = wiring.registry_name or "literal"
 
     return wired_fields
+
+
+def _collect_init_param_names(cls: type) -> set[str]:
+    """Named ``__init__`` parameters of *cls*, including inherited ones."""
+    try:
+        sig = inspect.signature(cls.__init__)  # type: ignore[misc]
+    except (ValueError, TypeError):
+        return set()
+    return {
+        p.name
+        for p in sig.parameters.values()
+        if p.name != "self"
+        and p.kind
+        not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+    }
+
+
+def _collect_slot_annotations(cls: type) -> dict[str, Any]:
+    """Class-level annotations along the MRO that denote a runtime slot.
+
+    ``ClassVar`` annotations and dunders are excluded: a ``ClassVar`` is
+    class-level configuration, never a per-instance receptor the framework
+    can inject into.  Annotations stay in whatever form the class declared
+    them (resolved object or PEP 563 string); callers must handle both.
+    """
+    slots: dict[str, Any] = {}
+    for klass in reversed(cls.__mro__):
+        if klass is object:
+            continue
+        annotations = klass.__dict__.get("__annotations__")
+        if not isinstance(annotations, dict):
+            continue
+        for name, annotation in annotations.items():
+            if name.startswith("__") and name.endswith("__"):
+                continue
+            if _is_classvar(annotation):
+                continue
+            slots[name] = annotation
+    return slots
+
+
+def _is_classvar(annotation: Any) -> bool:
+    """Return ``True`` for ``ClassVar`` / ``"ClassVar[...]"`` annotations."""
+    if isinstance(annotation, str):
+        text = annotation.strip()
+        return text.startswith("ClassVar") or text.startswith("typing.ClassVar")
+    return annotation is ClassVar or get_origin(annotation) is ClassVar
+
+
+# Names that denote a container when they appear in a string annotation.
+_CONTAINER_NAMES: frozenset[str] = frozenset(
+    {
+        "list", "dict", "set", "frozenset", "tuple",
+        "List", "Dict", "Set", "FrozenSet", "Tuple",
+        "Sequence", "MutableSequence", "Mapping", "MutableMapping",
+        "AbstractSet", "MutableSet", "Collection", "Iterable",
+        "OrderedDict", "DefaultDict", "defaultdict", "deque", "Deque",
+    }
+)
+
+_CONTAINER_ORIGINS: tuple[Any, ...] = (list, dict, set, frozenset, tuple)
+
+
+def _container_origin(tp: Any) -> Any:
+    """Return the container origin of *tp*, or ``None`` if it is not one.
+
+    Handles both the parameterised form (``dict[str, X]``) and the bare one
+    (``dict``) — a receptor annotated with either is multi-instance.
+    """
+    origin = get_origin(tp)
+    if origin is None:
+        # Bare, unparameterised annotation: ``capabilities: list``.
+        origin = tp if isinstance(tp, type) else None
+        if origin is None:
+            return None
+    if origin in _CONTAINER_ORIGINS:
+        return origin
+    if isinstance(origin, type) and issubclass(
+        origin, (_c_abc.Sequence, _c_abc.Mapping, _c_abc.Set)
+    ):
+        # str/bytes are Sequences but are scalars for config purposes.
+        if issubclass(origin, (str, bytes, bytearray)):
+            return None
+        return origin
+    return None
+
+
+def _annotation_is_container(annotation: Any) -> bool:
+    """Return ``True`` when *annotation* declares a multi-instance receptor.
+
+    Handles resolved type objects and PEP 563 string annotations alike, and
+    looks through ``Optional[...]`` / ``X | None`` / ``Annotated[...]``
+    wrappers.
+    """
+    if annotation is None:
+        return False
+    if isinstance(annotation, str):
+        return _string_annotation_is_container(annotation)
+
+    origin = get_origin(annotation)
+    if origin is Annotated:
+        args = get_args(annotation)
+        return bool(args) and _annotation_is_container(args[0])
+    if origin in _UNION_ORIGINS:
+        return any(
+            arg is not type(None) and _annotation_is_container(arg)
+            for arg in get_args(annotation)
+        )
+    return _container_origin(annotation) is not None
+
+
+def _string_annotation_is_container(text: str) -> bool:
+    """AST-based container detection for unresolved string annotations."""
+    try:
+        node: Any = ast.parse(text.strip(), mode="eval").body
+    except (SyntaxError, ValueError):
+        return False
+    return _ast_is_container(node)
+
+
+def _ast_is_container(node: Any) -> bool:
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return _ast_is_container(node.left) or _ast_is_container(node.right)
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return _string_annotation_is_container(node.value)
+    if isinstance(node, ast.Name):  # bare ``list`` / ``dict``
+        return node.id in _CONTAINER_NAMES
+    if isinstance(node, ast.Attribute):  # ``typing.List``
+        return node.attr in _CONTAINER_NAMES
+    if isinstance(node, ast.Subscript):
+        base = node.value
+        name = base.attr if isinstance(base, ast.Attribute) else getattr(base, "id", None)
+        if name in ("Optional", "Annotated", "Union"):
+            inner = node.slice
+            if isinstance(inner, ast.Tuple):
+                elts = inner.elts
+                # Annotated[T, ...] → only the first arg is the type.
+                if name == "Annotated":
+                    return bool(elts) and _ast_is_container(elts[0])
+                return any(_ast_is_container(e) for e in elts)
+            return _ast_is_container(inner)
+        return name in _CONTAINER_NAMES
+    return False
 
 
 def _replace_str_with_literal(original_type: Any, literal_type: Any) -> Any:
@@ -416,7 +597,15 @@ def _replace_str_with_literal(original_type: Any, literal_type: Any) -> Any:
     - ``Optional[str]`` → ``Optional[Literal[...]]``
     - ``Union[str, X]`` → ``Union[Literal[...], X]``
     - ``Annotated[str, Field(...)]`` → ``Annotated[Literal[...], Field(...)]``
+    - ``dict[str, X]`` / ``list[X]`` → ``list[Literal[...]]``
+    - ``dict[str, X] | None`` → ``Optional[list[Literal[...]]]``
     - Other types → replaced entirely with ``literal_type``
+
+    A container-annotated receptor is a *multi-instance* receptor: the
+    owner can hold several wired targets at once.  Collapsing it to a
+    scalar ``Literal`` made it impossible to declare more than one from
+    config, so containers become a **list** of selectors — which the
+    composed-config pass then widens into a list of nested configs.
 
     Args:
         original_type: The existing type annotation.
@@ -435,8 +624,8 @@ def _replace_str_with_literal(original_type: Any, literal_type: Any) -> Any:
         replaced_base = _replace_str_with_literal(base, literal_type)
         return Annotated[tuple([replaced_base] + list(metadata))]  # type: ignore[return-value]
 
-    # Optional[str] or Union[str, None]
-    if origin is Union:
+    # Optional[str], Union[str, None], and PEP 604 ``X | None``
+    if origin in _UNION_ORIGINS:
         args = get_args(original_type)
         new_args = []
         for arg in args:
@@ -444,12 +633,18 @@ def _replace_str_with_literal(original_type: Any, literal_type: Any) -> Any:
                 new_args.append(literal_type)
             elif arg is type(None):
                 new_args.append(arg)
+            elif _container_origin(arg) is not None:
+                new_args.append(list[literal_type])  # type: ignore[valid-type]
             else:
                 new_args.append(arg)
         if len(new_args) == 2 and type(None) in new_args:
             non_none = [a for a in new_args if a is not type(None)][0]
             return Union[non_none, None]  # type: ignore[return-value]
         return Union[tuple(new_args)]  # type: ignore[return-value]
+
+    # Container receptor → list of selectors, one per wired instance.
+    if _container_origin(original_type) is not None:
+        return list[literal_type]  # type: ignore[valid-type]
 
     # Plain str or Any → just use the Literal type
     if original_type is str or original_type is Any:

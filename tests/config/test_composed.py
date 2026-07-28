@@ -6,9 +6,28 @@ JSON Schema / Python source generation.
 """
 from __future__ import annotations
 
-from typing import Literal, get_args, get_origin
+from typing import Literal, Union, get_args, get_origin
 import pytest
 from pydantic import BaseModel, TypeAdapter
+
+
+def _literal_members(annotation):
+    """Return the ``Literal`` members of a wired field, or ``None``.
+
+    Slot-less wired fields are emitted as ``Optional[Literal[...]]``, so the
+    ``Optional`` wrapper has to come off before inspecting the constraint.
+    """
+    if get_origin(annotation) is Union:
+        for arg in get_args(annotation):
+            if arg is type(None):
+                continue
+            members = _literal_members(arg)
+            if members is not None:
+                return members
+        return None
+    if get_origin(annotation) is Literal:
+        return get_args(annotation)
+    return None
 
 from conscribe.config.builder import build_layer_config
 from conscribe.config.codegen import generate_composed_config_source
@@ -266,8 +285,9 @@ class TestBuildComposedConfig:
         agent_result = result.layer_results["comp_agent"]
         browser_model = agent_result.per_key_models["browser_use"]
         llm_field = browser_model.model_fields["llm"]
-        # Should still be Literal[...]
-        assert get_origin(llm_field.annotation) is Literal
+        # Should still be a Literal selector (wrapped in Optional because
+        # ``llm`` is a slot-less wired declaration on the fixture agent).
+        assert _literal_members(llm_field.annotation) is not None
 
     def test_inline_true_replaces_with_union(
         self, llm_registrar, loop_registrar, agent_registrar,
@@ -378,9 +398,8 @@ class TestMode3Passthrough:
         agent_result = result.layer_results["comp_m3_agent"]
         simple_model = agent_result.per_key_models["simple"]
         browser_field = simple_model.model_fields["browser"]
-        # Mode 3: should still be Literal
-        assert get_origin(browser_field.annotation) is Literal
-        assert set(get_args(browser_field.annotation)) == {"chromium", "firefox"}
+        # Mode 3: should still be a Literal selector, never inlined
+        assert set(_literal_members(browser_field.annotation)) == {"chromium", "firefox"}
 
 
 # ---------------------------------------------------------------------------

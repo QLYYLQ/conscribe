@@ -1,6 +1,7 @@
 """Collect stub information from registered classes with wired attributes."""
 from __future__ import annotations
 
+import ast
 import inspect
 from dataclasses import dataclass
 from typing import Any
@@ -17,11 +18,17 @@ class InjectedAttr:
 
 @dataclass(frozen=True)
 class MethodStub:
-    """Method signature for .pyi rendering."""
+    """Method signature for .pyi rendering.
+
+    ``is_async`` records whether the underlying function is a coroutine
+    (or async generator) function, so the renderer can emit ``async def``.
+    Without it every ``await`` on the method is a type error downstream.
+    """
 
     name: str
     signature: str  # e.g. "(self, x: int) -> str"
     decorators: tuple[str, ...]  # e.g. ("@classmethod",)
+    is_async: bool = False
 
 
 @dataclass(frozen=True)
@@ -109,7 +116,7 @@ def collect_class_stub_info(cls: type) -> ClassStubInfo | None:
         try:
             sig = inspect.signature(cls.__init__)
             init_param_names = set(sig.parameters.keys()) - {"self"}
-            init_signature = str(sig)
+            init_signature = render_signature(sig)
             if sig.return_annotation is inspect.Parameter.empty:
                 init_signature += " -> None"
         except (ValueError, TypeError):
@@ -246,12 +253,150 @@ def _collect_own_methods(cls: type) -> tuple[MethodStub, ...]:
         methods.append(
             MethodStub(
                 name=name,
-                signature=str(sig),
+                signature=render_signature(sig),
                 decorators=tuple(decorators),
+                is_async=_is_async_function(func),
             )
         )
 
     return tuple(methods)
+
+
+def _is_async_function(func: Any) -> bool:
+    """Return ``True`` for coroutine *and* async-generator functions.
+
+    ``inspect.iscoroutinefunction`` alone misses ``async def`` bodies that
+    ``yield`` — those are async generators, and they still need ``async def``
+    in the stub.  Unwraps ``functools.wraps``-style chains via ``__wrapped__``.
+    """
+    seen: set[int] = set()
+    target = func
+    while target is not None and id(target) not in seen:
+        seen.add(id(target))
+        try:
+            if inspect.iscoroutinefunction(target) or inspect.isasyncgenfunction(target):
+                return True
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            return False
+        target = getattr(target, "__wrapped__", None)
+    return False
+
+
+# ── Signature rendering ──────────────────────────────────────────
+
+
+class _Source:
+    """Carries pre-rendered source text through ``str(inspect.Signature)``.
+
+    ``inspect`` formats both annotations and defaults with ``repr()``, so
+    wrapping a value in this shim lets us decide the exact text that lands
+    in the ``.pyi`` while still reusing ``Signature.__str__`` for all the
+    positional-only ``/``, keyword-only ``*`` and ``**kwargs`` placement.
+    """
+
+    __slots__ = ("text",)
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    def __repr__(self) -> str:
+        return self.text
+
+
+def render_signature(sig: inspect.Signature) -> str:
+    """Render *sig* as ``.pyi``-safe source text.
+
+    ``str(inspect.Signature)`` cannot be trusted for stub output: it
+    ``repr()``s defaults straight into the signature, which emits things
+    like ``<factory>`` (the dataclass ``default_factory`` sentinel),
+    ``FieldInfo(...)`` or ``<object at 0x...>`` — none of which are valid
+    Python.  Defaults that cannot be rendered faithfully collapse to the
+    ``...`` placeholder that PEP 484 defines for exactly this purpose.
+
+    String annotations (PEP 563 / explicit forward refs) are emitted
+    unquoted, since the stub already carries ``from __future__ import
+    annotations``.  This also avoids double-quoting an annotation whose
+    source text was itself a string literal.
+    """
+    params = []
+    for param in sig.parameters.values():
+        annotation = param.annotation
+        if annotation is not inspect.Parameter.empty:
+            annotation = _Source(_annotation_text(annotation))
+        default = param.default
+        if default is not inspect.Parameter.empty:
+            default = _Source(_default_to_source(default))
+        params.append(param.replace(annotation=annotation, default=default))
+
+    return_annotation = sig.return_annotation
+    if return_annotation is not inspect.Signature.empty:
+        return_annotation = _Source(_annotation_text(return_annotation))
+
+    try:
+        return str(sig.replace(parameters=params, return_annotation=return_annotation))
+    except (ValueError, TypeError):  # pragma: no cover - defensive
+        return str(sig)
+
+
+def _annotation_text(ann: Any) -> str:
+    """Render a single annotation as stub source text."""
+    if isinstance(ann, str):
+        text = ann.strip()
+        if _parses_as_expression(text):
+            return text
+        return repr(ann)
+
+    forward_arg = getattr(ann, "__forward_arg__", None)
+    if isinstance(forward_arg, str):
+        return _annotation_text(forward_arg)
+
+    try:
+        return inspect.formatannotation(ann)
+    except Exception:  # pragma: no cover - defensive
+        return "Any"
+
+
+def _parses_as_expression(text: str) -> bool:
+    """Return ``True`` when *text* is a syntactically valid expression."""
+    if not text:
+        return False
+    try:
+        ast.parse(text, mode="eval")
+    except (SyntaxError, ValueError):
+        return False
+    return True
+
+
+# Types whose ``repr()`` round-trips to valid, self-contained source.
+_LITERAL_SCALARS: tuple[type, ...] = (bool, int, float, complex, str, bytes)
+_LITERAL_CONTAINERS: tuple[type, ...] = (list, tuple, set, frozenset, dict)
+
+
+def _default_to_source(value: Any) -> str:
+    """Render a parameter default as stub source, or ``...`` if impossible.
+
+    Only values whose ``repr()`` is guaranteed to be valid, self-contained
+    source survive; everything else (``default_factory`` sentinels, pydantic
+    ``FieldInfo``, ``WiredField`` descriptors, arbitrary instances, enums)
+    degrades to ``...`` — the PEP 484 stub placeholder, which still tells a
+    type checker the parameter is optional.
+    """
+    if value is None:
+        return "None"
+    if value is Ellipsis:
+        return "..."
+    # ``type(value) in`` (not isinstance): subclasses such as IntEnum or a
+    # str-subclass may have a repr that is not valid source.
+    if type(value) in _LITERAL_SCALARS:
+        return repr(value)
+    if type(value) in _LITERAL_CONTAINERS:
+        rendered = repr(value)
+        try:
+            if ast.literal_eval(rendered) == value:
+                return rendered
+        except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+            pass
+    return "..."
 
 
 def _collect_class_attrs(

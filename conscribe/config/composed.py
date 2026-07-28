@@ -240,7 +240,8 @@ def _extract_literal_keys(annotation: Any) -> tuple[str, ...] | None:
     """Extract string keys from a Literal type annotation.
 
     Handles: ``Literal[...]``, ``Optional[Literal[...]]``,
-    ``Union[Literal[...], None]``.
+    ``Union[Literal[...], None]``, and the multi-instance container form
+    ``list[Literal[...]]`` / ``Optional[list[Literal[...]]]``.
 
     Returns None if the annotation is not a Literal-based type.
     """
@@ -250,6 +251,14 @@ def _extract_literal_keys(annotation: Any) -> tuple[str, ...] | None:
         args = get_args(annotation)
         if args and all(isinstance(a, str) for a in args):
             return tuple(args)
+        return None
+
+    # list[Literal[...]] — a container-annotated wired receptor.
+    if origin in _CONTAINER_ORIGINS:
+        for arg in get_args(annotation):
+            keys = _extract_literal_keys(arg)
+            if keys is not None:
+                return keys
         return None
 
     # Optional[Literal[...]] or Union[Literal[...], None]
@@ -282,7 +291,9 @@ def _build_inline_type(
     If allowed_keys covers all keys in the target, returns the full union.
     Otherwise, builds a subset union from matching per-key models.
 
-    Preserves Optional wrapping from the original annotation.
+    Preserves ``list[...]`` and ``Optional`` wrapping from the original
+    annotation, so a multi-instance receptor becomes a *list of nested
+    configs* rather than a single one.
     """
     target_keys = set(target_result.per_key_models.keys())
     allowed_set = set(allowed_keys)
@@ -295,6 +306,10 @@ def _build_inline_type(
         inline_type = _build_subset_union(target_result, allowed_keys)
         if inline_type is None:
             return None
+
+    # Preserve container wrapping (multi-instance receptor)
+    if _is_container(original_annotation):
+        inline_type = list[inline_type]  # type: ignore[valid-type]
 
     # Preserve Optional wrapping
     if _is_optional(original_annotation):
@@ -338,6 +353,26 @@ def _is_optional(annotation: Any) -> bool:
         args = get_args(annotation)
         if args:
             return _is_optional(args[0])
+    return False
+
+
+# Container origins that mark a multi-instance wired receptor.
+_CONTAINER_ORIGINS: tuple[Any, ...] = (list, set, frozenset, tuple)
+
+
+def _is_container(annotation: Any) -> bool:
+    """Check whether a wired annotation is the multi-instance list form."""
+    origin = get_origin(annotation)
+    if origin in _CONTAINER_ORIGINS:
+        return True
+    if origin is Annotated:
+        args = get_args(annotation)
+        return bool(args) and _is_container(args[0])
+    if origin is Union:
+        return any(
+            arg is not type(None) and _is_container(arg)
+            for arg in get_args(annotation)
+        )
     return False
 
 

@@ -2,7 +2,15 @@
 from __future__ import annotations
 
 import pytest
-from typing import Literal, Optional, Protocol, runtime_checkable
+from typing import (
+    Literal,
+    Optional,
+    Protocol,
+    Union,
+    get_args,
+    get_origin,
+    runtime_checkable,
+)
 
 from pydantic import TypeAdapter
 
@@ -13,6 +21,27 @@ from conscribe.config import (
     generate_layer_json_schema,
 )
 from conscribe.registration.registry import _REGISTRY_INDEX, _deregister
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def literal_keys(annotation) -> tuple:
+    """Return the ``Literal`` members of a wired field's annotation.
+
+    Slot-less wired fields (no ``__init__`` param, no class annotation) are
+    emitted as ``Optional[Literal[...]]``, so config files need not carry a
+    value that nothing can receive.  This unwraps that wrapper so a test can
+    assert on the constraint itself.
+    """
+    if get_origin(annotation) is Union:
+        non_none = [a for a in get_args(annotation) if a is not type(None)]
+        assert len(non_none) == 1, annotation
+        annotation = non_none[0]
+    assert get_origin(annotation) is Literal, annotation
+    return get_args(annotation)
 
 
 # ---------------------------------------------------------------------------
@@ -96,15 +125,14 @@ class TestWiringE2E:
 
         model = result.per_key_models["swe_agent"]
 
-        # Verify wired field was injected
+        # Verify wired field was injected.  ``loop`` has no runtime slot
+        # (no __init__ param, no class annotation), so it is optional.
         assert "loop" in model.model_fields
+        assert model.model_fields["loop"].is_required() is False
         loop_type = model.model_fields["loop"].annotation
-        from typing import get_origin
-        assert get_origin(loop_type) is Literal
 
         # Verify Literal values contain all loop keys
-        from typing import get_args
-        literal_args = get_args(loop_type)
+        literal_args = literal_keys(loop_type)
         assert sorted(literal_args) == ["codeact_loop", "react_loop"]
 
         # Verify __init__ params are still there
@@ -152,8 +180,7 @@ class TestWiringE2E:
         result = build_layer_config(Agent)
         model = result.per_key_models["swe_agent2"]
 
-        from typing import get_args
-        literal_args = get_args(model.model_fields["loop"].annotation)
+        literal_args = literal_keys(model.model_fields["loop"].annotation)
         assert sorted(literal_args) == ["codeact_loop2", "react_loop2"]  # type: ignore[type-var]
 
     def test_full_pipeline_mode3_literal_list(self):
@@ -179,8 +206,7 @@ class TestWiringE2E:
         result = build_layer_config(Agent)
         model = result.per_key_models["browser_agent"]
 
-        from typing import get_args
-        literal_args = get_args(model.model_fields["browser"].annotation)
+        literal_args = literal_keys(model.model_fields["browser"].annotation)
         assert sorted(literal_args) == ["chromium", "firefox"]
 
     def test_constrain_existing_init_param(self):
@@ -429,16 +455,14 @@ class TestWiringE2E:
 
         result = build_layer_config(Agent)
 
-        from typing import get_args
-
         # Wide agent: all 3 loop keys
         wide_model = result.per_key_models["wide_agent"]
-        wide_literal = get_args(wide_model.model_fields["loop"].annotation)
+        wide_literal = literal_keys(wide_model.model_fields["loop"].annotation)
         assert sorted(wide_literal) == ["codeact_loop8", "plan_act_loop8", "react_loop8"]
 
         # Narrow agent: only react
         narrow_model = result.per_key_models["narrow_agent"]
-        narrow_literal = get_args(narrow_model.model_fields["loop"].annotation)
+        narrow_literal = literal_keys(narrow_model.model_fields["loop"].annotation)
         assert narrow_literal == ("react_loop8",)
 
     def test_full_pipeline_mode2_with_optional(self):
@@ -481,8 +505,7 @@ class TestWiringE2E:
         result = build_layer_config(Agent)
         model = result.per_key_models["opt_agent"]
 
-        from typing import get_args
-        literal_args = get_args(model.model_fields["loop"].annotation)
+        literal_args = literal_keys(model.model_fields["loop"].annotation)
         # Both required and optional keys appear in the Literal
         assert sorted(literal_args) == ["codeact_loop9", "react_loop9"]
 

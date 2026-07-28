@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Conscribe** (`conscribe` package, v1.1.2) — A Python library for automatic class registration and config typing stub generation for layered Python architectures. It targets framework developers building config-driven frameworks with pluggable layers (agents, LLM providers, etc.).
+**Conscribe** (`conscribe` package, v1.2.0) — A Python library for automatic class registration and config typing stub generation for layered Python architectures. It targets framework developers building config-driven frameworks with pluggable layers (agents, LLM providers, etc.).
 
 Six core capabilities:
 1. **Auto-registration**: Classes inheriting a base are automatically registered in their layer's registry (via metaclass). Also supports bridging external classes and explicit `@register` decorators.
@@ -101,6 +101,20 @@ pytest is pre-configured in `pyproject.toml` with `--cov=conscribe --cov-report=
 - `__config_mro_depth__` — Per-class override for MRO traversal depth (int or None).
 - `__degraded_fields__` — Attached to dynamically created models by `extract_config_schema()` when field types were degraded to `Any`. List of `DegradedField` instances. Only present when degradation occurred (zero overhead on happy path).
 - `__wiring__` — Cross-registry field constraints. Dict mapping param names to registry references. Three modes: `{"loop": "agent_loop"}` (all keys), `{"loop": ("agent_loop", ["react"])}` (subset), `{"browser": ["chromium"]}` (literal list). Mode 2 also supports 3-element tuple: `{"obs": ("observation", ["terminal"], ["filesystem"])}` (required + optional). `None` value excludes inherited key. Deep-merged along MRO.
+
+### Wired field *shape* in generated configs (v1.2.0)
+
+How a `__wiring__` entry lands in the generated config depends on whether the class has a **runtime slot** for it — an `__init__` parameter, or a non-`ClassVar` class-level annotation anywhere in the MRO:
+
+| Declaration | Generated config field |
+|---|---|
+| Slot + scalar annotation | `Literal[...]` (required, or the param's own default) |
+| Slot + container annotation (`dict[str, X]`, `list[X]`, bare `list`) | `list[Literal[...]]` — one selector per wired instance |
+| **No slot at all** | `Optional[Literal[...]] = None` |
+
+A slot-less entry is a *declaration-only* constraint: nothing can receive a value for it, so it must not be a required config field. The `Literal` still applies whenever a value **is** supplied — this is about presence, not weaker validation.
+
+A container-annotated receptor is *multi-instance*: collapsing it to a scalar made composite owners (e.g. an environment holding several capabilities) impossible to declare from config. Under composed config with `inline_wiring=True`, `list[Literal[...]]` widens to `list[<target layer union>]` — a list of nested configs.
 - `__wired_fields__` — Attached to dynamically created models by `extract_config_schema()` when wiring was applied. Dict mapping field names to registry names. Used by codegen for `# wired from:` comments.
 
 ### Pydantic Generic Compatibility
