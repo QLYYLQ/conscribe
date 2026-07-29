@@ -362,6 +362,20 @@ The 3-element tuple distinguishes required and optional keys — both appear in 
 
 Use `None` to exclude an inherited wiring key: `__wiring__ = {"llm": None}`.
 
+### How do I wire to a capability without naming it?
+
+If the target registry uses a `key_separator`, name only the trailing segment. Conscribe expands it to every provider that offers it, so the same class works against any of them:
+
+```python
+# Registered: "browser.click", "desktop.click"
+
+class PortableAgent(BaseAgent):
+    __wiring__ = {"action": ("action", ["click"])}
+    # -> Literal["browser.click", "desktop.click"]
+```
+
+Write the full key (`"browser.click"`) to pin one provider instead. Both matches stay in the `Literal[...]` when a short name is ambiguous — deciding between them is your framework's job, at the point where it knows which providers are loaded.
+
 ## How do I get IDE autocomplete for wired attributes injected at runtime?
 
 If a class declares `__wiring__` for fields not in `__init__`, those attributes are invisible to the IDE. Use `generate-stubs` to create `.pyi` files:

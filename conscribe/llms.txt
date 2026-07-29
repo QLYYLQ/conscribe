@@ -1,6 +1,6 @@
 # Conscribe
 
-> Automatic class registration and config typing stub generation for layered Python architectures. Inheritance is registration. `__init__` signature is config schema.
+> Automatic class registration and config typing stub generation for layered Python architectures. Inheritance is registration. `__init__` signature *plus* `__wiring__` is config schema.
 
 Conscribe targets framework developers building config-driven frameworks with pluggable layers (agents, LLM providers, browser backends, etc.). It eliminates manual registry boilerplate and generates Pydantic-based config schemas from constructor signatures.
 
@@ -8,9 +8,11 @@ Conscribe targets framework developers building config-driven frameworks with pl
 - Two subsystems: registration (metaclass-based) and config typing (signature reflection)
 - Three registration paths: inheritance (auto), bridge (external classes), decorator (manual)
 - Four config tiers: plain `__init__` -> docstring -> Annotated[Field] -> explicit BaseModel
+- The `__init__` signature is the *primary* schema source, not the only one: `__wiring__` receptors are contributed on top of it, so a class with `def __init__(self) -> None` still emits its wired fields
 - Hierarchical keys with dotted segments (e.g., `"openai.azure"`) and tree queries
 - Cross-registry diamond inheritance via `|` operator (`metaclass=LLM.Meta | Agent.Meta`)
 - Cross-registry wiring via `__wiring__`: constrain config fields to `Literal[...]` from other registries (auto-discovery, explicit subset, required+optional subset, or literal list modes)
+- Capability-relative wiring keys: against a registry with a `key_separator`, `__wiring__` may name a bare trailing segment (`"click"`) which expands to every matching fully-qualified key (`browser.click`, `desktop.click`), so a class need not name a provider; a key that already contains the separator is passed through unchanged
 - `.pyi` stub generation for wired attributes: `generate-stubs` CLI command produces PEP 484 stubs so IDEs (PyCharm, VS Code, mypy) can see runtime-injected dependencies. Type narrowing resolves wired attributes to the most specific common ancestor of constrained classes (e.g., subset `["terminal.bash", "terminal.zsh"]` → type `Terminal`, not root protocol)
 - Predicate-based filter system with opt-out controls (`__skip_registries__`, `__propagate__`, `__registration_filter__`)
 - Nested compound discrimination: each key segment maps to a nested Pydantic sub-model with params split by MRO level

@@ -511,3 +511,256 @@ class TestWiringE2E:
 
         # __wired_fields__ metadata preserved
         assert model.__wired_fields__["loop"] == "e2e_loop9"
+
+
+# ---------------------------------------------------------------------------
+# Capability-relative (short) keys through the full pipeline
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class ActionProtocol(Protocol):
+    def act(self) -> None: ...
+
+
+def _build_action_layer(name: str):
+    """A hierarchical action registry with two capabilities and one collision."""
+    Action = create_registrar(
+        name, ActionProtocol, discriminator_field="action_id", key_separator="."
+    )
+
+    class ActionBase(metaclass=Action.Meta):
+        __abstract__ = True
+
+        def act(self) -> None: ...
+
+    class BrowserClick(ActionBase):
+        __registry_key__ = "browser.click"
+
+        def __init__(self, index: int = 0) -> None:
+            self.index = index
+
+    class DesktopClick(ActionBase):
+        __registry_key__ = "desktop.click"
+
+        def __init__(self, x: int = 0) -> None:
+            self.x = x
+
+    class BrowserScroll(ActionBase):
+        __registry_key__ = "browser.scroll"
+
+        def __init__(self, amount: int = 100) -> None:
+            self.amount = amount
+
+    return Action, ActionBase
+
+
+class TestCapabilityRelativeKeysE2E:
+    """A class that names no capability must still generate valid config.
+
+    Before this, ``__wiring__`` could only name fully-qualified keys, which
+    type-welded every declaring class to exactly one capability.
+    """
+
+    def test_codegen_widens_literal_across_capabilities(self):
+        """extractor.py call site."""
+        _build_action_layer("e2e_relkey_action1")
+        Agent = create_registrar(
+            "e2e_relkey_agent1", AgentProtocol, discriminator_field="name"
+        )
+
+        class BaseAgent(metaclass=Agent.Meta):
+            __abstract__ = True
+
+            def step(self, task: str) -> str: ...
+            def reset(self) -> None: ...
+
+        class PortableAgent(BaseAgent):
+            # Note: no capability named anywhere.
+            __wiring__ = {"action": ("e2e_relkey_action1", ["click"], ["scroll"])}
+
+            def __init__(self) -> None: ...
+
+            def step(self, task: str) -> str: ...
+            def reset(self) -> None: ...
+
+        class PinnedAgent(BaseAgent):
+            # Escape hatch: fully-qualified key pins one capability.
+            __wiring__ = {"action": ("e2e_relkey_action1", ["browser.click"])}
+
+            def __init__(self) -> None: ...
+
+            def step(self, task: str) -> str: ...
+            def reset(self) -> None: ...
+
+        result = build_layer_config(Agent)
+
+        portable = result.per_key_models["portable_agent"]
+        assert sorted(literal_keys(portable.model_fields["action"].annotation)) == [
+            "browser.click",
+            "browser.scroll",
+            "desktop.click",
+        ]
+
+        pinned = result.per_key_models["pinned_agent"]
+        assert literal_keys(pinned.model_fields["action"].annotation) == (
+            "browser.click",
+        )
+
+        # The generated source is valid Python and carries both shapes.
+        source = generate_layer_config_source(result)
+        assert "'browser.click', 'desktop.click', 'browser.scroll'" in source
+        compile(source, "<generated>", "exec")
+
+    def test_json_schema_enumerates_every_candidate(self):
+        Action, _ = _build_action_layer("e2e_relkey_action2")
+        Agent = create_registrar(
+            "e2e_relkey_agent2", AgentProtocol, discriminator_field="name"
+        )
+
+        class BaseAgent(metaclass=Agent.Meta):
+            __abstract__ = True
+
+            def step(self, task: str) -> str: ...
+            def reset(self) -> None: ...
+
+        class PortableAgent(BaseAgent):
+            __wiring__ = {"action": ("e2e_relkey_action2", ["click"])}
+
+            def __init__(self) -> None: ...
+
+            def step(self, task: str) -> str: ...
+            def reset(self) -> None: ...
+
+        schema = generate_layer_json_schema(build_layer_config(Agent))
+        text = str(schema)
+        assert "browser.click" in text and "desktop.click" in text
+
+    def test_validation_accepts_every_expansion(self):
+        _build_action_layer("e2e_relkey_action3")
+        Agent = create_registrar(
+            "e2e_relkey_agent3", AgentProtocol, discriminator_field="name"
+        )
+
+        class BaseAgent(metaclass=Agent.Meta):
+            __abstract__ = True
+
+            def step(self, task: str) -> str: ...
+            def reset(self) -> None: ...
+
+        class PortableAgent(BaseAgent):
+            __wiring__ = {"action": ("e2e_relkey_action3", ["click"])}
+            action: str
+
+            def __init__(self) -> None: ...
+
+            def step(self, task: str) -> str: ...
+            def reset(self) -> None: ...
+
+        model = build_layer_config(Agent).per_key_models["portable_agent"]
+        adapter = TypeAdapter(model)
+        assert adapter.validate_python(
+            {"name": "portable_agent", "action": "browser.click"}
+        ).action == "browser.click"
+        assert adapter.validate_python(
+            {"name": "portable_agent", "action": "desktop.click"}
+        ).action == "desktop.click"
+        with pytest.raises(Exception):
+            adapter.validate_python({"name": "portable_agent", "action": "click"})
+
+    def test_fingerprint_invalidates_when_a_capability_appears(self):
+        """fingerprint.py call site: a new match must widen the Literal.
+
+        If the fingerprint did not move, a stale generated config would
+        silently omit the new capability.
+        """
+        from conscribe import compute_registry_fingerprint
+
+        _, ActionBase = _build_action_layer("e2e_relkey_action4")
+        Agent = create_registrar(
+            "e2e_relkey_agent4", AgentProtocol, discriminator_field="name"
+        )
+
+        class BaseAgent(metaclass=Agent.Meta):
+            __abstract__ = True
+
+            def step(self, task: str) -> str: ...
+            def reset(self) -> None: ...
+
+        class PortableAgent(BaseAgent):
+            __wiring__ = {"action": ("e2e_relkey_action4", ["click"])}
+
+            def __init__(self) -> None: ...
+
+            def step(self, task: str) -> str: ...
+            def reset(self) -> None: ...
+
+        before = compute_registry_fingerprint(Agent)
+
+        class MobileClick(ActionBase):
+            __registry_key__ = "mobile.click"
+
+            def __init__(self, finger: int = 1) -> None: ...
+
+        assert compute_registry_fingerprint(Agent) != before
+
+    def test_stub_type_narrows_across_capabilities(self):
+        """collector.py call site: narrowing still resolves a common base."""
+        from conscribe.stubs.collector import collect_class_stub_info
+
+        _, ActionBase = _build_action_layer("e2e_relkey_action5")
+        Agent = create_registrar(
+            "e2e_relkey_agent5", AgentProtocol, discriminator_field="name"
+        )
+
+        class BaseAgent(metaclass=Agent.Meta):
+            __abstract__ = True
+
+            def step(self, task: str) -> str: ...
+            def reset(self) -> None: ...
+
+        class PortableAgent(BaseAgent):
+            __wiring__ = {"action": ("e2e_relkey_action5", ["click"])}
+
+            def __init__(self) -> None: ...
+
+            def step(self, task: str) -> str: ...
+            def reset(self) -> None: ...
+
+        info = collect_class_stub_info(PortableAgent)
+        assert info is not None
+        attr = next(a for a in info.injected_attrs if a.name == "action")
+        assert attr.resolved_type is ActionBase
+
+    def test_composed_config_inlines_every_candidate(self):
+        """Composed config widens the union, not just the Literal."""
+        from conscribe import build_composed_config, generate_composed_config_source
+
+        Action, _ = _build_action_layer("e2e_relkey_action6")
+        Agent = create_registrar(
+            "e2e_relkey_agent6", AgentProtocol, discriminator_field="name"
+        )
+
+        class BaseAgent(metaclass=Agent.Meta):
+            __abstract__ = True
+
+            def step(self, task: str) -> str: ...
+            def reset(self) -> None: ...
+
+        class PortableAgent(BaseAgent):
+            __wiring__ = {"action": ("e2e_relkey_action6", ["click"])}
+            action: list
+
+            def __init__(self) -> None: ...
+
+            def step(self, task: str) -> str: ...
+            def reset(self) -> None: ...
+
+        composed = build_composed_config(
+            {"e2e_relkey_agent6": Agent, "e2e_relkey_action6": Action},
+            inline_wiring=True,
+        )
+        source = generate_composed_config_source(composed)
+        assert "BrowserClickE2E_Relkey_Action6Config" in source
+        assert "DesktopClickE2E_Relkey_Action6Config" in source
+        compile(source, "<generated>", "exec")

@@ -50,8 +50,9 @@ The main path:
 6. **Get docstring descriptions**: parse Google/NumPy-style docstrings for Tier 1.5
 7. **Build field definitions**: for each param, extract type, default, FieldInfo, and description
 8. **Apply wiring**: resolve `__wiring__` declarations, constrain existing fields to `Literal[...]`, inject missing fields
-9. **Determine extra policy**: `"forbid"` if no `**kwargs` or fully resolved MRO; `"allow"` if truncated
-10. **Create model**: `pydantic.create_model()` with try/degrade fallback
+9. **Bail if empty**: return `None` only when the class contributes neither named `__init__` parameters *nor* wiring receptors. A class with `def __init__(self) -> None` and a `__wiring__` entry still produces a model containing that receptor (fixed in 1.3.0; before that the bail happened at step 3 and the receptor was lost).
+10. **Determine extra policy**: `"forbid"` if no `**kwargs` or fully resolved MRO; `"allow"` if truncated
+11. **Create model**: `pydantic.create_model()` with try/degrade fallback
 
 ### `extract_own_init_params(cls)`
 

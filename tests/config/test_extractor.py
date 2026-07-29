@@ -15,7 +15,7 @@ Organized by tier with class-based grouping per Test* convention.
 from __future__ import annotations
 
 import inspect
-from typing import Annotated, Any, Optional
+from typing import Annotated, Any, Optional, Protocol, runtime_checkable
 from unittest.mock import patch
 
 import pytest
@@ -1339,3 +1339,199 @@ class TestBaseModelFastPath:
         """BaseModel itself (not a subclass) does not trigger fast path."""
         result = extract_config_schema(BaseModel)
         assert result is None
+
+
+# ===================================================================
+# Regression: wiring receptors must survive a parameter-less __init__
+# ===================================================================
+
+class TestWiringSurvivesEmptyInit:
+    """``extract_config_schema`` used to bail before applying ``__wiring__``.
+
+    A class whose ``__init__`` declares no named parameters produced a
+    schema of ``None``, which the builder turns into a discriminator-only
+    model.  Every receptor the class declared or inherited through
+    ``__wiring__`` vanished silently: the dependency became unselectable
+    from YAML and bound to whatever default the framework used instead.
+
+    The only way to get the receptor back was to widen the signature with
+    a throw-away parameter, which is exactly the kind of workaround these
+    tests exist to make unnecessary.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _registry(self):
+        from conscribe.registration.registry import LayerRegistry, _deregister
+
+        @runtime_checkable
+        class _LLMProto(Protocol):
+            def generate(self) -> str: ...
+
+        reg = LayerRegistry("t_empty_init_llm", _LLMProto)
+        for key in ("openai", "anthropic"):
+            reg.add(key, type(f"Dummy{key}", (), {"generate": lambda self: ""}))
+        yield reg
+        _deregister("t_empty_init_llm")
+
+    def test_wired_slot_survives_empty_init(self) -> None:
+        """The headline case: no config knobs of its own, one wired slot."""
+
+        class Judge:
+            __wiring__ = {"llm": "t_empty_init_llm"}
+            llm: Any  # runtime slot the framework injects into
+
+            def __init__(self) -> None: ...
+
+        result = extract_config_schema(Judge)
+        assert result is not None, "wiring receptor was dropped"
+        assert "llm" in result.model_fields
+        # A real slot exists, so the receptor is required, not optional.
+        assert result.model_fields["llm"].is_required()
+
+    def test_wired_slot_accepts_only_registry_keys(self) -> None:
+        """The receptor is a real ``Literal``, not a free-form string."""
+
+        class Judge:
+            __wiring__ = {"llm": "t_empty_init_llm"}
+            llm: Any
+
+            def __init__(self) -> None: ...
+
+        result = extract_config_schema(Judge)
+        assert result is not None
+        assert result(llm="openai").llm == "openai"
+        with pytest.raises(Exception):
+            result(llm="not_a_registered_key")
+
+    def test_inherited_wiring_survives_empty_init(self) -> None:
+        """N3's exact shape: the receptor comes from a parent class."""
+
+        class JudgeBase:
+            __wiring__ = {"llm": "t_empty_init_llm"}
+            llm: Any
+
+            def __init__(self, temperature: float = 0.0) -> None: ...
+
+        class BrowseComp(JudgeBase):
+            def __init__(self) -> None: ...
+
+        result = extract_config_schema(BrowseComp)
+        assert result is not None
+        assert "llm" in result.model_fields
+
+    def test_slotless_wiring_survives_empty_init(self) -> None:
+        """Declaration-only wiring still emits an optional receptor."""
+
+        class Judge:
+            __wiring__ = {"llm": "t_empty_init_llm"}
+
+            def __init__(self) -> None: ...
+
+        result = extract_config_schema(Judge)
+        assert result is not None
+        assert "llm" in result.model_fields
+        assert not result.model_fields["llm"].is_required()
+
+    def test_kwargs_only_init_with_wiring_survives(self) -> None:
+        """``def __init__(self, **kwargs)`` is the other zero-param shape."""
+
+        class Hook:
+            __wiring__ = {"llm": "t_empty_init_llm"}
+            llm: Any
+
+            def __init__(self, **kwargs: Any) -> None: ...
+
+        result = extract_config_schema(Hook)
+        assert result is not None
+        assert "llm" in result.model_fields
+
+    def test_widener_param_is_no_longer_needed(self) -> None:
+        """The workaround and the fix must produce the same receptor.
+
+        Downstream code kept a dummy ``__init__`` parameter alive purely to
+        stop the bail from firing.  This asserts that deleting it changes
+        nothing about the wired field.
+        """
+
+        class WithWidener:
+            __wiring__ = {"llm": "t_empty_init_llm"}
+            llm: Any
+
+            def __init__(self, image_detail: str = "high") -> None: ...
+
+        class WithoutWidener:
+            __wiring__ = {"llm": "t_empty_init_llm"}
+            llm: Any
+
+            def __init__(self) -> None: ...
+
+        widened = extract_config_schema(WithWidener)
+        plain = extract_config_schema(WithoutWidener)
+        assert widened is not None and plain is not None
+        assert (
+            plain.model_fields["llm"].annotation
+            == widened.model_fields["llm"].annotation
+        )
+        # ...and the throw-away knob really is the only difference.
+        assert set(widened.model_fields) - set(plain.model_fields) == {"image_detail"}
+
+    def test_wired_fields_marker_is_attached(self) -> None:
+        """Codegen relies on ``__wired_fields__`` for its wiring comments."""
+
+        class Judge:
+            __wiring__ = {"llm": "t_empty_init_llm"}
+            llm: Any
+
+            def __init__(self) -> None: ...
+
+        result = extract_config_schema(Judge)
+        assert getattr(result, "__wired_fields__", None) == {"llm": "t_empty_init_llm"}
+
+    def test_empty_init_without_wiring_still_returns_none(self) -> None:
+        """The bail must still fire when there is genuinely nothing to emit."""
+
+        class Plain:
+            def __init__(self) -> None: ...
+
+        assert extract_config_schema(Plain) is None
+
+    def test_unresolvable_registry_still_returns_none(self) -> None:
+        """A wiring entry that cannot resolve must not fabricate a model."""
+
+        class Broken:
+            __wiring__ = {"llm": "no_such_registry_anywhere"}
+            llm: Any
+
+            def __init__(self) -> None: ...
+
+        assert extract_config_schema(Broken) is None
+
+    def test_selectable_from_config_end_to_end(self) -> None:
+        """The point of the fix: the dependency becomes selectable."""
+        from conscribe import create_registrar
+        from conscribe.registration.registry import _deregister
+
+        @runtime_checkable
+        class _JudgeProto(Protocol):
+            def evaluate(self) -> float: ...
+
+        Judge = create_registrar(
+            "t_empty_init_judge", _JudgeProto, discriminator_field="evaluator_id"
+        )
+        try:
+
+            class JudgeBase(metaclass=Judge.Meta):
+                __abstract__ = True
+                __wiring__ = {"llm": "t_empty_init_llm"}
+                llm: Any
+
+                def evaluate(self) -> float: ...
+
+            class BrowseComp(JudgeBase):
+                def __init__(self) -> None: ...
+
+            model = Judge.build_config().per_key_models["browse_comp"]
+            assert set(model.model_fields) == {"evaluator_id", "llm"}
+            assert model(llm="anthropic").llm == "anthropic"
+        finally:
+            _deregister("t_empty_init_judge")

@@ -15,6 +15,22 @@ Three grammar modes are supported::
 A ``None`` value excludes an inherited key::
 
     __wiring__ = {"llm": None}  # remove parent's llm wiring
+
+Capability-relative keys
+------------------------
+
+When the target registry was created with a ``key_separator`` (e.g.
+``create_registrar(..., key_separator=".")``), the explicit key lists of
+Mode 2 may name a **trailing segment** instead of a fully-qualified key::
+
+    __wiring__ = {"action": ("action", ["click"], ["scroll"])}
+
+``resolve_wiring`` expands ``"click"`` into every registered key whose
+trailing segment is ``click`` (``browser.click``, ``desktop.click``, ...).
+This is *not* a fourth grammar mode — it is a relaxation of how the key
+strings inside Mode 2 are matched.  A key that already contains the
+separator is passed through unchanged, which is the escape hatch for
+pinning one specific provider.
 """
 from __future__ import annotations
 
@@ -152,12 +168,97 @@ def parse_wiring(cls: type) -> list[WiringSpec]:
     return specs
 
 
+def expand_relative_keys(
+    declared: tuple[str, ...] | list[str],
+    registry_keys: list[str],
+    separator: str,
+) -> list[str]:
+    """Expand capability-relative (short) keys into fully-qualified keys.
+
+    A registry created with ``key_separator="."`` holds fully-qualified keys
+    such as ``browser.click`` / ``desktop.click``.  Requiring every
+    ``__wiring__`` declaration to spell out the provider prefix welds the
+    declaring class to one provider, even though "I need a *click*" is a
+    provider-independent statement.  This function lifts that restriction:
+
+    - A declared key that **contains** the separator is passed through
+      **unchanged**.  This is the escape hatch — spell out
+      ``"browser.click"`` and you get exactly ``browser.click``.
+    - A declared key that does **not** contain the separator is expanded
+      into every registered key whose trailing segment equals it.
+    - A short key matching nothing is passed through unchanged, so the
+      caller's normal "key not found" validation reports it as usual.
+    - When the registry has no separator (flat keys) nothing is expanded.
+
+    Ambiguity is deliberately **not** an error here
+    ------------------------------------------------
+    If ``"click"`` expands to several fully-qualified keys, *all* of them
+    are returned and all of them land in the generated ``Literal[...]``.
+    That is intentional, and it is the subtle part: conscribe's job is
+    **expansion**, not **arbitration**.
+
+    Config generation happens once, ahead of time, with no knowledge of
+    which providers a given assembled runtime will actually hold.  At that
+    moment every candidate is legitimately possible, so narrowing the
+    ``Literal`` to one of them would reject configs that are perfectly
+    valid for some other assembly.  Deciding *which* ``click`` is meant
+    requires knowing the concrete set of providers present, and only the
+    consuming framework knows that — at wiring/negotiation time, where it
+    can refuse a genuine collision with both candidates named, or pick the
+    single provider that is actually installed.
+
+    So: conscribe widens the type, the consumer narrows the instance.  Do
+    not "fix" this by raising on multiple matches — that would move a
+    runtime decision into a build-time one and break the very portability
+    the expansion exists to provide.
+
+    Args:
+        declared: Key strings exactly as written in ``__wiring__``.
+        registry_keys: All keys currently registered in the target registry.
+        separator: The target registry's ``key_separator`` (``""`` = flat).
+
+    Returns:
+        The expanded key list, order-preserving and de-duplicated.
+        Expansions of a single short key are sorted for determinism
+        (registration order must not leak into generated sources).
+    """
+    if not separator:
+        return list(declared)
+
+    expanded: list[str] = []
+    seen: set[str] = set()
+    for key in declared:
+        if separator in key:
+            # Already fully qualified — pass through untouched.
+            candidates = [key]
+        else:
+            candidates = sorted(
+                k for k in registry_keys if k.rsplit(separator, 1)[-1] == key
+            )
+            if not candidates:
+                # Unknown short name: keep it so the caller's missing-key
+                # check produces the normal error message.
+                candidates = [key]
+        for candidate in candidates:
+            if candidate not in seen:
+                seen.add(candidate)
+                expanded.append(candidate)
+    return expanded
+
+
 def resolve_wiring(cls: type) -> dict[str, ResolvedWiring]:
     """Resolve a class's ``__wiring__`` to concrete key lists.
 
     For Mode 1 (registry name string), looks up the registry and uses all its keys.
     For Mode 2 (tuple), validates that each key exists in the referenced registry.
     For Mode 3 (literal list), returns the list as-is.
+
+    Mode 2 key lists additionally support **capability-relative keys** when
+    the target registry declares a ``key_separator``: a bare trailing
+    segment (``"click"``) expands to every matching fully-qualified key
+    (``browser.click``, ``desktop.click``).  See
+    :func:`expand_relative_keys` for the expansion rules and for why an
+    ambiguous short name widens the ``Literal`` instead of raising.
 
     Args:
         cls: The class whose wiring to resolve.
@@ -209,8 +310,13 @@ def resolve_wiring(cls: type) -> dict[str, ResolvedWiring]:
                 )
 
             if spec.allowed_keys is not None:
-                # Mode 2: validate required subset
-                missing = [k for k in spec.allowed_keys if k not in registry_keys]
+                # Mode 2: expand capability-relative keys, then validate.
+                separator = getattr(registry, "separator", "")
+                required_keys = expand_relative_keys(
+                    spec.allowed_keys, registry_keys, separator
+                )
+
+                missing = [k for k in required_keys if k not in registry_keys]
                 if missing:
                     raise WiringResolutionError(
                         cls_name=cls_name,
@@ -226,7 +332,10 @@ def resolve_wiring(cls: type) -> dict[str, ResolvedWiring]:
                 # Validate optional keys if present
                 optional_resolved: list[str] | None = None
                 if spec.optional_keys is not None:
-                    missing_opt = [k for k in spec.optional_keys if k not in registry_keys]
+                    optional_keys = expand_relative_keys(
+                        spec.optional_keys, registry_keys, separator
+                    )
+                    missing_opt = [k for k in optional_keys if k not in registry_keys]
                     if missing_opt:
                         raise WiringResolutionError(
                             cls_name=cls_name,
@@ -238,11 +347,13 @@ def resolve_wiring(cls: type) -> dict[str, ResolvedWiring]:
                                 f"Available: {', '.join(sorted(registry_keys))}."
                             ),
                         )
-                    optional_resolved = list(spec.optional_keys)
+                    optional_resolved = optional_keys
                     # Combined: required + optional for Literal type generation
-                    allowed = list(spec.allowed_keys) + list(spec.optional_keys)
+                    allowed = required_keys + [
+                        k for k in optional_keys if k not in required_keys
+                    ]
                 else:
-                    allowed = list(spec.allowed_keys)
+                    allowed = list(required_keys)
             else:
                 # Mode 1: all keys
                 allowed = sorted(registry_keys)

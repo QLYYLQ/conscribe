@@ -1,11 +1,11 @@
 # Conscribe
 
-**Inheritance is registration. `__init__` signature is config schema.**
+**Inheritance is registration. `__init__` signature (plus `__wiring__`) is config schema.**
 
 Conscribe is a Python library that provides **automatic class registration** and **config typing stub generation** for layered architectures. It eliminates two categories of boilerplate:
 
 1. **Manual registration** — Write a class, inherit a base → it's registered. No `registry["foo"] = FooClass`.
-2. **Config guesswork** — Your `__init__` parameters become the config schema. IDE autocomplete and fail-fast validation come for free.
+2. **Config guesswork** — Your `__init__` parameters become the config schema, and `__wiring__` adds the cross-registry fields on top. IDE autocomplete and fail-fast validation come for free.
 
 ```
 pip install conscribe
@@ -164,6 +164,28 @@ The 3-element tuple distinguishes required and optional keys — both appear in 
 
 Inheritance: child `__wiring__` merges with parent (child keys override). Use `None` to exclude: `{"llm": None}`.
 
+A class that declares no config knobs of its own still gets its wired fields — `def __init__(self) -> None` produces a config model containing the receptors, not an empty one.
+
+#### Capability-relative keys
+
+When the target registry was created with a `key_separator`, an explicit key list may name a bare **trailing segment** instead of a fully-qualified key. Conscribe expands it to every registered key that ends with that segment, so a class does not have to name the provider it will run against:
+
+```python
+# Registered: "browser.click", "desktop.click", "browser.scroll"
+
+class PortableAgent(BaseAgent):
+    __wiring__ = {"action": ("action", ["click"], ["scroll"])}
+    # -> Literal["browser.click", "desktop.click", "browser.scroll"]
+
+class PinnedAgent(BaseAgent):
+    __wiring__ = {"action": ("action", ["browser.click"])}  # escape hatch
+    # -> Literal["browser.click"]
+```
+
+A key that already contains the separator is passed through unchanged. This is not a fifth mode — it only relaxes how the key strings inside the existing modes are matched, and it is inert for registries without a `key_separator`.
+
+If a short name matches several providers, **all** of them land in the `Literal[...]`. Conscribe expands; it does not arbitrate. Config generation cannot know which providers a given assembled runtime will hold, so every candidate is legitimately possible at that point; picking one belongs to the consuming framework, at the moment it knows the concrete provider set.
+
 ### Composed Config (Multi-Layer Inline Wiring)
 
 Combine multiple layers into a single config schema. Wired fields become full inline config objects instead of key selectors — enabling recursive IDE autocompletion across layers:
@@ -230,7 +252,7 @@ class LLMAgent(metaclass=CombinedMeta):
 
 | API | Purpose |
 |-----|---------|
-| `extract_config_schema(cls, mro_scope, mro_depth)` | Extract Pydantic model from `__init__` |
+| `extract_config_schema(cls, mro_scope, mro_depth)` | Extract Pydantic model from `__init__` + `__wiring__` |
 | `build_layer_config(registrar)` | Build discriminated union (flat or nested mode) |
 | `generate_layer_config_source(result)` | Generate Python stub source code |
 | `generate_layer_json_schema(result)` | Generate JSON Schema |
@@ -245,7 +267,7 @@ class LLMAgent(metaclass=CombinedMeta):
 ## Design Principles
 
 - **Zero registration burden** — Inherit a base class = registered
-- **`__init__` is the single source of truth** — No duplicate config definitions
+- **`__init__` + `__wiring__` are the single source of truth** — No duplicate config definitions
 - **Fail-fast** — Duplicate keys raise immediately; invalid config rejects at startup
 - **Domain-agnostic** — Pure infrastructure, knows nothing about agents or LLMs
 - **Stubs and runtime are separate** — Stale stubs don't affect correctness

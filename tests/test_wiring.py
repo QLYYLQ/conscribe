@@ -11,6 +11,7 @@ from conscribe.wiring import (
     WiredField,
     WiringSpec,
     collect_wiring_from_mro,
+    expand_relative_keys,
     inject_wired_descriptors,
     parse_wiring,
     resolve_wiring,
@@ -41,9 +42,11 @@ def _cleanup_registries():
             _deregister(name)
 
 
-def _make_registry(name: str, protocol: type, keys: list[str]) -> LayerRegistry:
+def _make_registry(
+    name: str, protocol: type, keys: list[str], *, separator: str = ""
+) -> LayerRegistry:
     """Helper to create a populated test registry."""
-    reg = LayerRegistry(name, protocol)
+    reg = LayerRegistry(name, protocol, separator=separator)
     for key in keys:
         # Create a dummy class for each key
         dummy = type(f"Dummy_{key}", (), {"run": lambda self: None, "generate": lambda self: ""})
@@ -365,6 +368,219 @@ class TestResolveWiring:
         resolved = resolve_wiring(Agent)
         assert resolved["llm"].optional_keys is None
         assert resolved["llm"].allowed_keys == ["openai"]
+
+
+# ---------------------------------------------------------------------------
+# Tests: capability-relative (short) key expansion
+# ---------------------------------------------------------------------------
+
+
+class TestExpandRelativeKeys:
+    """Unit tests for the expansion helper itself."""
+
+    KEYS = ["browser.click", "desktop.click", "browser.scroll", "mobile.tap"]
+
+    def test_flat_registry_is_untouched(self):
+        """No separator -> nothing is expanded (flat registries unaffected)."""
+        assert expand_relative_keys(("click",), ["click", "scroll"], "") == ["click"]
+
+    def test_short_key_expands_to_all_matching(self):
+        assert expand_relative_keys(("click",), self.KEYS, ".") == [
+            "browser.click",
+            "desktop.click",
+        ]
+
+    def test_qualified_key_passes_through_unchanged(self):
+        """The escape hatch: a key containing the separator is not touched."""
+        assert expand_relative_keys(("browser.click",), self.KEYS, ".") == [
+            "browser.click"
+        ]
+
+    def test_unique_short_key_expands_to_one(self):
+        assert expand_relative_keys(("scroll",), self.KEYS, ".") == ["browser.scroll"]
+
+    def test_unknown_short_key_passes_through(self):
+        """Left alone so the caller's missing-key check reports it normally."""
+        assert expand_relative_keys(("nope",), self.KEYS, ".") == ["nope"]
+
+    def test_only_trailing_segment_matches(self):
+        """``browser`` is a prefix, not a trailing segment -> no expansion."""
+        assert expand_relative_keys(("browser",), self.KEYS, ".") == ["browser"]
+
+    def test_deep_key_matches_last_segment_only(self):
+        keys = ["a.b.click", "x.click"]
+        assert expand_relative_keys(("click",), keys, ".") == ["a.b.click", "x.click"]
+
+    def test_expansion_is_sorted_not_registration_ordered(self):
+        """Registration order must not leak into generated sources."""
+        shuffled = ["zeta.click", "alpha.click", "mid.click"]
+        assert expand_relative_keys(("click",), shuffled, ".") == [
+            "alpha.click",
+            "mid.click",
+            "zeta.click",
+        ]
+
+    def test_declaration_order_preserved_across_keys(self):
+        assert expand_relative_keys(("scroll", "click"), self.KEYS, ".") == [
+            "browser.scroll",
+            "browser.click",
+            "desktop.click",
+        ]
+
+    def test_overlap_between_short_and_qualified_is_deduped(self):
+        assert expand_relative_keys(("browser.click", "click"), self.KEYS, ".") == [
+            "browser.click",
+            "desktop.click",
+        ]
+
+    def test_flat_key_registered_alongside_qualified_ones(self):
+        """An unprefixed registered key is itself a trailing-segment match."""
+        keys = ["click", "browser.click"]
+        assert expand_relative_keys(("click",), keys, ".") == ["browser.click", "click"]
+
+    def test_non_dot_separator(self):
+        keys = ["browser/click", "desktop/click"]
+        assert expand_relative_keys(("click",), keys, "/") == [
+            "browser/click",
+            "desktop/click",
+        ]
+
+
+class TestResolveWiringRelativeKeys:
+    """``resolve_wiring`` end of the same feature."""
+
+    def _registry(self, name: str) -> LayerRegistry:
+        return _make_registry(
+            name,
+            LoopProtocol,
+            ["browser.click", "desktop.click", "browser.scroll", "mobile.tap"],
+            separator=".",
+        )
+
+    def test_short_required_key_resolves(self):
+        """This is the regression: a short key used to be a hard error."""
+        self._registry("test_rel1")
+
+        class PortableAgent:
+            __wiring__ = {"action": ("test_rel1", ["click"])}
+
+        resolved = resolve_wiring(PortableAgent)
+        assert resolved["action"].allowed_keys == ["browser.click", "desktop.click"]
+
+    def test_short_optional_key_resolves(self):
+        self._registry("test_rel2")
+
+        class PortableAgent:
+            __wiring__ = {"action": ("test_rel2", ["click"], ["scroll"])}
+
+        resolved = resolve_wiring(PortableAgent)
+        assert resolved["action"].allowed_keys == [
+            "browser.click",
+            "desktop.click",
+            "browser.scroll",
+        ]
+        assert resolved["action"].optional_keys == ["browser.scroll"]
+
+    def test_qualified_key_still_pins_one_provider(self):
+        """Escape hatch survives: naming the provider narrows the Literal."""
+        self._registry("test_rel3")
+
+        class PinnedAgent:
+            __wiring__ = {"action": ("test_rel3", ["browser.click"])}
+
+        resolved = resolve_wiring(PinnedAgent)
+        assert resolved["action"].allowed_keys == ["browser.click"]
+
+    def test_mixed_short_and_qualified(self):
+        self._registry("test_rel4")
+
+        class MixedAgent:
+            __wiring__ = {"action": ("test_rel4", ["desktop.click", "scroll"])}
+
+        resolved = resolve_wiring(MixedAgent)
+        assert resolved["action"].allowed_keys == ["desktop.click", "browser.scroll"]
+
+    def test_unknown_short_key_still_raises(self):
+        self._registry("test_rel5")
+
+        class BadAgent:
+            __wiring__ = {"action": ("test_rel5", ["teleport"])}
+
+        with pytest.raises(WiringResolutionError, match="teleport"):
+            resolve_wiring(BadAgent)
+
+    def test_unknown_short_optional_key_still_raises(self):
+        self._registry("test_rel6")
+
+        class BadAgent:
+            __wiring__ = {"action": ("test_rel6", ["click"], ["teleport"])}
+
+        with pytest.raises(WiringResolutionError, match="Optional keys not found"):
+            resolve_wiring(BadAgent)
+
+    def test_flat_registry_short_key_unchanged(self):
+        """Registries without a separator behave exactly as before."""
+        _make_registry("test_rel7", LoopProtocol, ["react", "codeact"])
+
+        class Agent:
+            __wiring__ = {"loop": ("test_rel7", ["react"])}
+
+        assert resolve_wiring(Agent)["loop"].allowed_keys == ["react"]
+
+    def test_flat_registry_missing_key_still_raises(self):
+        """Empty separator must not accidentally match everything."""
+        _make_registry("test_rel8", LoopProtocol, ["react"])
+
+        class Agent:
+            __wiring__ = {"loop": ("test_rel8", ["nope"])}
+
+        with pytest.raises(WiringResolutionError, match="nope"):
+            resolve_wiring(Agent)
+
+    def test_mode1_auto_discovery_unaffected(self):
+        self._registry("test_rel9")
+
+        class Agent:
+            __wiring__ = {"action": "test_rel9"}
+
+        resolved = resolve_wiring(Agent)
+        assert resolved["action"].allowed_keys == [
+            "browser.click",
+            "browser.scroll",
+            "desktop.click",
+            "mobile.tap",
+        ]
+
+    def test_mode3_literal_list_unaffected(self):
+        """Mode 3 has no registry, so nothing is expanded."""
+
+        class Agent:
+            __wiring__ = {"browser": ["click", "scroll"]}
+
+        assert resolve_wiring(Agent)["browser"].allowed_keys == ["click", "scroll"]
+
+    def test_required_and_optional_overlap_is_deduped(self):
+        self._registry("test_rel10")
+
+        class Agent:
+            __wiring__ = {"action": ("test_rel10", ["click"], ["browser.click"])}
+
+        resolved = resolve_wiring(Agent)
+        assert resolved["action"].allowed_keys == ["browser.click", "desktop.click"]
+
+    def test_expansion_widens_when_a_new_provider_registers(self):
+        """Ambiguity is expansion, not arbitration -- conscribe never refuses."""
+        reg = self._registry("test_rel11")
+
+        class Agent:
+            __wiring__ = {"action": ("test_rel11", ["tap"])}
+
+        assert resolve_wiring(Agent)["action"].allowed_keys == ["mobile.tap"]
+
+        dummy = type("Dummy_pad_tap", (), {"run": lambda self: None})
+        reg.add("pad.tap", dummy)
+
+        assert resolve_wiring(Agent)["action"].allowed_keys == ["mobile.tap", "pad.tap"]
 
 
 # ---------------------------------------------------------------------------

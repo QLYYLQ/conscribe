@@ -481,6 +481,17 @@ The 3-element tuple form `(registry, required_keys, optional_keys)` distinguishe
 - If the param exists in `__init__`: type is constrained from `str` to `Literal[...keys...]`
 - If the param does NOT exist in `__init__`: injected as a new required field with `Literal[...keys...]` type
 - Generated stubs annotate wired fields: `loop: Literal["react"] = ...  # wired from: agent_loop`
+- A class whose `__init__` takes no named parameters still emits its wired fields; the schema is not reduced to a discriminator-only model (since 1.3.0)
+
+**Capability-relative keys (since 1.3.0):** when the target registry declares a `key_separator`, an explicit key list may name a bare trailing segment, which expands to every registered key ending in that segment:
+
+```python
+# Registered: "browser.click", "desktop.click", "browser.scroll"
+__wiring__ = {"action": ("action", ["click"], ["scroll"])}
+# -> Literal["browser.click", "desktop.click", "browser.scroll"]
+```
+
+A key that already contains the separator is passed through unchanged (the escape hatch for pinning one provider). Registries without a `key_separator` are unaffected. Multiple matches are **all** kept: conscribe expands, the consuming framework arbitrates once it knows which providers are actually present. See `expand_relative_keys()`.
 
 **Inheritance:** Deep-merged along MRO. Child keys override parent keys. `None` excludes an inherited key:
 
@@ -526,5 +537,5 @@ All inherit from `RegistryError`.
 | `__config_annotated_only__` | `bool` | Only include `Annotated[..., Field()]` params |
 | `__config_mro_scope__` | `MROScope` | Per-class MRO scope override |
 | `__config_mro_depth__` | `int \| None` | Per-class MRO depth override |
-| `__wiring__` | `dict[str, str \| tuple \| list \| None]` | Cross-registry field constraints (4 modes + None for exclusion) |
+| `__wiring__` | `dict[str, str \| tuple \| list \| None]` | Cross-registry field constraints (4 modes + None for exclusion; explicit keys may be capability-relative when the target registry has a `key_separator`) |
 | `__wired_fields__` | `dict[str, str]` | Set by extractor: maps wired field names to registry names (read-only) |

@@ -154,12 +154,18 @@ def extract_config_schema(
             elif hints is None and mro_result.hints:
                 hints = dict(mro_result.hints)
 
-    # -- No named params -> None --
-    if not named_params:
-        return None
+    # NOTE: an empty ``named_params`` is deliberately *not* an early exit.
+    # A class whose ``__init__`` takes no named parameters can still own
+    # ``__wiring__`` receptors (its own or inherited along the MRO).
+    # Bailing here used to drop them silently, leaving a discriminator-only
+    # model — the dependency then became unselectable from config and
+    # bound to a default instead.  The "nothing to emit" check now lives
+    # after ``_apply_wiring`` below.
 
-    if hints is None:
-        # Both get_type_hints and signature annotations failed
+    if hints is None and named_params:
+        # Both get_type_hints and signature annotations failed, and there
+        # are params that would need them.  (With no params there is
+        # nothing to type, so keep going for the wiring pass.)
         return None
 
     # -- Get docstring descriptions for fallback --
@@ -240,6 +246,13 @@ def extract_config_schema(
 
     # -- Apply __wiring__ constraints / injection --
     wired_fields = _apply_wiring(cls, field_definitions)
+
+    # -- Nothing to emit -> None --
+    # Only when the class contributes *neither* named ``__init__``
+    # parameters *nor* wiring receptors.  A param-less class that carries
+    # wiring still gets a real model.
+    if not named_params and not field_definitions:
+        return None
 
     # -- Determine extra policy --
     if has_var_kw and mro_result is not None and mro_result.params:

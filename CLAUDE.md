@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Conscribe** (`conscribe` package, v1.2.0) — A Python library for automatic class registration and config typing stub generation for layered Python architectures. It targets framework developers building config-driven frameworks with pluggable layers (agents, LLM providers, etc.).
+**Conscribe** (`conscribe` package, v1.3.0) — A Python library for automatic class registration and config typing stub generation for layered Python architectures. It targets framework developers building config-driven frameworks with pluggable layers (agents, LLM providers, etc.).
 
 Six core capabilities:
 1. **Auto-registration**: Classes inheriting a base are automatically registered in their layer's registry (via metaclass). Also supports bridging external classes and explicit `@register` decorators.
@@ -54,7 +54,7 @@ pytest is pre-configured in `pyproject.toml` with `--cov=conscribe --cov-report=
 
 **Config Typing** (`conscribe/config/`):
 - Pipeline: **extract** → **build** → **generate**
-- `extractor.py` — `extract_config_schema()` reflects `__init__` signatures into Pydantic models. Three tiers: Tier 1 (types+defaults), Tier 1.5 (+docstring descriptions), Tier 2 (+Annotated metadata), Tier 3 (explicit `__config_schema__`). MRO-aware. Also provides `extract_own_init_params()` for per-class param extraction (used by nested builder).
+- `extractor.py` — `extract_config_schema()` reflects `__init__` signatures into Pydantic models, then adds `__wiring__` receptors. Returns `None` only when the class contributes neither named params nor receptors — an empty `__init__` plus wiring still yields a model (**v1.3.0**; before that the early bail silently dropped the receptors). Note the sibling bail is still unfixed: when *no* class in the MRO defines `__init__`, `find_init_definer()` returns `None` and extraction stops before wiring. Three tiers: Tier 1 (types+defaults), Tier 1.5 (+docstring descriptions), Tier 2 (+Annotated metadata), Tier 3 (explicit `__config_schema__`). MRO-aware. Also provides `extract_own_init_params()` for per-class param extraction (used by nested builder).
 - `mro.py` — `collect_mro_params()` walks the MRO upward when `__init__` has `**kwargs`, collecting parent parameters. `classify_class_scope()` determines whether a class is local/third_party/stdlib. `MROScope` type alias (`"local" | "third_party" | "all"`).
 - `degradation.py` — Type degradation for Pydantic-incompatible field types. Try-first approach: zero overhead on happy path.
 - `builder.py` — Two builder paths:
@@ -72,7 +72,8 @@ pytest is pre-configured in `pyproject.toml` with `--cov=conscribe --cov-report=
 - `inject_wired_descriptors(cls)` — Sets `WiredField` descriptors on `cls` for each wired field not in `__init__`. Called from `AutoRegistrar.__new__` (Path A), `register()` (Path C), and `_inject_auto_registration.__init_subclass__` (Path C propagate). Uses `collect_wiring_from_mro()` — no registry resolution needed, avoiding timing issues with unpopulated registries.
 - `collect_wiring_from_mro(cls)` — Walks MRO bottom-up to deep-merge `__wiring__` dicts. `None` value excludes inherited keys.
 - `parse_wiring(cls)` — Normalizes `__wiring__` dict to `WiringSpec` list.
-- `resolve_wiring(cls)` — Resolves specs to concrete key lists via `get_registry()`. Raises `WiringResolutionError` on failures.
+- `resolve_wiring(cls)` — Resolves specs to concrete key lists via `get_registry()`. Raises `WiringResolutionError` on failures. Expands capability-relative keys first (see below).
+- `expand_relative_keys(declared, registry_keys, separator)` — **(v1.3.0)** Expands a bare trailing segment (`"click"`) into every registered fully-qualified key ending in it (`browser.click`, `desktop.click`). Keys already containing the separator pass through unchanged (escape hatch); unknown short names pass through so the caller's missing-key error still fires; a registry with no separator is a no-op. Multiple matches are ALL kept — conscribe expands, the consumer arbitrates at the point where it knows which providers are loaded. Do not "fix" this by raising on ambiguity.
 
 **Stubs** (`conscribe/stubs/`):
 - `collector.py` — `collect_class_stub_info(cls)` reflects `__init__` signatures, wiring, and own class-level annotations to produce `ClassStubInfo`. Only returns info for classes with *injected* wired fields (not in `__init__`). `narrowest_common_base(classes, fallback)` computes the most specific common ancestor via MRO intersection for type narrowing. `ClassAttrStub` captures dataclass-style class-body annotations (`use_vision: bool = False`) so IDEs see them as class attributes in the rendered stub, not just as `__init__` params.
@@ -100,7 +101,7 @@ pytest is pre-configured in `pyproject.toml` with `--cov=conscribe --cov-report=
 - `__config_mro_scope__` — Per-class override for MRO traversal scope (`"local"`, `"third_party"`, `"all"`).
 - `__config_mro_depth__` — Per-class override for MRO traversal depth (int or None).
 - `__degraded_fields__` — Attached to dynamically created models by `extract_config_schema()` when field types were degraded to `Any`. List of `DegradedField` instances. Only present when degradation occurred (zero overhead on happy path).
-- `__wiring__` — Cross-registry field constraints. Dict mapping param names to registry references. Three modes: `{"loop": "agent_loop"}` (all keys), `{"loop": ("agent_loop", ["react"])}` (subset), `{"browser": ["chromium"]}` (literal list). Mode 2 also supports 3-element tuple: `{"obs": ("observation", ["terminal"], ["filesystem"])}` (required + optional). `None` value excludes inherited key. Deep-merged along MRO.
+- `__wiring__` — Cross-registry field constraints. Dict mapping param names to registry references. Explicit key lists may use capability-relative keys against a registry with a `key_separator` (v1.3.0). Three modes: `{"loop": "agent_loop"}` (all keys), `{"loop": ("agent_loop", ["react"])}` (subset), `{"browser": ["chromium"]}` (literal list). Mode 2 also supports 3-element tuple: `{"obs": ("observation", ["terminal"], ["filesystem"])}` (required + optional). `None` value excludes inherited key. Deep-merged along MRO.
 
 ### Wired field *shape* in generated configs (v1.2.0)
 

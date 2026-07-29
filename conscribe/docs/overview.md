@@ -17,7 +17,7 @@ That's N x (registry + factory + protocol + schema) = a lot of boilerplate that 
 
 **1. Inheritance is registration.** When you write `class ChatOpenAI(ChatBaseModel)`, the class is automatically registered in the LLM registry. No decorators. No `registry["openai"] = ChatOpenAI`. Just Python inheritance.
 
-**2. `__init__` signature is config schema.** Conscribe reflects your constructor parameters into Pydantic models, builds discriminated unions, and generates stub files for IDE autocomplete. Your `__init__` is the single source of truth.
+**2. `__init__` signature is config schema.** Conscribe reflects your constructor parameters into Pydantic models, builds discriminated unions, and generates stub files for IDE autocomplete. Your `__init__` is the primary source of truth — `__wiring__` receptors are contributed on top of it, so a class with no constructor parameters of its own still gets its wired fields.
 
 ## Two Subsystems
 
