@@ -27,7 +27,12 @@ htmlcov/
 *.swo
 *~
 
+# Local agent settings (repository skills under .agents/ remain tracked)
+.claude/settings.local.json
 
 # OS
 .DS_Store
 Thumbs.db
+
+# Throwaway scripts (never committed)
+.scratch/

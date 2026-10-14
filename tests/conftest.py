@@ -9,6 +9,12 @@ import pytest
 from typing import Protocol, runtime_checkable
 
 from conscribe import create_registrar
+from conscribe.testing import isolated_registries
+
+# The opt-in isolation fixture (``conscribe_isolated``) and pytester for the
+# plugin's own tests.  Loaded here, never with ``-p``: ``-p`` imports the
+# plugin before pytest-cov starts measuring.
+pytest_plugins = ["conscribe.testing.pytest_plugin", "pytester"]
 
 
 # ---------------------------------------------------------------------------
@@ -65,69 +71,60 @@ class NotRuntimeCheckable(Protocol):
 
 
 # ---------------------------------------------------------------------------
-# Registrar fixtures (with cleanup)
+# Registrar fixtures (isolated: the registrar, everything registered with it
+# during the test, and any registry its name shadowed are restored afterwards)
 # ---------------------------------------------------------------------------
+
+def _isolated_registrar(name: str, protocol: type, **options):
+    with isolated_registries():
+        yield create_registrar(name, protocol, **options)
+
 
 @pytest.fixture
 def agent_registrar():
     """Create Agent layer registrar (simulates Alice's first step)."""
-    registrar = create_registrar(
+    yield from _isolated_registrar(
         "agent",
         AgentProtocol,
         strip_suffixes=["Agent"],
         discriminator_field="name",
     )
-    yield registrar
-    for key in list(registrar.keys()):
-        registrar.unregister(key)
 
 
 @pytest.fixture
 def llm_registrar():
     """Create LLM Provider layer registrar."""
-    registrar = create_registrar(
+    yield from _isolated_registrar(
         "llm",
         LLMProtocol,
         strip_suffixes=["LLM", "Provider"],
         discriminator_field="provider",
     )
-    yield registrar
-    for key in list(registrar.keys()):
-        registrar.unregister(key)
 
 
 @pytest.fixture
 def browser_registrar():
     """Create Browser Provider layer registrar."""
-    registrar = create_registrar(
+    yield from _isolated_registrar(
         "browser",
         BrowserProtocol,
         strip_suffixes=["Provider", "Browser"],
         discriminator_field="id",
     )
-    yield registrar
-    for key in list(registrar.keys()):
-        registrar.unregister(key)
 
 
 @pytest.fixture
 def simple_registrar():
     """Minimal registrar for basic unit tests."""
-    registrar = create_registrar("test", SimpleProtocol)
-    yield registrar
-    for key in list(registrar.keys()):
-        registrar.unregister(key)
+    yield from _isolated_registrar("test", SimpleProtocol)
 
 
 @pytest.fixture
 def evaluator_registrar():
     """Create Evaluator layer registrar."""
-    registrar = create_registrar(
+    yield from _isolated_registrar(
         "evaluator",
         EvaluatorProtocol,
         strip_suffixes=["Evaluator"],
         discriminator_field="evaluator",
     )
-    yield registrar
-    for key in list(registrar.keys()):
-        registrar.unregister(key)

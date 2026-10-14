@@ -9,9 +9,7 @@ scenario it guards against, not the line number it covers.
 """
 from __future__ import annotations
 
-import inspect
 import json
-import sys
 from pathlib import Path
 from typing import (
     Any,
@@ -25,7 +23,7 @@ from typing import (
 from unittest.mock import patch
 
 import pytest
-from pydantic import BaseModel, Field
+from pydantic import Field
 
 from conscribe import create_registrar
 
@@ -106,7 +104,7 @@ class TestCodegenTypeEdgeCases:
     def test_three_way_union_with_none_renders_all_members(self) -> None:
         """``Union[str, int, None]`` is NOT a simple Optional, so codegen
         must render each member including ``None`` for NoneType."""
-        from conscribe.config.codegen import _type_to_source
+        from tests.config.artifact_parity import type_to_source as _type_to_source
 
         source = _type_to_source(Union[str, int, None])
         # NoneType must appear as "None", not "NoneType"
@@ -114,36 +112,28 @@ class TestCodegenTypeEdgeCases:
         assert "str" in source
         assert "int" in source
 
-    def test_annotated_type_unwraps_to_base_in_source(self) -> None:
-        """``Annotated[int, Field(ge=0)]`` should render as just ``int``
-        in generated source (the metadata lives in the Field, not the type)."""
-        from conscribe.config.codegen import _type_to_source
+    def test_annotated_type_keeps_its_constraints_in_source(self) -> None:
+        """``Annotated[int, Field(ge=0)]`` inside a type expression keeps its
+        constraint (conscribe 2.0: nested constraints are rendered, not dropped)."""
+        from tests.config.artifact_parity import type_to_source as _type_to_source
 
         source = _type_to_source(Annotated[int, Field(ge=0)])
-        assert source == "int"
-
-    def test_annotated_union_import_collection(self) -> None:
-        """When a field has ``Annotated[Union[str, int], ...]``, the import
-        collector must recurse through Annotated to find the Union inside."""
-        from conscribe.config.codegen import _collect_type_imports
-
-        imports: set[str] = set()
-        _collect_type_imports(Annotated[Union[str, int], Field()], imports)
-        assert "Union" in imports
+        assert source == "Annotated[int, Field(ge=0)]"
 
     def test_bare_generic_renders_as_plain_name(self) -> None:
         """``typing.List`` (unsubscripted) should render as ``list``,
         not ``list[]`` or crash."""
         import typing
-        from conscribe.config.codegen import _type_to_source
+        from tests.config.artifact_parity import type_to_source as _type_to_source
 
         assert _type_to_source(typing.List) == "list"
         assert _type_to_source(typing.Dict) == "dict"
 
-    def test_type_without_dunder_name_falls_back_to_repr(self) -> None:
-        """A synthetic type object that lacks ``__name__`` must not crash;
-        the repr fallback should produce *some* string."""
-        from conscribe.config.codegen import _get_type_name
+    def test_type_without_dunder_name_is_refused(self) -> None:
+        """A synthetic type object that lacks ``__name__`` cannot be written
+        as source; conscribe 2.0 raises instead of emitting its repr."""
+        from tests.config.artifact_parity import type_to_source as _type_to_source
+        from conscribe.exceptions import ConfigRenderError
 
         # Real types always have __name__; simulate a synthetic type-like
         # object that lacks it (e.g. a runtime-generated generic alias).
@@ -152,15 +142,13 @@ class TestCodegenTypeEdgeCases:
             def __repr__(self) -> str:
                 return "<FakeType>"
 
-        fake = _FakeType()
-        # _FakeType instances don't have __name__, and it's not Any
-        result = _get_type_name(fake)
-        assert result == "<FakeType>"
+        with pytest.raises(ConfigRenderError):
+            _type_to_source(_FakeType())
 
     def test_ellipsis_default_renders_as_three_dots(self) -> None:
         """A FieldInfo whose default is ``...`` (Ellipsis) must render
         as ``...`` in source, not ``Ellipsis``."""
-        from conscribe.config.codegen import _value_to_source
+        from tests.config.artifact_parity import value_to_source as _value_to_source
 
         assert _value_to_source(...) == "..."
 
@@ -168,7 +156,7 @@ class TestCodegenTypeEdgeCases:
         """Default values that are not str/int/float/bool/list/dict
         (e.g. tuple, frozenset, custom objects) must fall back to repr
         without crashing."""
-        from conscribe.config.codegen import _value_to_source
+        from tests.config.artifact_parity import value_to_source as _value_to_source
 
         assert _value_to_source((1, 2, 3)) == repr((1, 2, 3))
         assert _value_to_source(frozenset({1})) == repr(frozenset({1}))
@@ -177,7 +165,7 @@ class TestCodegenTypeEdgeCases:
         """String defaults containing quotes or backslashes must be
         safely escaped via repr, not naively wrapped in double quotes
         (which would enable code injection in generated .py files)."""
-        from conscribe.config.codegen import _value_to_source
+        from tests.config.artifact_parity import value_to_source as _value_to_source
 
         dangerous = 'x"; import os; os.system("id"); x="'
         source = _value_to_source(dangerous)
@@ -262,150 +250,28 @@ class TestExtractorEdgeCases:
         with pytest.raises(Exception):
             schema(x=101)
 
-    def test_hints_totally_unavailable_returns_none_not_crash(self) -> None:
-        """If ``get_type_hints`` fails *and* the fallback annotation
-        resolution also fails (e.g. a C extension class), the extractor
-        must return None gracefully — not crash with an AttributeError
-        or attempt to build a model from no information."""
+    def test_unreadable_init_signature_warns_not_crash(self) -> None:
+        """A constructor conscribe cannot introspect (e.g. a C extension
+        or an opaque callable) must not crash extraction and must not be
+        silent: an ``ExtractionWarning`` names the class, and the config
+        accepts unknown keys rather than rejecting every real knob."""
         from conscribe.config.extractor import extract_config_schema
+        from conscribe.exceptions import ExtractionWarning
 
-        # Create a class with params via exec (no annotations)
-        ns = {}
-        exec(
-            "class Opaque:\n"
-            "    def __init__(self, x, y):\n"
-            "        pass\n",
-            ns,
-        )
+        class _Opaque:
+            __signature__ = "not a signature"
 
-        with patch(
-            "conscribe.config.extractor._safe_get_type_hints",
-            return_value=None,
-        ):
-            result = extract_config_schema(ns["Opaque"])
+            def __call__(self, *args: Any, **kwargs: Any) -> None: ...
 
-        assert result is None
+        class Opaque:
+            __init__ = _Opaque()
 
-    def test_safe_get_type_hints_with_empty_annotations(self) -> None:
-        """When ``get_type_hints`` raises (unusual) and the function has
-        no ``__annotations__`` at all, the fallback should return None
-        cleanly — not attempt to iterate an empty dict."""
-        from conscribe.config.extractor import _safe_get_type_hints
+        with pytest.warns(ExtractionWarning, match="Opaque"):
+            result = extract_config_schema(Opaque)
 
-        def bare_func():
-            pass
-
-        with patch(
-            "conscribe.config.extractor.get_type_hints",
-            side_effect=TypeError("forced failure"),
-        ):
-            result = _safe_get_type_hints(bare_func)
-
-        assert result is None
-
-    def test_safe_get_type_hints_keeps_preresolved_annotations(self) -> None:
-        """When ``get_type_hints`` raises but ``__annotations__`` contains
-        actual type objects (not strings), the fallback must keep them
-        as-is rather than trying to ``eval()`` a type object."""
-        from conscribe.config.extractor import _safe_get_type_hints
-
-        def func(x):
-            pass
-        func.__annotations__ = {"x": int}
-
-        with patch(
-            "conscribe.config.extractor.get_type_hints",
-            side_effect=TypeError("forced failure"),
-        ):
-            result = _safe_get_type_hints(func)
-
-        assert result == {"x": int}
-
-    def test_safe_get_type_hints_fallback_resolves_field_annotations(self) -> None:
-        """When ``get_type_hints`` fails globally (e.g. one annotation
-        references a name missing from the module), the per-annotation
-        fallback must still resolve annotations containing callables
-        like ``pydantic.Field`` — not filter them out of the namespace.
-
-        Regression test for: ``from __future__ import annotations`` +
-        cross-file type references causing ``get_type_hints`` to fail,
-        which then caused ``Annotated[..., Field(...)]`` annotations
-        to degrade to raw strings (because ``Field`` was excluded from
-        the eval namespace), breaking ``__config_annotated_only__``.
-        """
-        from conscribe.config.extractor import (
-            _safe_get_type_hints,
-            _extract_field_info_from_annotated,
-        )
-        from pydantic import Field
-        from pydantic.fields import FieldInfo
-
-        # Simulate a function with string annotations (from __future__)
-        # where get_type_hints fails because of one bad annotation.
-        def func(good_param="x", bad_param=None):
-            pass
-
-        func.__annotations__ = {
-            "good_param": 'Annotated[str, Field(description="hello")]',
-            "bad_param": "SomeUnresolvableType",
-        }
-
-        # Inject Field into the function's module globals so the
-        # fallback eval can find it (mirrors real-world imports).
-        func.__globals__["Field"] = Field
-
-        with patch(
-            "conscribe.config.extractor.get_type_hints",
-            side_effect=NameError("name 'SomeUnresolvableType' is not defined"),
-        ):
-            hints = _safe_get_type_hints(func)
-
-        assert hints is not None
-        # good_param must be a resolved Annotated type, not a raw string
-        good_hint = hints["good_param"]
-        assert get_origin(good_hint) is Annotated, (
-            f"Expected Annotated, got {type(good_hint).__name__}: {good_hint!r}"
-        )
-        args = get_args(good_hint)
-        assert args[0] is str
-        assert isinstance(args[1], FieldInfo)
-        assert args[1].description == "hello"
-
-        # _extract_field_info_from_annotated must find the FieldInfo
-        field_info = _extract_field_info_from_annotated(good_hint)
-        assert field_info is not None
-        assert field_info.description == "hello"
-
-        # bad_param should fall back to raw string (not crash)
-        assert hints["bad_param"] == "SomeUnresolvableType"
-
-    def test_safe_get_type_hints_catastrophic_failure_returns_none(self) -> None:
-        """If even the fallback annotation processing crashes (e.g.
-        ``__annotations__`` is corrupted to a non-dict), the function
-        must return None — never propagate an unhandled exception."""
-        from conscribe.config.extractor import _safe_get_type_hints
-
-        def func(x):
-            pass
-
-        # Simulate a function whose __annotations__ is corrupted in a way
-        # that causes iteration to fail.  Python 3.12+ won't allow setting
-        # __annotations__ to a non-dict directly, so we patch getattr to
-        # return something that blows up on .items().
-        class _BrokenDict(dict):
-            def items(self):
-                raise RuntimeError("corrupted annotations")
-
-        with (
-            patch(
-                "conscribe.config.extractor.get_type_hints",
-                side_effect=TypeError("forced failure"),
-            ),
-            patch.object(func, "__annotations__", _BrokenDict({"x": "int"})),
-        ):
-            result = _safe_get_type_hints(func)
-
-        assert result is None
+        assert result is not None
+        assert result.model_fields == {}
+        assert result.model_config.get("extra") == "allow"
 
 
 # ===================================================================
@@ -465,10 +331,10 @@ class TestFingerprintEdgeCases:
 
         normal_fp = compute_registry_fingerprint(reg)
 
-        with patch(
-            "conscribe.config.fingerprint.inspect.signature",
-            side_effect=ValueError("cannot inspect"),
-        ):
+        from conscribe.config import _annotations
+
+        with patch("inspect.signature", side_effect=ValueError("cannot inspect")):
+            _annotations._SIGNATURES.clear()  # signatures are cached per function
             degraded_fp = compute_registry_fingerprint(reg)
 
         assert isinstance(degraded_fp, str) and len(degraded_fp) == 16
@@ -517,61 +383,6 @@ class TestFingerprintEdgeCases:
         # Other data should be gone
         data = json.loads(cache.read_text())
         assert isinstance(data, dict)
-
-
-# ===================================================================
-# Discover — auto-freshness edge cases
-# ===================================================================
-
-
-class TestDiscoverEdgeCases:
-    """discover() auto-freshness must be a no-op when there's nothing
-    to do, and must derive sensible defaults for optional parameters."""
-
-    def test_auto_freshness_skips_when_no_registrars(
-        self, tmp_path: Path,
-    ) -> None:
-        """With ``auto_update_stubs=True`` and a ``stub_dir`` set but no
-        known registrars, discover() must complete normally and not create
-        any fingerprint/stub files."""
-        from conscribe.discover import discover
-
-        stub_dir = tmp_path / "stubs"
-        stub_dir.mkdir()
-        fp_path = tmp_path / "fp.json"
-
-        mod_file = tmp_path / "trivial_mod.py"
-        mod_file.write_text("X = 1\n")
-
-        sys.path.insert(0, str(tmp_path))
-        try:
-            result = discover(
-                "trivial_mod",
-                auto_update_stubs=True,
-                stub_dir=stub_dir,
-                fingerprint_path=fp_path,
-            )
-            assert "trivial_mod" in result
-            # No registrars → no fingerprint file created
-            assert not fp_path.exists()
-        finally:
-            sys.path.remove(str(tmp_path))
-            sys.modules.pop("trivial_mod", None)
-
-    def test_auto_freshness_derives_fingerprint_path_from_stub_dir(
-        self, tmp_path: Path,
-    ) -> None:
-        """When ``fingerprint_path`` is None, ``_auto_update_stubs`` must
-        derive it as ``stub_dir / '.registry_fingerprint'`` — not crash
-        with a NoneType error."""
-        from conscribe.discover import _auto_update_stubs
-
-        stub_dir = tmp_path / "stubs"
-        stub_dir.mkdir()
-
-        # Should not raise — even though _get_known_registrars returns [],
-        # the path derivation code on line 126 must execute safely.
-        _auto_update_stubs(stub_dir, fingerprint_path=None)
 
 
 # ===================================================================

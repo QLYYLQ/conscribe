@@ -1,290 +1,558 @@
 # CLI Reference
 
-Conscribe provides a command-line interface for generating config stubs and inspecting registries.
+The `conscribe` command generates config sources, JSON Schemas and `.pyi` stubs from your registries, and inspects what is registered.
+
+| Command | Does |
+|---------|------|
+| `generate-config` | Writes one layer's Python config source (`--json-schema` adds its JSON Schema) |
+| `generate-composed-config` | Writes one composed JSON Schema or Python source for several layers |
+| `generate-stubs` | Writes `.pyi` stubs for the attributes the framework injects into one layer's classes |
+| `inspect` | Prints one layer's registered keys and their config fields |
+| `scan` | Finds `create_registrar()` calls by parsing source files (imports nothing) |
+| `list` | Imports packages, then lists what the registries hold |
+
+## Loading layers
+
+`generate-config`, `generate-composed-config`, `generate-stubs` and `inspect` load layers with the same options:
+
+| Option | Description |
+|--------|-------------|
+| `--registrar MODULE:ATTRIBUTE` | Import `MODULE` and use the registrar at `ATTRIBUTE` (a class returned by `create_registrar()`; a dotted attribute path works) |
+| `--discover PACKAGE` | Run `discover(PACKAGE)` so implementations register |
+| `--allow-missing MODULE` | Forwarded to `discover(allow_missing=...)`: modules that fail because this optional dependency is missing are skipped |
+| `--exclude PREFIX` | Forwarded to `discover(exclude=...)`: a dotted module or package name and everything below it is never imported (`pkg.generated` excludes `pkg.generated.x`, but not `pkg.generated_old`) |
+| `--layer NAME` | The layer (registry name) of a one-layer command. Optional when exactly one `--registrar` is given. |
+| `--layers NAME ...` | The layers of `generate-composed-config`. Default: every `--registrar` given. |
+
+All of them except `--layer` are repeatable, and each takes one or more values (`--registrar a:A b:B` equals `--registrar a:A --registrar b:B`).
+
+- The registrar modules are imported first, then the `--discover` packages, in the order given.
+- A layer named by `--layer` / `--layers` uses the first matching explicit `--registrar`. If none matches, it uses the current registry of that name from the imports; a later `create_registrar()` takes over that global name. An unknown name is an error that lists the loaded layers, with a "did you mean".
+- `discover()` runs strict, as it does by default in Python: a module that fails to import stops the command with an error naming the module and suggesting `--exclude` (or `--allow-missing` when an optional dependency is missing).
+- The current directory is importable while a command runs, as with `python -m`.
+
+## Output, errors and exit codes
+
+A command exits with status `0` on success and `1` on an error, which it prints as `Error: <message>` on stderr without a traceback. Usage errors (an unknown option, a missing command) exit with `2` and are reported by argparse. A command also exits with `1`, silently, when stdout is closed early (`conscribe inspect ... | head`).
+
+Errors include a bad `MODULE:ATTRIBUTE`, import failures, unknown or empty layers, and every registry, wiring, annotation, declaration and render error. A `WiringResolutionError` lists all its problems.
+
+All requested content is generated before writing starts. Config commands stage each output in a temporary file next to its target, then replace the targets (`generate-config --json-schema` replaces the schema before the source) and finally print stdout output. A failure during staging leaves every target untouched and removes temporary files. Replacement is atomic per file; if a later replacement fails, an earlier target may already have changed. Missing parent directories are created, and config outputs follow symlinks while preserving the link.
+
+`generate-stubs` validates and renders every module first, then writes the `.pyi` files directly. An I/O failure can leave earlier stubs written.
+
+`generate-stubs` prints `StaleStubWarning` reports as `Warning: ...` lines on stderr, and `scan` does the same for `ExtractionWarning` reports about files it cannot parse. These two handlers force their warnings to be shown, overriding warning filters; those reports alone do not fail the command, even with `PYTHONWARNINGS=error::UserWarning`.
+
+Other conscribe warnings use Python's warning filters; config extraction warnings point at your class definition. Set `PYTHONWARNINGS=error::UserWarning` to make these warnings fail the command: they become `Error: ...` and generation stops before writing. This also escalates other libraries' `UserWarning`s. Python's startup `-W` / `PYTHONWARNINGS` settings cannot name conscribe's own categories; pytest filters and `warnings.simplefilter("error", ConscribeWarning)` can.
 
 ## Commands
 
 ### `generate-config`
 
-Generate a Python config stub file from a registry.
-
-```bash
-conscribe generate-config \
-  --registrar "my_app.llm._registrar:LLMRegistrar" \
-  --discover "my_app.llm.providers" \
-  --output "generated/llm_config.py"
+```
+conscribe generate-config [--registrar MODULE:ATTRIBUTE ...] [--discover PACKAGE ...]
+                          [--allow-missing MODULE ...] [--exclude PREFIX ...] [--layer NAME]
+                          [--output OUTPUT] [--json-schema PATH]
 ```
 
-**Options:**
-
-| Flag | Required | Description |
-|------|----------|-------------|
-| `--registrar` | Yes | Dotted path to registrar (`module:attribute`) |
-| `--discover` | No | Package paths to import before generation |
-| `--output` | No | Output file path (prints to stdout if omitted) |
-| `--json-schema` | No | Also generate JSON Schema to this path |
-| `--config` | No | Path to batch config YAML file |
+| Option | Description |
+|--------|-------------|
+| `--output OUTPUT` | Write the Python source here; stdout when omitted |
+| `--json-schema PATH` | Also write the layer's JSON Schema here. Must differ from `--output` (the same path is an `Error:`). |
 
 ### `generate-composed-config`
 
-Generate a composed config schema from multiple registries. Wired fields become inline config objects (or `Literal[...]` with `--no-inline-wiring`).
-
-```bash
-conscribe generate-composed-config \
-  --layers "llm" "agent" \
-  --format json-schema \
-  --output "generated/composed_config.schema.json"
+```
+conscribe generate-composed-config [--registrar MODULE:ATTRIBUTE ...] [--discover PACKAGE ...]
+                                   [--allow-missing MODULE ...] [--exclude PREFIX ...]
+                                   [--layers NAME ...] [--inline-wiring | --no-inline-wiring]
+                                   [--top-level-extra {forbid,ignore,allow}]
+                                   [--format {python,json-schema}] [--output OUTPUT]
 ```
 
-**Options:**
+| Option | Description |
+|--------|-------------|
+| `--layers NAME ...` | Layers to compose (registry names); default: every `--registrar` |
+| `--inline-wiring` / `--no-inline-wiring` | Wired fields hold the target layer's configs (default), or stay `Literal[...]` keys |
+| `--top-level-extra` | Unknown top-level keys: `forbid` (default), `ignore` or `allow`. Inline-only layer names are refused in every mode. |
+| `--format` | `json-schema` (default) or `python` |
+| `--output OUTPUT` | Output file; stdout when omitted |
 
-| Flag | Required | Description |
-|------|----------|-------------|
-| `--layers` | Yes | Layer names to include (space-separated) |
-| `--format` | No | Output format: `json-schema` (default) or `python` |
-| `--inline-wiring` | No | Inline wired fields as target layer union types (default) |
-| `--no-inline-wiring` | No | Keep wired fields as `Literal[...]` strings |
-| `--output` | No | Output file path (prints to stdout if omitted) |
-
-**Example output (JSON Schema):**
-
-The schema has a top-level property per layer, each as `list[union_type]`. Wired fields reference the target layer's models via `$defs`/`$ref`:
-
-```json
-{
-  "properties": {
-    "llm": {"type": "array", "items": {"oneOf": [...]}},
-    "agent": {"type": "array", "items": {"oneOf": [...]}}
-  },
-  "$defs": {
-    "OpenaiLLMConfig": {...},
-    "BrowserUseAgentConfig": {
-      "properties": {
-        "llm": {"$ref": "#/$defs/LLMConfig"},
-        ...
-      }
-    }
-  }
-}
-```
-
-### `inspect`
-
-Display registry contents with config fields.
-
-```bash
-conscribe inspect \
-  --registrar "my_app.llm._registrar:LLMRegistrar" \
-  --discover "my_app.llm.providers"
-```
-
-Output:
-
-```
-Layer: llm
-Discriminator: provider
-Registered keys (2):
-
-  anthropic (ChatAnthropic):
-    model_id: str
-    max_tokens: int = 4096
-
-  open_ai (ChatOpenAI):
-    model_id: str  # Model identifier, e.g. gpt-4o
-    temperature: float = 0.0  # Sampling temperature, 0-2
-```
+Each layer's section is named after its registry, and [inline-only layers](config-typing.md#inline-only-layers) have no section. Without `--layers`, composing two different explicit `--registrar` values with the same name is an error. With `--layers`, each name selects the first matching explicit registrar, then falls back to the global registry lookup described above.
 
 ### `generate-stubs`
 
-Generate `.pyi` stub files for registered classes with injected wired attributes. These stubs give IDEs (PyCharm, VS Code, mypy) visibility into runtime-injected dependencies that aren't declared in `__init__`.
-
-```bash
-conscribe generate-stubs \
-  --registrar "my_app.agents._registrar:AgentRegistrar" \
-  --discover "my_app.agents" \
-  --output-dir "generated/stubs"
+```
+conscribe generate-stubs [--registrar MODULE:ATTRIBUTE ...] [--discover PACKAGE ...]
+                         [--allow-missing MODULE ...] [--exclude PREFIX ...] [--layer NAME]
+                         [--output-dir OUTPUT_DIR] [--partial-class-fallback] [--prune]
 ```
 
-**Options:**
+| Option | Description |
+|--------|-------------|
+| `--output-dir OUTPUT_DIR` | Mirror module paths under this directory; default: next to each source file (never into an installed package) |
+| `--partial-class-fallback` | Give each stubbed class `def __getattr__(self, name: str) -> Incomplete: ...` to tolerate dynamic attributes (looser type checking) |
+| `--prune` | Delete the stale conscribe-generated stubs instead of reporting them |
 
-| Flag | Required | Description |
-|------|----------|-------------|
-| `--registrar` | Yes | Dotted path to registrar (`module:attribute`) |
-| `--discover` | No | Package paths to import before generation |
-| `--output-dir` | No | Output directory. If omitted, writes `.pyi` alongside source `.py` files. |
-| `--partial-class-fallback` | No | Emit class-level `__getattr__` returning `Incomplete` so IDEs tolerate dynamic instance attributes. Off by default for strict type checking. |
+Only `__wiring__` entries without a runtime slot (no constructor parameter, no non-`ClassVar` class annotation anywhere in the MRO) and without [`declare_only`](api-reference.md#__wiring__-entries) are stubbed, typed as the target registry's protocol. The command prints the written paths and `Generated N stub file(s).` on stdout, or `No classes with injected wired attributes found.` on stderr.
 
-**How it works:**
+A conscribe-generated `.pyi` is stale when it sits in a directory this layer's stubs go to, this run did not rewrite it, and no class in the registries the [writer considers](api-reference.md#write_layer_stubs) needs it. These files are reported as `Warning: ...` lines; `--prune` deletes exactly those files. conscribe recognises both `# Generated by conscribe` and the older `# Auto-generated by conscribe.` followed by `# Stub file for:`.
 
-1. Iterates all registered classes in the layer.
-2. For each class with `__wiring__` fields **not in `__init__`** (injected at runtime), collects stub info.
-3. Resolves the type of each injected attribute using **type narrowing**:
-   - Mode 1 (all keys): registry protocol (e.g., `EnvironmentProtocol`)
-   - Mode 2 (explicit subset): narrowest common ancestor of the subset classes (e.g., `Terminal` instead of `EnvironmentProtocol`)
-   - Mode 2 (single key): exact class (e.g., `BashTerminal`)
-   - Mode 3 (literal list): `str`
-4. Generates `.pyi` with injected attributes, own `__init__` signature, and own methods.
-5. **Resolves names inside string annotations** (PEP 563 / `from __future__ import annotations`):
-   - Walks each annotation with `ast.parse(..., mode="eval")` and emits imports for every referenced identifier.
-   - Names from `typing` (e.g., `Annotated`, `Literal`, `Optional`) go to `from typing import …`.
-   - Third-party callables like `pydantic.Field` (used inside `Annotated[int, Field(...)]`) get imported from their source module so PyCharm/Pylance can resolve them.
-   - Aliased imports are preserved verbatim: `from pydantic import Field as PydanticField` round-trips into the stub with the original module *and* the local alias intact (the runtime `__module__` of the resolved object is **not** used as the import source).
-   - Names imported under `if TYPE_CHECKING:` blocks are picked up by AST-scanning the source file (otherwise they are invisible at runtime).
-   - Unresolvable names are skipped silently — the stub still compiles; the IDE simply degrades that reference to `Any`.
-6. **Renders own class-level annotations** as class-body attributes. Dataclass-style fields (`use_vision: bool = False`) appear both inside `__init__` and as class attributes in the stub, mirroring the source class so IDEs resolve `obj.use_vision` against the stub.
+Type checkers pick up stubs next to the source files without configuration. With `--output-dir`, mark the directory as a source root in PyCharm, or add it to your type checker's stub search path (for example mypy's `mypy_path`).
 
-**Why this matters:** PEP 561 mandates that PyCharm and Pylance treat `.pyi` as authoritative and ignore the sibling `.py` for type analysis. If signatures reference names that aren't imported in the stub header, the IDE cannot resolve them and falls back to `Any`, losing type information.
+### `inspect`
 
-**Example output** (`my_app/agents/react.pyi`):
+```
+conscribe inspect [--registrar MODULE:ATTRIBUTE ...] [--discover PACKAGE ...]
+                  [--allow-missing MODULE ...] [--exclude PREFIX ...] [--layer NAME]
+```
+
+Prints the layer, its discriminator ([nested-mode](config-typing.md#nested-mode-discriminator_fields) layers: all fields and the separator), `Inline-only: yes` for inline-only layers, and every key with its config fields: `name: type = default  # description; wired from: registry`. The discriminator itself is not listed. A key whose config cannot be built is reported in an `Error:` line after the listing, and the exit status is `1`.
+
+### `scan`
+
+```
+conscribe scan [--path PATH]
+```
+
+Parses the `.py` files under `PATH` (default: the current directory) for `create_registrar()` and `create_auto_registrar()` calls, without importing anything. (`--path` is the directory to search here; for `list` it filters entries.) Skips `site-packages`, `.venv`, `venv`, `.git`, `__pycache__`, `.eggs`, `.tox`, `node_modules`, `build`, `dist`, `.mypy_cache`, `.pytest_cache` and `.ruff_cache`.
+
+### `list`
+
+```
+conscribe list [--discover PACKAGE ...] [--allow-missing MODULE ...] [--exclude PREFIX ...]
+               [--layer LAYER] [--path PATH]
+```
+
+Imports the packages (strict `discover()`), then lists every registry with its entries: key, class and source location. Without `--discover` it imports every top-level package in the current directory (a directory with an `__init__.py`, one level deep, so a `src/` layout needs `--discover`). Only entries whose source file is under the current directory are shown, so classes from installed packages stay out.
+
+| Option | Description |
+|--------|-------------|
+| `--discover PACKAGE ...` | Packages to import; auto-detected when omitted |
+| `--layer LAYER` | Show only this registry |
+| `--path PATH` | Show only entries whose source path (relative to the current directory) starts with `PATH`; empty registries are hidden |
+
+## Worked example
+
+A project with two layers:
+
+```
+my_app/
+    __init__.py
+    layers.py           # protocols, registrars, base classes
+    llm/__init__.py
+    llm/providers.py    # OpenAIChat ("openai"), AnthropicChat ("anthropic")
+    agents/__init__.py
+    agents/react.py     # ReactAgent: llm through the constructor, critic injected
+```
 
 ```python
+# my_app/layers.py
+from typing import Protocol, runtime_checkable
+
+from conscribe import create_registrar
+
+
+@runtime_checkable
+class ChatModel(Protocol):
+    def complete(self, prompt: str) -> str: ...
+
+
+@runtime_checkable
+class Agent(Protocol):
+    def run(self, task: str) -> str: ...
+
+
+LLM = create_registrar("llm", ChatModel, discriminator_field="provider")
+AgentRegistrar = create_registrar(
+    "agent", Agent, discriminator_field="name", strip_suffixes=["Agent"]
+)
+
+
+class BaseChatModel(metaclass=LLM.Meta):
+    __abstract__ = True
+
+    def complete(self, prompt: str) -> str:
+        raise NotImplementedError
+
+
+class BaseAgent(metaclass=AgentRegistrar.Meta):
+    __abstract__ = True
+
+    def run(self, task: str) -> str:
+        raise NotImplementedError
+```
+
+```python
+# my_app/llm/providers.py
+from typing import Annotated
+
+from pydantic import Field
+
+from my_app.layers import BaseChatModel
+
+
+class OpenAIChat(BaseChatModel):
+    """OpenAI chat models.
+
+    Args:
+        model: Model identifier, e.g. gpt-4o.
+        temperature: Sampling temperature.
+    """
+
+    __registry_key__ = "openai"
+
+    def __init__(
+        self,
+        model: str,
+        temperature: Annotated[float, Field(ge=0, le=2)] = 0.7,
+    ) -> None:
+        self.model = model
+        self.temperature = temperature
+
+
+class AnthropicChat(BaseChatModel):
+    __registry_key__ = "anthropic"
+
+    def __init__(self, model: str, max_tokens: int = 4096) -> None:
+        self.model = model
+        self.max_tokens = max_tokens
+```
+
+```python
+# my_app/agents/react.py
+from my_app.layers import BaseAgent, ChatModel
+
+
+class ReactAgent(BaseAgent):
+    """A ReAct loop.
+
+    Args:
+        llm: The model that plans each step.
+        max_steps: Step budget.
+    """
+
+    # llm arrives through the constructor; the framework sets critic itself.
+    __wiring__ = {"llm": "llm", "critic": "llm"}
+
+    llm: ChatModel
+    max_steps: int
+
+    def __init__(self, llm: ChatModel, max_steps: int = 10) -> None:
+        self.llm = llm
+        self.max_steps = max_steps
+
+    def run(self, task: str) -> str:
+        return self.llm.complete(task)
+```
+
+Every command below runs from the project root.
+
+### Find the registrars
+
+`scan` finds them without importing anything:
+
+```bash
+conscribe scan
+```
+
+```
+Found 2 registrar(s):
+
+  llm             ChatModel           my_app/layers.py:17  (var: LLM)
+  agent           Agent               my_app/layers.py:18  (var: AgentRegistrar)
+```
+
+### List what registers
+
+`list` imports the packages it finds and shows each registry's entries:
+
+```bash
+conscribe list
+```
+
+```
+Registry: agent (Agent) — 1 entries
+  react               ReactAgent              my_app/agents/react.py:5
+
+Registry: llm (ChatModel) — 2 entries
+  anthropic           AnthropicChat           my_app/llm/providers.py:28
+  openai              OpenAIChat              my_app/llm/providers.py:9
+
+```
+
+### Inspect a layer's config fields
+
+The agent's wiring targets the `llm` layer, so the whole `my_app` package is discovered:
+
+```bash
+conscribe inspect --registrar my_app.layers:AgentRegistrar --discover my_app
+```
+
+```
+Layer: agent
+Discriminator: name
+Registered keys (1):
+
+  react (ReactAgent):
+    llm: Literal['anthropic', 'openai']  # The model that plans each step.; wired from: llm
+    max_steps: int = 10  # Step budget.
+    critic: Optional[Literal['anthropic', 'openai']] = None  # wired from: llm
+```
+
+`critic` has no slot in `ReactAgent` (no constructor parameter, no class annotation): the framework sets the attribute after construction, so the config field is an optional key, and `generate-stubs` declares the attribute below.
+
+### Generate one layer's config source and JSON Schema
+
+```bash
+conscribe generate-config --registrar my_app.layers:LLM --discover my_app.llm --output generated/llm_config.py --json-schema generated/llm_config.schema.json
+```
+
+`generated/llm_config.py`:
+
+```python
+# Generated by conscribe 2.0.0
 # Auto-generated by conscribe. DO NOT EDIT.
+# Layer: llm
+# Discriminator: provider
+# Entries (2): anthropic, openai
+
 from __future__ import annotations
-from typing import Annotated, Any
-from pydantic import Field as PydanticField
-from my_app.protocols import EnvironmentProtocol, LLMProtocol
-from my_app.agents.base import BaseAgent
+
+from typing import Annotated, Literal, Union
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class AnthropicLLMConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model: str
+    max_tokens: int = 4096
+    provider: Literal['anthropic'] = 'anthropic'
+
+
+class OpenaiLLMConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model: str = Field(description='Model identifier, e.g. gpt-4o.')
+    temperature: float = Field(default=0.7, description='Sampling temperature.', ge=0, le=2)
+    provider: Literal['openai'] = 'openai'
+
+
+# Rebuild models for deferred annotation resolution
+AnthropicLLMConfig.model_rebuild()
+OpenaiLLMConfig.model_rebuild()
+
+
+LLMConfig = Annotated[
+    Union[OpenaiLLMConfig, AnthropicLLMConfig],
+    Field(discriminator="provider"),
+]
+```
+
+### Compose both layers
+
+The composed config holds each agent's LLM config inline:
+
+```bash
+conscribe generate-composed-config --registrar my_app.layers:LLM my_app.layers:AgentRegistrar --discover my_app --format python --output generated/composed.py
+```
+
+The agent part of `generated/composed.py`:
+
+```python
+class ReactAgentConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    llm: LLMConfig = Field(description='The model that plans each step.')  # wired from: llm
+    max_steps: int = Field(default=10, description='Step budget.')
+    critic: Optional[LLMConfig] = None  # wired from: llm
+    name: Literal['react'] = 'react'
+
+
+# Rebuild models for deferred annotation resolution
+ReactAgentConfig.model_rebuild()
+
+
+# ── Composed Config ──
+
+
+class ComposedConfig(BaseModel):
+    # Unknown top-level keys are refused (top_level_extra='forbid').
+    model_config = ConfigDict(extra="forbid", json_schema_extra={'x-composed-layers': ['llm', 'agent'], 'x-inline-wiring': True})
+
+    llm: list[LLMConfig] = []
+    agent: list[ReactAgentConfig] = []
+
+
+# Rebuild models for deferred annotation resolution
+ComposedConfig.model_rebuild()
+```
+
+The `agent` layer has a single key, so it has no union alias and its section is a list of `ReactAgentConfig`. A YAML config validated by this model (or by the JSON Schema `--format json-schema` writes) looks like:
+
+```yaml
+agent:
+  - name: react
+    max_steps: 20
+    llm:
+      provider: openai
+      model: gpt-4o
+```
+
+### Generate stubs
+
+The stub declares the injected `critic` attribute:
+
+```bash
+conscribe generate-stubs --registrar my_app.layers:AgentRegistrar --discover my_app
+```
+
+```
+  /path/to/project/my_app/agents/react.pyi
+Generated 1 stub file(s).
+```
+
+`my_app/agents/react.pyi`:
+
+```python
+# Generated by conscribe 2.0.0
+# DO NOT EDIT. Stub for module: my_app.agents.react
+from __future__ import annotations
+
+from my_app.layers import BaseAgent, ChatModel
+from typing import Any
 
 def __getattr__(name: str) -> Any: ...
 
 class ReactAgent(BaseAgent):
-    env: EnvironmentProtocol  # wired from: environment
-    llm: LLMProtocol  # wired from: llm_provider
+    critic: ChatModel  # wired from: llm
 
-    max_steps: Annotated[int, PydanticField(description="Max steps")]
-    use_vision: Annotated[bool, PydanticField(description="Include screenshots")]
+    llm: ChatModel
+    max_steps: int
 
-    def __init__(self, max_steps: int = 10, use_vision: bool = False) -> None: ...
-    def step(self, task: str) -> str: ...
+    def __init__(self, llm: ChatModel, max_steps: int = 10) -> None: ...
+    def run(self, task: str) -> str: ...
 ```
 
-**PyCharm integration:** When `.pyi` files are alongside source files (default mode), PyCharm discovers them automatically with zero configuration. With `--output-dir`, mark the directory as "Source Root" in PyCharm.
+Only `critic` gets a `# wired from:` line; `llm` reaches the class through the constructor. The stub repeats the class body's own annotations (`llm: ChatModel`, `max_steps: int`). That matters because a stub replaces its module for type checkers: an attribute that is only assigned inside `__init__` (`self.llm = llm`) is invisible to them once the stub exists, so mypy would report `"ReactAgent" has no attribute "llm"`. Declare such attributes in the class body, or pass `--partial-class-fallback`.
 
-### `update-stubs`
+### Errors
 
-Force regenerate all stubs, ignoring the fingerprint cache.
+A wrong attribute name:
 
 ```bash
-conscribe update-stubs --config conscribe.yaml
+conscribe generate-config --registrar my_app.layers:Llm --discover my_app
 ```
 
-### `scan`
+```
+Error: --registrar 'my_app.layers:Llm': 'my_app.layers' has no attribute 'Llm' (registrars defined there: AgentRegistrar, LLM)
+```
 
-Scan Python files under the current directory for `create_registrar()` and `create_auto_registrar()` definitions using static AST analysis. No imports, no side effects.
+Discovering only the agents leaves the `llm` registry empty, which every wiring entry reports:
 
 ```bash
-conscribe scan
-conscribe scan --path src/my_app
+conscribe generate-config --registrar my_app.layers:AgentRegistrar --discover my_app.agents
 ```
 
-**Options:**
-
-| Flag | Required | Description |
-|------|----------|-------------|
-| `--path` | No | Root directory to scan (default: current directory) |
-
-Output:
-
 ```
-Found 3 registrar(s):
-
-  agent           AgentProtocol       src/layers.py:12    (var: AgentRegistrar)
-  llm             LLMProtocol         src/layers.py:22    (var: LLMRegistrar)
-  evaluator       EvaluatorProtocol   src/layers.py:32    (var: EvaluatorRegistrar)
+Error: 2 wiring problems:
+  - ReactAgent (key 'react') wiring 'llm': registry 'llm' is empty (no class is registered in it): discover() missed the package that implements it, or one of its modules failed to import; import every implementation module before resolving wiring
+  - ReactAgent (key 'react') wiring 'critic': registry 'llm' is empty (no class is registered in it): discover() missed the package that implements it, or one of its modules failed to import; import every implementation module before resolving wiring
 ```
 
-Excluded directories: `site-packages`, `.venv`, `venv`, `.git`, `__pycache__`, `.eggs`, `.tox`, `node_modules`, `build`, `dist`, `.mypy_cache`, `.pytest_cache`, `.ruff_cache`.
-
-### `list`
-
-Import packages to trigger registration, then list all registered content from runtime registries. Auto-detects top-level packages under the current directory if `--discover` is not specified.
+A typo in a layer name:
 
 ```bash
-conscribe list --discover my_app
-conscribe list --discover my_app --layer agent
-conscribe list --discover my_app --path my_app/agents
+conscribe generate-config --layer agnt --discover my_app
 ```
 
-**Options:**
-
-| Flag | Required | Description |
-|------|----------|-------------|
-| `--discover` | No | Packages to import for registration (auto-detected if omitted) |
-| `--layer` | No | Show only this registry (by name) |
-| `--path` | No | Filter entries by source file path prefix |
-
-Output:
-
 ```
-Registry: agent (AgentProtocol) — 3 entries
-  browser_use         BrowserUseAgent         my_app/agents/browser_use.py:17
-  skyvern             SkyvernAgent            my_app/agents/skyvern.py:7
-  custom_v2           CustomAgent             my_app/agents/custom.py:7
-
-Registry: llm (LLMProtocol) — 2 entries
-  openai              OpenAIProvider          my_app/llm/openai.py:14
-  anthropic           AnthropicProvider       my_app/llm/anthropic.py:7
+Error: no registrar for layer 'agnt' is loaded (did you mean 'agent'?); loaded layers: agent, llm. Pass --registrar MODULE:ATTRIBUTE, or --discover the package that creates it.
 ```
 
-By default, only entries whose source file is under the current directory are shown (site-packages entries are excluded). When `--path` is given, empty registries are hidden.
+Each of these exits with status `1`.
 
-## Batch Config File
+### Modules that fail to import
 
-For projects with multiple layers, use a YAML config file:
-
-```yaml
-# conscribe.yaml
-discover:
-  - my_app.agents
-  - my_app.llm.providers
-  - my_app.evaluators
-
-output_dir: generated
-
-layers:
-  - registrar: my_app.agents._registrar:AgentRegistrar
-    output: generated/agent_config.py
-    json_schema: generated/agent_config.schema.json
-
-  - registrar: my_app.llm._registrar:LLMRegistrar
-    output: generated/llm_config.py
-    json_schema: generated/llm_config.schema.json
-```
-
-Then run:
+With the `tools_pkg` package from [Registration Deep-Dive](registration.md#discover) (a `generated` subpackage that raises when imported, and a module that needs the missing optional dependency `fancy_ocr`), the strict discovery stops at the first failure and says how to skip it:
 
 ```bash
-conscribe generate-config --config conscribe.yaml
+conscribe list --discover tools_pkg
 ```
 
-This discovers all packages, then generates stubs for each layer.
+```
+Error: could not import module 'tools_pkg.generated' (--discover tools_pkg): RuntimeError: generated code is not meant to be imported (tools_pkg/generated/__init__.py, line 1)
+Fix the module, or skip it with --exclude tools_pkg.generated.
+```
 
-## Programmatic Equivalent
+```bash
+conscribe list --discover tools_pkg --exclude tools_pkg.generated
+```
 
-Every CLI command has a Python equivalent:
+```
+Error: could not import module 'tools_pkg.vision' (--discover tools_pkg): ModuleNotFoundError: No module named 'fancy_ocr' (tools_pkg/vision.py, line 8)
+If 'fancy_ocr' is an optional dependency, skip the modules that need it with --allow-missing fancy_ocr; or skip this module with --exclude tools_pkg.vision.
+```
+
+```bash
+conscribe list --discover tools_pkg --exclude tools_pkg.generated --allow-missing fancy_ocr
+```
+
+```
+Registry: tool (ToolProtocol) — 1 entries
+  search              Search                  tools_pkg/search.py:4
+
+```
+
+## Programmatic equivalents
+
+Every command maps to a few calls (run from the project root):
 
 ```python
-from conscribe import discover, build_layer_config
-from conscribe import generate_layer_config_source, generate_layer_json_schema
-from conscribe import build_composed_config, generate_composed_json_schema
-
-# discover
-discover("my_app.llm.providers")
-
-# generate-config (single layer)
-result = build_layer_config(LLMRegistrar)
-source = generate_layer_config_source(result)
-schema = generate_layer_json_schema(result)
-
-# generate-composed-config (multi-layer)
-composed = build_composed_config(
-    {"llm": LLMRegistrar, "agent": AgentRegistrar},
-    inline_wiring=True,
+from conscribe import (
+    build_composed_config,
+    build_layer_config,
+    discover,
+    generate_composed_config_source,
+    generate_composed_json_schema,
+    generate_layer_config_source,
+    generate_layer_json_schema,
 )
-composed_schema = generate_composed_json_schema(composed)
+from conscribe.stubs import write_layer_stubs
+from my_app.layers import LLM, AgentRegistrar          # --registrar my_app.layers:...
 
-# inspect
-for key in LLMRegistrar.keys():
-    cls = LLMRegistrar.get(key)
-    print(f"{key}: {cls.__name__}")
+discover("my_app")                                     # --discover my_app
+
+result = build_layer_config(LLM)                       # generate-config
+source = generate_layer_config_source(result)
+schema = generate_layer_json_schema(result)            # --json-schema
+
+composed = build_composed_config(                      # generate-composed-config
+    {"llm": LLM, "agent": AgentRegistrar},             # section name -> registrar
+    inline_wiring=True,
+    top_level_extra="forbid",
+)
+composed_schema = generate_composed_json_schema(composed)   # --format json-schema
+composed_source = generate_composed_config_source(composed)  # --format python
+
+written = write_layer_stubs(AgentRegistrar)            # generate-stubs (prune=True for --prune)
+
+for key in AgentRegistrar.keys():                      # inspect
+    schema = AgentRegistrar.get_config_schema(key)
+    print(key, list(schema.model_fields) if schema is not None else [])
 ```
+
+```
+react ['llm', 'max_steps', 'critic']
+```
+
+`conscribe.scanner` provides `scan_registrar_definitions(root)` and `list_registries(root, ...)` for `scan` and `list`.
+
+## Removed in 2.0
+
+- `update-stubs` and the `--config` batch YAML file are gone. Call the generation commands from your build or CI script instead. Compare `compute_registry_fingerprint()` with a stored value to track config-source and JSON-Schema changes; it does not cover `.pyi` stubs, which need separate regeneration.
+- `discover()` no longer regenerates stubs (`auto_update_stubs`, `stub_dir` and `fingerprint_path` were removed).
+
+See [Migrating to 2.0](migrating-to-2.0.md).

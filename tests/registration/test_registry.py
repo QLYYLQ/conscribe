@@ -654,3 +654,255 @@ class TestAgentRegistryScenario:
         registry.add("w", W)
         # Just verify it doesn't raise
         registry._dump_registry()
+
+
+# ===================================================================
+# remove(key, *, missing_ok)
+# ===================================================================
+
+class TestRemove:
+    """remove() returns the class, is idempotent with missing_ok, and says
+    why a missing key cannot be removed."""
+
+    @staticmethod
+    def _worker(name: str) -> type:
+        return type(name, (), {"do_work": lambda self: name})
+
+    def test_remove_returns_removed_class(self) -> None:
+        registry = LayerRegistry("test", WorkerProtocol)
+        worker = self._worker("W")
+        registry.add("w", worker)
+        assert registry.remove("w") is worker
+        assert registry.keys() == []
+
+    def test_missing_key_raises_removal_specific_key_not_found(self) -> None:
+        registry = LayerRegistry("my_layer", WorkerProtocol)
+        registry.add("alpha", self._worker("A"))
+        with pytest.raises(KeyNotFoundError) as info:
+            registry.remove("beta")
+        message = str(info.value)
+        assert isinstance(info.value, KeyError)
+        assert info.value.key == "beta"
+        assert info.value.available_keys == ["alpha"]
+        assert "'beta' not found in 'my_layer'" in message
+        assert "alpha" in message
+        assert "missing_ok=True" in message
+        assert "discover()" not in message  # that advice is for lookups
+
+    def test_missing_ok_returns_none_twice_without_invalidating(self) -> None:
+        registry = LayerRegistry("test", WorkerProtocol)
+        counter = registry._invalidation_counter
+        assert registry.remove("nope", missing_ok=True) is None
+        assert registry.remove("nope", missing_ok=True) is None
+        assert registry._invalidation_counter == counter
+
+    def test_counter_bumped_only_when_something_was_removed(self) -> None:
+        registry = LayerRegistry("test", WorkerProtocol)
+        registry.add("w", self._worker("W"))
+        counter = registry._invalidation_counter
+        registry.remove("w")
+        assert registry._invalidation_counter == counter + 1
+        registry.remove("w", missing_ok=True)
+        assert registry._invalidation_counter == counter + 1
+
+    def test_removing_one_key_of_multi_key_class_keeps_the_others(self) -> None:
+        registry = LayerRegistry("test", WorkerProtocol)
+        worker = self._worker("Multi")
+        registry.add("alias_a", worker)
+        registry.add("alias_b", worker)
+        assert registry.remove("alias_a") is worker
+        assert registry.get("alias_b") is worker
+
+    def test_hierarchical_prefix_is_not_a_key(self) -> None:
+        registry = LayerRegistry("llm", WorkerProtocol, separator=".")
+        registry.add("openai.azure", self._worker("Azure"))
+        registry.add("openai.chat", self._worker("Chat"))
+        registry.add("anthropic.claude", self._worker("Claude"))
+        with pytest.raises(KeyNotFoundError, match="only a prefix") as info:
+            registry.remove("openai")
+        advice = str(info.value).split("only a prefix")[1]
+        assert "openai.azure, openai.chat" in advice
+        assert "anthropic.claude" not in advice
+        assert len(registry.keys()) == 3
+
+    def test_removing_parent_leaf_keeps_children(self) -> None:
+        registry = LayerRegistry("llm", WorkerProtocol, separator=".")
+        parent, child = self._worker("OpenAI"), self._worker("Azure")
+        registry.add("openai", parent)
+        registry.add("openai.azure", child)
+        assert registry.remove("openai") is parent
+        assert registry.keys() == ["openai.azure"]
+        assert registry.tree() == {"openai": {"azure": child}}
+
+
+# ===================================================================
+# DuplicateKeyError advice
+# ===================================================================
+
+class TestDuplicateKeyAdvice:
+    def test_different_classes_get_default_advice(self) -> None:
+        registry = LayerRegistry("test", WorkerProtocol)
+
+        class A:
+            def do_work(self) -> str:
+                return "a"
+
+        class B:
+            def do_work(self) -> str:
+                return "b"
+
+        registry.add("k", A)
+        with pytest.raises(DuplicateKeyError, match="To fix: add __registry_key__") as info:
+            registry.add("k", B)
+        assert info.value.hint is None
+
+    def test_same_class_twice_names_the_cause(self) -> None:
+        registry = LayerRegistry("test", WorkerProtocol)
+
+        class A:
+            def do_work(self) -> str:
+                return "a"
+
+        registry.add("k", A)
+        with pytest.raises(DuplicateKeyError, match="listed twice"):
+            registry.add("k", A)
+
+    def test_class_body_run_twice_points_to_isolation(self) -> None:
+        registry = LayerRegistry("test", WorkerProtocol)
+
+        def define() -> type:
+            class Again:
+                def do_work(self) -> str:
+                    return "again"
+
+            return Again
+
+        registry.add("k", define())
+        with pytest.raises(DuplicateKeyError, match="isolated_registries") as info:
+            registry.add("k", define())
+        assert "ran a second time" in str(info.value)
+        assert "To fix: add __registry_key__" not in str(info.value)
+
+    def test_same_named_subclass_is_told_to_take_its_own_key(self) -> None:
+        registry = LayerRegistry("test", WorkerProtocol)
+
+        class Worker:
+            def do_work(self) -> str:
+                return "w"
+
+        registry.add("worker", Worker)
+        Sub = type("Worker", (Worker,), {"__qualname__": "Other.Worker"})
+        with pytest.raises(DuplicateKeyError, match="its own __registry_key__"):
+            registry.add("worker", Sub)
+
+
+# ===================================================================
+# Internal mutation helpers (used by registration and isolation)
+# ===================================================================
+
+class TestInternalMutations:
+    @staticmethod
+    def _worker(name: str) -> type:
+        return type(name, (), {"do_work": lambda self: name})
+
+    def test_replace_class_rebinds_every_key(self) -> None:
+        registry = LayerRegistry("test", WorkerProtocol)
+        old, new, other = self._worker("Old"), self._worker("New"), self._worker("Other")
+        registry.add("a", old)
+        registry.add("b", old)
+        registry.add("c", other)
+        assert registry._replace_class(old, new) == ["a", "b"]
+        assert registry.items() == [("a", new), ("b", new), ("c", other)]
+
+    def test_discard_class_removes_every_key_and_invalidates(self) -> None:
+        registry = LayerRegistry("test", WorkerProtocol)
+        gone, other = self._worker("Gone"), self._worker("Other")
+        registry.add("a", gone)
+        registry.add("b", other)
+        registry.add("c", gone)
+        counter = registry._invalidation_counter
+        assert registry._discard_class(gone) == ["a", "c"]
+        assert registry.keys() == ["b"]
+        assert registry._invalidation_counter == counter + 1
+        assert registry._discard_class(gone) == []
+        assert registry._invalidation_counter == counter + 1
+
+    def test_discard_binding_only_if_still_bound(self) -> None:
+        registry = LayerRegistry("test", WorkerProtocol)
+        first, second = self._worker("First"), self._worker("Second")
+        registry.add("k", first)
+        assert registry._discard_binding("k", second) is False
+        assert registry._discard_binding("k", first) is True
+        assert registry._discard_binding("k", first) is False
+        assert registry.keys() == []
+
+    def test_find_by_id_and_holds(self) -> None:
+        registry = LayerRegistry("test", WorkerProtocol)
+        worker = self._worker("W")
+        registry.add("w", worker)
+        assert registry._find_by_id(id(worker)) is worker
+        assert registry._find_by_id(id(object())) is None
+        assert registry._holds(worker)
+        assert not registry._holds(self._worker("X"))
+
+
+# ===================================================================
+# Live registry tracking
+# ===================================================================
+
+class TestLiveRegistries:
+    def test_shadowed_registry_stays_tracked(self) -> None:
+        from conscribe.registration.registry import _live_registries, get_registry
+
+        first = LayerRegistry("test_live_shadow", WorkerProtocol)
+        second = LayerRegistry("test_live_shadow", WorkerProtocol)
+        assert get_registry("test_live_shadow") is second
+        live = _live_registries()
+        assert first in live and second in live
+
+    def test_missing_sentinel_repr(self) -> None:
+        from conscribe.registration.registry import _MISSING
+
+        assert repr(_MISSING) == "<missing>"
+
+    def test_live_snapshot_while_another_thread_creates_registries(self) -> None:
+        """Review probe 8: the live-registry WeakSet was iterated without a
+        lock, so a purge / rebind / isolation snapshot failed with "Set changed
+        size during iteration" while another thread created a registrar."""
+        import sys
+
+        from conscribe.registration.registry import _live_registries
+        from conscribe.testing import isolated_registries
+
+        errors: list[BaseException] = []
+        stop = threading.Event()
+
+        def snapshot() -> None:
+            while not stop.is_set():
+                try:
+                    _live_registries()
+                except RuntimeError as exc:  # pragma: no cover - the bug
+                    errors.append(exc)
+                    return
+
+        old_interval = sys.getswitchinterval()
+        with isolated_registries():
+            keep = [LayerRegistry(f"test_race_pre_{i}", WorkerProtocol) for i in range(200)]
+
+            def create() -> None:
+                for i in range(300):
+                    keep.append(LayerRegistry(f"test_race_new_{i}", WorkerProtocol))
+
+            sys.setswitchinterval(1e-5)
+            try:
+                reader = threading.Thread(target=snapshot)
+                writer = threading.Thread(target=create)
+                reader.start()
+                writer.start()
+                writer.join()
+                stop.set()
+                reader.join()
+            finally:
+                sys.setswitchinterval(old_interval)
+        assert errors == []
+        assert len(keep) == 500

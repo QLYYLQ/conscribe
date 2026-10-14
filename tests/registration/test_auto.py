@@ -15,14 +15,21 @@ Covers:
 """
 from __future__ import annotations
 
+import enum
 from abc import ABCMeta
 from typing import Protocol, runtime_checkable
 
 import pytest
 
+from conscribe.exceptions import DuplicateKeyError
 from conscribe.registration.registry import LayerRegistry
 from conscribe.registration.key_transform import make_key_transform, default_key_transform
 from conscribe.registration.auto import create_auto_registrar
+from conscribe.testing import isolated_registries
+
+
+class Kind(str, enum.Enum):
+    REACT = "react"
 
 
 @runtime_checkable
@@ -661,3 +668,194 @@ class TestPydanticGenericSkipping:
                 return "normal"
 
         assert "normal_worker" in registry.keys()
+
+
+# ===================================================================
+# Atomic registration (Path A)
+# ===================================================================
+
+class TestAtomicRegistration:
+    """A class whose definition fails leaves no binding in any registry."""
+
+    @staticmethod
+    def _base(registry: LayerRegistry) -> type:
+        Meta = create_auto_registrar(registry, default_key_transform)
+
+        class Base(metaclass=Meta):
+            __abstract__ = True
+
+            def do_work(self) -> str:
+                return ""
+
+        return Base
+
+    def test_multi_key_collision_leaves_no_partial_key(self) -> None:
+        registry = LayerRegistry("test_atomic_multi", SimpleProto)
+        Base = self._base(registry)
+
+        class Holder(Base):
+            __registry_key__ = "taken"
+
+        with pytest.raises(DuplicateKeyError, match="taken"):
+            class Partial(Base):
+                __registry_key__ = ["fresh", "taken"]
+
+        assert registry.keys() == ["taken"]
+        assert registry.get("taken") is Holder
+
+    def test_key_listed_twice_leaves_nothing(self) -> None:
+        registry = LayerRegistry("test_atomic_twice", SimpleProto)
+        Base = self._base(registry)
+
+        with pytest.raises(DuplicateKeyError, match="listed twice"):
+            class Twice(Base):
+                __registry_key__ = ["dup", "dup"]
+
+        assert registry.keys() == []
+
+    def test_invalid_config_schema_registers_nothing(self) -> None:
+        registry = LayerRegistry("test_atomic_schema", SimpleProto)
+        Base = self._base(registry)
+
+        with pytest.raises(TypeError, match="__config_schema__"):
+            class BadSchema(Base):
+                __config_schema__ = {"not": "a model"}
+
+        assert registry.keys() == []
+
+    def test_failure_after_add_purges(self) -> None:
+        class Picky(type):
+            """Refuses the re-creation stamp, written after the registry adds."""
+
+            def __setattr__(cls, name: str, value: object) -> None:
+                if name == "__registry_origin__":
+                    raise RuntimeError("late failure")
+                super().__setattr__(name, value)
+
+        registry = LayerRegistry("test_atomic_late", SimpleProto)
+        Meta = create_auto_registrar(registry, default_key_transform, base_metaclass=Picky)
+
+        class Base(metaclass=Meta):
+            __abstract__ = True
+
+            def do_work(self) -> str:
+                return ""
+
+        with pytest.raises(RuntimeError, match="late failure"):
+            class Late(Base):
+                __registry_key__ = ["late_a", "late_b"]
+
+        assert registry.keys() == []
+
+    def test_failure_in_injection_registers_nothing(self, monkeypatch) -> None:
+        import conscribe.wiring
+
+        registry = LayerRegistry("test_atomic_inject", SimpleProto)
+        Base = self._base(registry)
+
+        def failing_inject(cls: type) -> None:
+            raise RuntimeError("inject failed")
+
+        monkeypatch.setattr(conscribe.wiring, "inject_wired_descriptors", failing_inject)
+        with pytest.raises(RuntimeError, match="inject failed"):
+            class Broken(Base):
+                pass
+
+        assert registry.keys() == []
+
+    def test_registered_class_is_stamped(self) -> None:
+        registry = LayerRegistry("test_stamp_a", SimpleProto)
+        Base = self._base(registry)
+
+        class Stamped(Base):
+            pass
+
+        assert Stamped.__registry_origin__ == id(Stamped)
+        assert "__registry_origin__" not in Base.__dict__  # abstract: not registered
+
+
+# ===================================================================
+# Registry keys are validated up front (spec 4.9)
+# ===================================================================
+
+class TestRegistryKeyValidation:
+    """Review probes 4 and 26: odd keys registered under keys nobody looks up."""
+
+    @staticmethod
+    def _base(registry: LayerRegistry, key_transform=default_key_transform) -> type:
+        Meta = create_auto_registrar(registry, key_transform)
+
+        class Base(metaclass=Meta):
+            __abstract__ = True
+
+            def do_work(self) -> str:
+                return ""
+
+        return Base
+
+    @pytest.mark.parametrize(
+        ("key", "fragment"),
+        [
+            (Kind.REACT, "not the Enum member <Kind.REACT: 'react'> (str() of it is 'Kind.REACT'"),
+            (("a", "b"), "a tuple is not a key; list several keys in a list"),
+            (3, "a registry key must be a non-empty str, got int 3"),
+            ("", "a registry key must be a non-empty str"),
+            ([], "an empty list registers the class under no key"),
+            (["a", 1], "every key in the list must be a non-empty str, got int 1"),
+            (["a", ""], "every key in the list must be a non-empty str"),
+            (["a", Kind.REACT], "every key in the list must be a plain str, not the Enum member"),
+        ],
+    )
+    def test_invalid_keys_raise_before_registering(self, key, fragment) -> None:
+        from conscribe import InvalidRegistryKeyError, RegistryError
+
+        with isolated_registries():
+            registry = LayerRegistry("test_key_validation", SimpleProto)
+            Base = self._base(registry)
+            with pytest.raises(InvalidRegistryKeyError) as info:
+                class Odd(Base):
+                    __registry_key__ = key
+
+            assert registry.keys() == []
+            assert isinstance(info.value, RegistryError) and isinstance(info.value, TypeError)
+            assert info.value.source == "__registry_key__"
+            assert str(info.value).startswith(
+                "TestRegistryKeyValidation.test_invalid_keys_raise_before_registering.<locals>"
+                ".Odd: invalid registry key "
+            )
+            assert fragment in str(info.value)
+
+    def test_enum_member_fix_names_the_value(self) -> None:
+        from conscribe import InvalidRegistryKeyError
+
+        with isolated_registries():
+            registry = LayerRegistry("test_key_enum", SimpleProto)
+            Base = self._base(registry)
+            with pytest.raises(InvalidRegistryKeyError, match="write the plain string 'react'"):
+                class ReactLoop(Base):
+                    __registry_key__ = Kind.REACT
+
+    def test_valid_keys_still_register(self) -> None:
+        with isolated_registries():
+            registry = LayerRegistry("test_key_valid", SimpleProto)
+            Base = self._base(registry)
+
+            class One(Base):
+                __registry_key__ = "one"
+
+            class Many(Base):
+                __registry_key__ = ["a", "b"]
+
+            assert registry.keys() == ["one", "a", "b"]
+            assert Many.__registry_keys__ == ["a", "b"]
+
+    def test_key_transform_result_is_validated(self) -> None:
+        from conscribe import InvalidRegistryKeyError
+
+        with isolated_registries():
+            registry = LayerRegistry("test_key_transform", SimpleProto)
+            Base = self._base(registry, key_transform=lambda name: None)
+            with pytest.raises(InvalidRegistryKeyError, match="from key_transform"):
+                class Inferred(Base):
+                    pass
+            assert registry.keys() == []

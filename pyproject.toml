@@ -1,27 +1,29 @@
 [build-system]
-requires = ["hatchling"]
+# The core-metadata-version = "2.4" pins below need hatchling >= 1.26; 1.27 made 2.4 the default.
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
 name = "conscribe"
-version = "1.3.0"
+version = "2.0.0"
 description = "Automatic class registration and config typing stub generation for layered Python architectures"
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Typing :: Typed",
 ]
 dependencies = [
-    "pydantic>=2.0,<3.0",
+    "pydantic>=2.7,<3",
 ]
 
 [project.urls]
@@ -39,22 +41,23 @@ dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
     "attrs>=22.0",
+    "docstring-parser>=0.15",
 ]
 
+# sdist allowlist: nothing else from the repository root ships. hatchling adds PKG-INFO and
+# the root .gitignore itself. uv builds the wheel from the sdist, so anything the sdist drops
+# from conscribe/ (as the old "*.md" exclude did with the docs) is missing from the wheel too.
 [tool.hatch.build.targets.sdist]
-exclude = [
-    "tests/",
-    "*.md",
-    "!README.md",
-    ".claude/",
-    "demo_*.py",
-    "test_*.py",
-    "uv.lock",
-]
+only-include = ["conscribe", "README.md", "CHANGELOG.md", "LICENSE", "pyproject.toml"]
+# hatchling >= 1.32 defaults to Metadata-Version 2.5, which twine 6 rejects.
+core-metadata-version = "2.4"
 
 [tool.hatch.build.targets.wheel]
 packages = ["conscribe"]
+core-metadata-version = "2.4"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "--cov=conscribe --cov-report=term-missing --tb=short -q"
+# A conscribe warning a test did not assert with pytest.warns is a bug.
+filterwarnings = ["error::conscribe.exceptions.ConscribeWarning"]

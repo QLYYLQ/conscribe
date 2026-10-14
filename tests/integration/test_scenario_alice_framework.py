@@ -110,9 +110,7 @@ class TestAliceEndToEnd:
         for agent_name in ["browser_use", "skyvern", "agent_tars"]:
             agent_cls = AgentRegistrar.get(agent_name)
             agent = agent_cls()
-            result = asyncio.get_event_loop().run_until_complete(
-                agent.step("test task")
-            )
+            result = asyncio.run(agent.step("test task"))
             assert agent_name.replace("_", " ") in result.replace("_", " ") or agent_name in result
 
     def test_alice_get_all(self) -> None:

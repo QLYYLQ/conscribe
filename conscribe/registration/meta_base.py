@@ -40,6 +40,19 @@ class MetaRegistrarType(type):
     def __ror__(cls, other: type) -> type:
         return cls.__or__(other)
 
+    @property
+    def inline_only(cls) -> bool:
+        """Whether this AutoRegistrar's layer was declared inline-only.
+
+        Set with ``create_auto_registrar(..., inline_only=True)`` (which
+        ``create_registrar(..., inline_only=True)`` calls).  The property lives
+        on the meta-metaclass, so it is visible on AutoRegistrar metaclasses
+        only and never as an attribute of the classes they create (where it
+        could be mistaken for a dataclass or pydantic field default).
+        A combined metaclass reports the flag of its first AutoRegistrar base.
+        """
+        return bool(getattr(cls, "_conscribe_inline_only", False))
+
 
 class AutoRegistrarBase(type, metaclass=MetaRegistrarType):
     """Base metaclass for all conscribe AutoRegistrar metaclasses.

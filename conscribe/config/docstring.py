@@ -6,9 +6,13 @@ Supports Google, NumPy, and reST docstring formats.
 
 When ``docstring_parser`` is not installed, gracefully returns
 an empty dict — no error, no side-effect.
+
+Parsing is cached per docstring text (docstrings are immutable strings, so a
+cache entry can never go stale); every call returns a fresh dict.
 """
 from __future__ import annotations
 
+import functools
 import inspect
 from typing import Any, Union
 
@@ -63,12 +67,16 @@ def _parse_docstring(docstring: Union[str, None]) -> dict[str, str]:
     Returns:
         Dict of {param_name: description}. Empty if nothing found.
     """
-    if not docstring:
+    if not isinstance(docstring, str) or not docstring:
         return {}
+    return dict(_parse_cached(docstring))
 
+
+@functools.lru_cache(maxsize=2048)
+def _parse_cached(docstring: str) -> tuple[tuple[str, str], ...]:
     parsed = docstring_parser.parse(docstring)
-    result: dict[str, str] = {}
-    for param in parsed.params:
-        if param.description:
-            result[param.arg_name] = param.description.strip()
-    return result
+    return tuple(
+        (param.arg_name, param.description.strip())
+        for param in parsed.params
+        if param.description
+    )

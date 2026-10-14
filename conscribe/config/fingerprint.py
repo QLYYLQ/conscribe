@@ -1,93 +1,99 @@
 """Registry fingerprinting for staleness detection.
 
-Computes a SHA-256 based fingerprint of a registrar's contents
-(keys, class qualnames, signatures, docstrings) and provides
-JSON-file caching for comparing against previously generated stubs.
+:func:`compute_registry_fingerprint` condenses what conscribe *generates* for
+a layer into a 16-character hex digest.  Store it next to the generated files
+(:func:`save_fingerprint` / :func:`load_cached_fingerprint`) and compare it
+later: a different value means that regenerating would change the files.
 
-See ``config-typing-design.md`` Section 7 for specification.
+What is hashed
+--------------
+SHA-256 over a canonical JSON document (sorted keys, ASCII) holding:
+
+* ``conscribe.__version__``;
+* the registrar settings that only show in *composed* output: the layer
+  name, the discriminator field (flat mode) or fields (nested mode), the key
+  separator and ``inline_only``;
+* the layer's generated config source,
+  ``generate_layer_config_source(build_layer_config(registrar))``;
+* the layer's JSON Schema, ``json.dumps(generate_layer_json_schema(result),
+  sort_keys=True)``.
+
+The fingerprint therefore changes exactly when regeneration would change the
+outputs -- a field's type, default, description or constraint, the keys a
+wired field allows (a target registry gaining a key widens its ``Literal``),
+a wiring default key, ``declare_only``, the registered keys and their order
+in the union, a conscribe upgrade -- and never for edits that do not reach
+them (comments, a class docstring's summary, the body of a factory that the
+generated file imports by reference).  It is identical across processes and
+Python versions whenever the outputs are.
+
+A composed build with inline wiring embeds the target layers' unions in the
+owner's models; fingerprint every layer of the build to cover it.
+
+Never raises
+------------
+A fingerprint must be computable in broken states (that is when generated
+files most need to be flagged as stale).  Each part is computed on its own,
+and an exception becomes the marker ``error:<ExceptionType>:<message>``
+(object addresses ``0x...`` removed from the message), so a broken layer --
+malformed ``__wiring__``, a typo in an annotation, an empty layer -- still has
+a fingerprint, one that differs from the repaired layer's.  Warnings emitted
+while generating (``DegradationWarning``, ``ExtractionWarning``, ...) are
+suppressed: the outputs carry their own markers.
 """
 from __future__ import annotations
 
 import hashlib
-import inspect
 import json
+import re
+import warnings
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Union
+from typing import Any
+
+from conscribe.config.builder import build_layer_config
+from conscribe.config.codegen import generate_layer_config_source
+from conscribe.config.json_schema import generate_layer_json_schema
+
+#: Object addresses as CPython prints them: ``<X object at 0x10f3a2b40>``.
+_ADDRESS = re.compile(r"0x[0-9A-Fa-f]+")
+
+#: Number of hex characters kept from the SHA-256 digest.
+_DIGEST_LENGTH = 16
 
 
 def compute_registry_fingerprint(registrar: type) -> str:
-    """Compute a fingerprint of all registered classes in a registrar.
+    """Compute a fingerprint of a layer's generated config outputs.
 
-    The fingerprint captures the "shape" of all registered implementations:
-    - Sorted registry keys
-    - Each class's qualified name
-    - Each class's ``__init__`` signature (via ``inspect.signature``)
-    - Each class's docstring (affects Tier 1.5 description extraction)
+    Hashes ``conscribe.__version__``, the layer name, discriminator field(s),
+    key separator and ``inline_only`` of *registrar*, and the layer's
+    generated config source and JSON Schema (see the module docstring).  The
+    value changes exactly when regenerating the layer's files would change
+    them; it does not depend on object addresses, hash seeds or the Python
+    version beyond what the outputs themselves contain.
+
+    Never raises: a layer that cannot be generated (wiring problems, an
+    unresolvable annotation, no registered classes, ...) gets a fingerprint
+    built from a stable error marker, which differs from the fingerprint of
+    the repaired layer.  Warnings emitted while generating are suppressed.
 
     Args:
-        registrar: A ``LayerRegistrar`` subclass.
+        registrar: A ``LayerRegistrar`` subclass (from ``create_registrar``).
 
     Returns:
         A 16-character lowercase hex string (first 16 chars of SHA-256).
     """
-    hasher = hashlib.sha256()
-    all_classes = registrar.get_all()
-
-    _BM = _get_base_model()
-
-    for key in sorted(all_classes.keys()):
-        cls = all_classes[key]
-        hasher.update(key.encode("utf-8"))
-
-        # BaseModel fast path: hash model_fields instead of __init__
-        if (
-            _BM is not None
-            and isinstance(cls, type)
-            and issubclass(cls, _BM)
-            and cls is not _BM
-            and "__init__" not in cls.__dict__
-        ):
-            for fname in sorted(cls.model_fields.keys()):
-                fi = cls.model_fields[fname]
-                hasher.update(
-                    f"pydantic:{fname}:{fi.annotation}:{fi.default}".encode("utf-8")
-                )
-            doc = cls.__doc__ or ""
-            hasher.update(doc.encode("utf-8"))
-            continue
-
-        # Signature
-        init_definer = _find_init_definer(cls)
-        if init_definer is not None:
-            try:
-                sig = inspect.signature(init_definer.__init__)
-                hasher.update(str(sig).encode("utf-8"))
-            except (ValueError, TypeError):
-                hasher.update(b"<no-signature>")
-
-            # Docstring (class-level first, then __init__)
-            doc = init_definer.__doc__ or ""
-            init_doc = getattr(init_definer.__init__, "__doc__", None) or ""
-            hasher.update(doc.encode("utf-8"))
-            hasher.update(init_doc.encode("utf-8"))
-
-            # MRO parent signatures: when **kwargs is present,
-            # parent signatures affect the generated schema.
-            _hash_mro_parent_signatures(hasher, cls, init_definer)
-        else:
-            hasher.update(b"<no-init>")
-
-        # Hash __wiring__ declarations so that changes in referenced
-        # registries trigger fingerprint invalidation.
-        _hash_wiring(hasher, cls)
-
-    return hasher.hexdigest()[:16]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        document = _fingerprint_document(registrar)
+    text = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(text.encode("ascii")).hexdigest()[:_DIGEST_LENGTH]
 
 
 def load_cached_fingerprint(
     fingerprint_path: Path,
     layer_name: str,
-) -> Union[str, None]:
+) -> str | None:
     """Load a cached fingerprint from a JSON file.
 
     The JSON file stores ``{layer_name: fingerprint_hex}`` mappings.
@@ -97,18 +103,20 @@ def load_cached_fingerprint(
         layer_name: The layer name to look up.
 
     Returns:
-        The cached fingerprint string, or ``None`` if the file
-        doesn't exist, the layer is not found, or the file is corrupt.
+        The cached fingerprint string, or ``None`` if the file doesn't
+        exist, the layer is not found (or not stored as a string), or the
+        file is corrupt.
     """
     if not fingerprint_path.exists():
         return None
     try:
         data = json.loads(fingerprint_path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            return None
-        return data.get(layer_name)
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         return None
+    if not isinstance(data, dict):
+        return None
+    value = data.get(layer_name)
+    return value if isinstance(value, str) else None
 
 
 def save_fingerprint(
@@ -131,11 +139,11 @@ def save_fingerprint(
     data: dict[str, Any] = {}
     if fingerprint_path.exists():
         try:
-            data = json.loads(fingerprint_path.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                data = {}
-        except (json.JSONDecodeError, OSError):
-            data = {}
+            loaded = json.loads(fingerprint_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+            loaded = None
+        if isinstance(loaded, dict):
+            data = loaded
 
     data[layer_name] = fingerprint
 
@@ -148,117 +156,65 @@ def save_fingerprint(
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers
+# The hashed document
 # ---------------------------------------------------------------------------
 
 
-def _get_base_model() -> Union[type, None]:
-    """Lazily import pydantic.BaseModel, returning None if unavailable."""
-    try:
-        from pydantic import BaseModel
-        return BaseModel
-    except ImportError:
-        return None
+def _fingerprint_document(registrar: Any) -> dict[str, Any]:
+    """The inputs of the fingerprint, as plain JSON values.
 
-
-def _find_init_definer(cls: type) -> Union[type, None]:
-    """Walk MRO to find the class that actually defines ``__init__``."""
-    from conscribe.config._utils import find_init_definer
-    return find_init_definer(cls)
-
-
-def _hash_wiring(hasher: hashlib._Hash, cls: type) -> None:
-    """Hash ``__wiring__`` resolved keys into the fingerprint.
-
-    This ensures that when a referenced registry changes (e.g., a new
-    class is registered in the "agent_loop" registry), the fingerprint
-    of the referencing registry invalidates, triggering stub regeneration.
+    The generated source and schema are both error markers when the layer
+    cannot be built; when only one of them fails, the other is still hashed.
     """
-    from conscribe.exceptions import WiringResolutionError
-
+    document: dict[str, Any] = {
+        "conscribe": _guarded(_conscribe_version),
+        "layer": {
+            "name": _guarded(lambda: registrar._registry.name),
+            "discriminator_field": _guarded(lambda: registrar.discriminator_field),
+            "discriminator_fields": _guarded(lambda: registrar.discriminator_fields),
+            "key_separator": _guarded(lambda: registrar._key_separator),
+            "inline_only": _guarded(lambda: registrar.inline_only),
+        },
+    }
     try:
-        from conscribe.wiring import resolve_wiring
-        resolved = resolve_wiring(cls)
-    except (WiringResolutionError, TypeError):
-        # Wiring resolution can fail if referenced registries aren't
-        # populated yet. In that case, hash the raw __wiring__ dict
-        # to at least detect changes in the declaration itself.
-        from conscribe.wiring import collect_wiring_from_mro
-        raw = collect_wiring_from_mro(cls)
-        if raw:
-            hasher.update(f"wiring_raw:{sorted(raw.items())}".encode("utf-8"))
-        return
-
-    for param_name in sorted(resolved.keys()):
-        wiring = resolved[param_name]
-        hasher.update(
-            f"wiring:{param_name}:{sorted(wiring.allowed_keys)}".encode("utf-8")
-        )
-        if wiring.optional_keys is not None:
-            hasher.update(
-                f"wiring_optional:{param_name}:{sorted(wiring.optional_keys)}".encode("utf-8")
-            )
-
-
-def _hash_mro_parent_signatures(
-    hasher: hashlib._Hash,
-    cls: type,
-    init_definer: type,
-) -> None:
-    """Hash parent class signatures when ``init_definer`` has ``**kwargs``.
-
-    This ensures that changes to parent ``__init__`` signatures cause
-    fingerprint invalidation when the child uses ``**kwargs`` forwarding.
-    """
-    init = init_definer.__dict__.get("__init__")
-    if init is None:
-        return
-
-    try:
-        sig = inspect.signature(init)
-    except (ValueError, TypeError):
-        return
-
-    has_var_kw = any(
-        p.kind == inspect.Parameter.VAR_KEYWORD
-        for p in sig.parameters.values()
+        result = build_layer_config(registrar)
+    except Exception as exc:  # noqa: BLE001 - a fingerprint must stay computable in broken states
+        document["source"] = document["schema"] = _error_marker(exc)
+        return document
+    document["source"] = _guarded(lambda: generate_layer_config_source(result))
+    document["schema"] = _guarded(
+        lambda: json.dumps(generate_layer_json_schema(result), sort_keys=True)
     )
-    if not has_var_kw:
-        return
+    return document
 
-    # Walk MRO from init_definer upward
-    mro = cls.__mro__
+
+def _guarded(compute: Callable[[], Any]) -> Any:
+    """``compute()`` as a plain JSON value, or the error marker of what it raised."""
     try:
-        start_idx = mro.index(init_definer)
-    except ValueError:
-        return
+        return _plain(compute())
+    except Exception as exc:  # noqa: BLE001 - a fingerprint must stay computable in broken states
+        return _error_marker(exc)
 
-    for klass in mro[start_idx + 1 :]:
-        if klass is object:
-            break
-        if "__init__" not in klass.__dict__:
-            continue
 
-        try:
-            parent_sig = inspect.signature(klass.__init__)
-            hasher.update(f"mro:{klass.__qualname__}:{parent_sig}".encode("utf-8"))
-        except (ValueError, TypeError):
-            hasher.update(f"mro:{klass.__qualname__}:<no-sig>".encode("utf-8"))
+def _plain(value: Any) -> Any:
+    """*value* as a JSON value that does not depend on the process."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_plain(item) for item in value]
+    return f"{type(value).__qualname__}:{_ADDRESS.sub('0x...', repr(value))}"
 
-        # Hash parent docstrings too
-        parent_doc = klass.__doc__ or ""
-        parent_init_doc = getattr(klass.__init__, "__doc__", None) or ""
-        hasher.update(parent_doc.encode("utf-8"))
-        hasher.update(parent_init_doc.encode("utf-8"))
 
-        # Check if this parent also has **kwargs; if not, stop
-        try:
-            parent_sig = inspect.signature(klass.__init__)
-            parent_has_kw = any(
-                p.kind == inspect.Parameter.VAR_KEYWORD
-                for p in parent_sig.parameters.values()
-            )
-            if not parent_has_kw:
-                break
-        except (ValueError, TypeError):
-            break
+def _error_marker(exc: BaseException) -> str:
+    """``error:<ExceptionType>:<message>``, object addresses removed."""
+    try:
+        message = str(exc)
+    except Exception:  # noqa: BLE001 - a user __str__ may raise; the type still marks the state
+        message = "<message unavailable>"
+    return f"error:{type(exc).__qualname__}:{_ADDRESS.sub('0x...', message)}"
+
+
+def _conscribe_version() -> str:
+    import conscribe
+
+    return conscribe.__version__

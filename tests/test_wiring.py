@@ -15,6 +15,7 @@ from conscribe.wiring import (
     inject_wired_descriptors,
     parse_wiring,
     resolve_wiring,
+    wired_field,
 )
 
 
@@ -35,8 +36,12 @@ class LLMProtocol(Protocol):
 
 @pytest.fixture(autouse=True)
 def _cleanup_registries():
-    """Clean up test registries after each test."""
+    """Clean up test registries (and discover()'s failure record) around each test."""
+    from conscribe.discover import clear_import_failures
+
+    clear_import_failures()
     yield
+    clear_import_failures()
     for name in list(_REGISTRY_INDEX.keys()):
         if name.startswith("test_"):
             _deregister(name)
@@ -183,15 +188,22 @@ class TestParseWiring:
         class Bad:
             __wiring__ = {"x": 42}
 
-        with pytest.raises(TypeError, match="Invalid __wiring__ entry"):
+        with pytest.raises(WiringResolutionError, match="expected a registry name") as exc_info:
             parse_wiring(Bad)
+        assert [p.kind for p in exc_info.value.problems] == ["malformed"]
+        assert exc_info.value.problems[0].param_name == "x"
+        assert "got int 42" in str(exc_info.value)
 
     def test_invalid_tuple_raises(self):
         class Bad:
             __wiring__ = {"x": (42, "not_a_list")}
 
-        with pytest.raises(TypeError, match="tuple mode expects"):
+        with pytest.raises(WiringResolutionError) as exc_info:
             parse_wiring(Bad)
+        message = str(exc_info.value)
+        assert "first tuple element (registry name) must be a non-empty str, got int 42" in message
+        assert "second tuple element (keys) must be a list of str, got str 'not_a_list'" in message
+        assert [p.kind for p in exc_info.value.problems] == ["malformed"]
 
     def test_mode2_tuple_with_optional(self):
         class Agent:
@@ -227,7 +239,10 @@ class TestParseWiring:
         class Bad:
             __wiring__ = {"x": ("reg", ["a"], "not_a_list")}
 
-        with pytest.raises(TypeError, match="third element.*must be list"):
+        with pytest.raises(
+            WiringResolutionError,
+            match=r"third tuple element \(optional keys\) must be a list of str",
+        ):
             parse_wiring(Bad)
 
     def test_empty_wiring(self):
@@ -276,7 +291,7 @@ class TestResolveWiring:
         class Agent:
             __wiring__ = {"loop": "nonexistent_registry"}
 
-        with pytest.raises(WiringResolutionError, match="not found"):
+        with pytest.raises(WiringResolutionError, match="unknown registry 'nonexistent_registry'"):
             resolve_wiring(Agent)
 
     def test_empty_registry_raises(self):
@@ -301,8 +316,9 @@ class TestResolveWiring:
         class Agent:
             __wiring__ = {"browser": []}
 
-        with pytest.raises(WiringResolutionError, match="non-empty"):
+        with pytest.raises(WiringResolutionError, match="literal list is empty") as exc_info:
             resolve_wiring(Agent)
+        assert [p.kind for p in exc_info.value.problems] == ["empty_keys"]
 
     def test_no_wiring_returns_empty(self):
         class Plain:
@@ -355,8 +371,12 @@ class TestResolveWiring:
         class Agent:
             __wiring__ = {"obs": ("test_obs2", ["terminal"], ["nonexistent"])}
 
-        with pytest.raises(WiringResolutionError, match="Optional keys not found"):
+        with pytest.raises(
+            WiringResolutionError,
+            match=r"unknown optional key 'nonexistent' in registry 'test_obs2'; registered: \['terminal'\]",
+        ) as exc_info:
             resolve_wiring(Agent)
+        assert [p.kind for p in exc_info.value.problems] == ["unknown_optional_key"]
 
     def test_mode2_backward_compat_resolved(self):
         """2-element tuple should produce optional_keys=None in ResolvedWiring."""
@@ -515,7 +535,11 @@ class TestResolveWiringRelativeKeys:
         class BadAgent:
             __wiring__ = {"action": ("test_rel6", ["click"], ["teleport"])}
 
-        with pytest.raises(WiringResolutionError, match="Optional keys not found"):
+        with pytest.raises(
+            WiringResolutionError,
+            match=r"unknown optional key 'teleport' in registry 'test_rel6' "
+            r"\(capability-relative: no registered key ends in '\.teleport'\)",
+        ):
             resolve_wiring(BadAgent)
 
     def test_flat_registry_short_key_unchanged(self):
@@ -597,12 +621,29 @@ class TestWiredField:
         wf = WiredField("browser")
         assert repr(wf) == "WiredField('browser')"
 
-    def test_class_level_access_returns_descriptor(self):
+    def test_class_level_access_returns_descriptor_when_not_annotated(self):
         class Foo:
             env = WiredField("env", registry_name="environment")
 
         assert isinstance(Foo.env, WiredField)
         assert Foo.env.name == "env"
+        assert not hasattr(WiredField("env"), "annotated")  # decided at access time
+
+    def test_class_level_access_raises_when_holder_annotates(self):
+        """An annotated name has no class-level value (dataclass/pydantic read
+        that as "no default"); the descriptor stays reachable statically."""
+        import inspect
+
+        class Foo:
+            __wiring__ = {"env": "environment"}
+            env: object = WiredField("env", registry_name="environment")
+
+        with pytest.raises(AttributeError, match="Foo.env has no class-level value"):
+            Foo.env
+        assert not hasattr(Foo, "env")
+        descriptor = inspect.getattr_static(Foo, "env")
+        assert isinstance(descriptor, WiredField)
+        assert wired_field(Foo, "env") is descriptor
 
     def test_instance_access_before_injection_raises(self):
         class Foo:
@@ -620,13 +661,14 @@ class TestWiredField:
 
     def test_instance_assignment_shadows_descriptor(self):
         class Foo:
+            __wiring__ = {"env": ["a"]}
             env = WiredField("env")
 
         obj = Foo()
         obj.env = "injected_value"
         assert obj.env == "injected_value"
         # Descriptor still on the class
-        assert isinstance(Foo.env, WiredField)
+        assert isinstance(wired_field(Foo, "env"), WiredField)
 
     def test_different_instances_independent(self):
         class Foo:
@@ -696,7 +738,30 @@ class TestInjectWiredDescriptors:
         assert isinstance(Child.__dict__["llm"], WiredField)
         # Child inherits env from Base (not in Child.__dict__)
         assert "env" not in Child.__dict__
-        assert isinstance(Child.env, WiredField)  # class-level access
+        assert wired_field(Child, "env") is Base.__dict__["env"]
+        assert Child.env is Base.__dict__["env"]  # not annotated: class access works
+
+    def test_annotated_name_gets_no_own_descriptor(self):
+        """The class declares the slot itself; attrs would read an own
+        placeholder from ``__dict__`` as the field's default."""
+
+        class Agent:
+            __wiring__ = {"env": "environment", "llm": "llm_provider"}
+            env: object
+
+        inject_wired_descriptors(Agent)
+        assert "env" not in Agent.__dict__
+        assert wired_field(Agent, "env") is None
+        assert Agent.llm is Agent.__dict__["llm"]
+
+    def test_never_overwrites_a_class_body_binding(self):
+        class Agent:
+            __wiring__ = {"env": "environment"}
+            env = None
+
+        inject_wired_descriptors(Agent)
+        assert Agent.__dict__["env"] is None
+        assert Agent().env is None
 
     def test_mode2_tuple_registry_name(self):
         class Agent:

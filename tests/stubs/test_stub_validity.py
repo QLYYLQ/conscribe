@@ -1,44 +1,46 @@
 """Regression tests: generated ``.pyi`` stubs must be valid Python.
 
-Bug: the stub generator ``repr()``-ed defaults straight into ``__init__``
-signatures, emitting ``<factory>`` (the dataclass ``default_factory``
-sentinel) and ``FieldInfo(...)``; it referenced module-private names it
-never imported; and it dropped ``async`` from every coroutine method, so
-every ``await`` on those methods became a type error downstream.
+Bugs this guards against: the stub generator ``repr()``-ed defaults straight
+into ``__init__`` signatures, emitting ``<factory>`` (the dataclass
+``default_factory`` sentinel) and ``FieldInfo(...)``; it referenced
+module-private names it never imported (then bound them to ``Any``); and it
+dropped ``async`` from every coroutine method, so every ``await`` on those
+methods became a type error downstream.
 
-The acceptance here is deliberately *mechanical*: the stub must
-``compile()``, must bind every name it references, and must keep
-``async def``.  A stub that merely "looks right" is not enough — the
+The acceptance here is deliberately *mechanical*: the stub must parse, must
+bind every name it references, must import only names that exist, and must
+keep ``async def``.  A stub that merely "looks right" is not enough -- the
 broken one looked plausible and did not parse.
 """
 from __future__ import annotations
 
 import ast
-import builtins
-import sys
+import enum
+import math
+import re
 
 import pytest
 
-from conscribe.registration.registry import (
-    _REGISTRY_INDEX,
-    LayerRegistry,
-    _deregister,
+from conscribe.registration.registry import LayerRegistry
+from conscribe.stubs.collector import (
+    ClassStubInfo,
+    InjectedAttr,
+    collect_class_members,
+    collect_class_stub_info,
 )
-from conscribe.stubs.collector import collect_class_stub_info, render_signature
 from conscribe.stubs.generator import generate_module_stub
 
 from . import _downstream_shapes as shapes
+from ._helpers import assert_valid_stub, class_body
 
 
 @pytest.fixture(autouse=True)
-def _provider_registry():
+def _provider_registry(conscribe_isolated):
+    """The provider registry, rolled back (with everything else) after each test."""
     reg = LayerRegistry("test_stub_provider", shapes.ProviderProtocol)
     reg.add("local", shapes.LocalProvider)
     reg.add("remote", shapes.RemoteProvider)
     yield reg
-    for name in list(_REGISTRY_INDEX.keys()):
-        if name.startswith("test_"):
-            _deregister(name)
 
 
 @pytest.fixture
@@ -63,8 +65,12 @@ class TestStubIsValidPython:
         """The whole point: the emitted stub must be real Python source."""
         compile(stub_source, "<stub>", "exec")
 
+    def test_stub_is_self_consistent(self, stub_source):
+        """Every name bound, nothing bound twice, every import exists."""
+        assert_valid_stub(stub_source)
+
     def test_no_factory_sentinel(self, stub_source):
-        """``<factory>`` is the dataclass sentinel repr — never valid source."""
+        """``<factory>`` is the dataclass sentinel repr -- never valid source."""
         assert "<factory>" not in stub_source
         # No repr-of-an-object leaked into the source at all.
         assert "<" not in stub_source.replace("->", "")
@@ -75,23 +81,32 @@ class TestStubIsValidPython:
     def test_pydantic_defaults_do_not_leak(self, stub_source):
         """FieldInfo / model instances degrade to ``...`` (the v1.1.2 defect)."""
         assert "FieldInfo(" not in stub_source
-        assert "Settings(" not in stub_source
+        assert "= Settings(" not in stub_source
         assert "opts: Settings = ..." in stub_source
 
     def test_wired_field_descriptor_default_does_not_leak(self, stub_source):
-        """A ``WiredField`` becomes a dataclass default; it must not be emitted."""
+        """A ``WiredField`` can become a dataclass default; it must not be emitted."""
         assert "WiredField(" not in stub_source
 
-    def test_every_referenced_name_is_bound(self, stub_source):
-        """No undefined names: a .pyi *replaces* its module for type checkers."""
-        from conscribe.stubs.generator import _unresolved_names
+    def test_injected_attribute_is_typed_as_the_protocol(self, stub_source):
+        """Mode 2 ``["local"]`` would have narrowed to ``LocalProvider`` in 1.3.0."""
+        plain = class_body(stub_source, "PlainCapability")
+        assert "backend: ProviderProtocol  # wired from: test_stub_provider" in plain
+        assert "LocalProvider" not in stub_source
 
-        assert _unresolved_names(stub_source) == []
+    def test_module_private_names_become_placeholders(self, stub_source):
+        """Same-module helpers cannot be imported from their own stub: they are
+        defined as nominal placeholders, never bound to ``Any``."""
+        assert "class _ObserveCycleCache(Any): ..." in stub_source
+        assert "class _StateEventOutcome(Any): ..." in stub_source
+        assert "class Settings(Any): ..." in stub_source
+        assert not re.search(r"^\w+ = Any$", stub_source, flags=re.M)
 
-    def test_module_private_names_fall_back_to_any(self, stub_source):
-        """Same-module helpers are not importable from the stub → Any."""
-        assert "_ObserveCycleCache = Any" in stub_source
-        assert "_StateEventOutcome = Any" in stub_source
+    def test_same_module_protocol_is_structural(self, stub_source):
+        assert (
+            "@runtime_checkable\nclass ProviderProtocol(Protocol):\n"
+            "    def connect(self) -> str: ...\n"
+        ) in stub_source
 
 
 class TestAsyncSurvives:
@@ -133,6 +148,11 @@ class TestAsyncSurvives:
         assert "@staticmethod\n    async def probe" in stub_source
         assert "@classmethod\n    async def build" in stub_source
 
+    def test_typing_alias_keeps_its_spelling(self, stub_source):
+        """``AsyncIterator[str]`` from ``typing`` stays that (not collections.abc)."""
+        assert "async def stream(self) -> AsyncIterator[str]: ..." in stub_source
+        assert "AsyncIterator_2" not in stub_source
+
 
 class TestWriterOutputCompiles:
     def test_written_pyi_file_compiles(self, tmp_path, _provider_registry):
@@ -150,100 +170,97 @@ class TestWriterOutputCompiles:
         for path in written:
             source = path.read_text(encoding="utf-8")
             compile(source, str(path), "exec")
+            assert_valid_stub(source)
             assert "async def" in source
 
 
-# ── render_signature unit coverage ───────────────────────────────
+# ── Signature rendering ──────────────────────────────────────────
 
 
-class TestRenderSignature:
-    def _sig(self, func):
-        import inspect
+def _signature(func) -> str:
+    """The rendered ``def`` line of *func* as a method of a throwaway class."""
+    # A static method: the rendered stub must type-check, and *func* has no ``self``.
+    owner = type("Owner", (), {"f": staticmethod(func), "__module__": __name__})
+    info = ClassStubInfo(
+        cls=owner,
+        class_name="Owner",
+        module=__name__,
+        source_file=None,
+        bases=(object,),
+        injected_attrs=(InjectedAttr("dummy", str, None),),
+        methods=collect_class_members(owner).methods,
+    )
+    source = generate_module_stub(__name__, [info])
+    line = next(line for line in source.splitlines() if "def f(" in line)
+    return line.strip()
 
-        return render_signature(inspect.signature(func))
 
+class TestSignatureRendering:
     def test_simple_literals_are_preserved(self):
         def f(a: int = 1, b: str = "x", c: bool = False, d: None = None): ...
 
-        rendered = self._sig(f)
-        assert "a: int = 1" in rendered
-        assert "b: str = 'x'" in rendered
-        assert "c: bool = False" in rendered
-        assert "d: None = None" in rendered
+        assert _signature(f) == "def f(a: int = 1, b: str = 'x', c: bool = False, d: None = None): ..."
 
     def test_empty_containers_are_preserved(self):
         def f(a: list = [], b: dict = {}, c: tuple = ()): ...
 
-        rendered = self._sig(f)
-        assert "a: list = []" in rendered
-        assert "b: dict = {}" in rendered
-        assert "c: tuple = ()" in rendered
+        assert _signature(f) == "def f(a: list = [], b: dict = {}, c: tuple = ()): ..."
 
     def test_arbitrary_object_default_becomes_ellipsis(self):
         sentinel = object()
 
         def f(a: int = sentinel): ...  # type: ignore[assignment]
 
-        assert "a: int = ..." in self._sig(f)
+        assert "a: int = ..." in _signature(f)
 
     def test_enum_default_becomes_ellipsis(self):
-        import enum
-
         class Color(enum.IntEnum):
             RED = 1
 
         def f(a: int = Color.RED): ...
 
-        rendered = self._sig(f)
+        rendered = _signature(f)
         assert "a: int = ..." in rendered
         assert "Color" not in rendered
 
+    def test_non_finite_float_default_becomes_ellipsis(self):
+        """``repr(inf)`` is ``inf``: not a literal, would be an unbound name."""
+
+        def f(a: float = math.inf, b: float = 0.5): ...
+
+        assert _signature(f) == "def f(a: float = ..., b: float = 0.5): ..."
+
     def test_string_annotations_are_unquoted(self):
-        """PEP 563 gives string annotations; the stub already defers them."""
-        rendered = self._sig(shapes.DataclassCapability.observe)
-        assert "cache: _ObserveCycleCache" in rendered
-        assert "'_ObserveCycleCache'" not in rendered
+        source = generate_module_stub(
+            shapes.__name__, [collect_class_stub_info(shapes.DataclassCapability)]
+        )
+        assert "cache: _ObserveCycleCache" in source
+        assert "'_ObserveCycleCache'" not in source
 
     def test_explicit_forward_ref_is_not_double_quoted(self):
-        rendered = self._sig(shapes.DataclassCapability.build)
+        source = generate_module_stub(
+            shapes.__name__, [collect_class_stub_info(shapes.DataclassCapability)]
+        )
         # Was rendered as -> "'DataclassCapability'" (a nested string).
-        assert '"\'' not in rendered
-        assert "DataclassCapability" in rendered
+        assert '"\'' not in source
+        assert "async def build(cls) -> DataclassCapability: ..." in source
 
     def test_star_args_and_kwargs_survive(self):
-        rendered = self._sig(shapes.PlainCapability.resolve_fragment)
-        assert "**kwargs: Any" in rendered
+        def f(*args: int, **kwargs: str): ...
+
+        assert _signature(f) == "def f(*args: int, **kwargs: str): ..."
 
     def test_keyword_only_marker_survives(self):
         def f(a: int, *, b: int = 2): ...
 
-        assert "*, b: int = 2" in self._sig(f)
+        assert _signature(f) == "def f(a: int, *, b: int = 2): ..."
 
-    @pytest.mark.skipif(
-        sys.version_info < (3, 8), reason="positional-only params need 3.8+"
-    )
     def test_positional_only_marker_survives(self):
         namespace: dict = {}
         exec("def f(a: int, /, b: int = 2): ...", namespace)
-        assert "/" in self._sig(namespace["f"])
+        assert _signature(namespace["f"]) == "def f(a: int, /, b: int = 2): ..."
 
-    def test_builtin_names_are_not_aliased(self):
-        """``_unresolved_names`` must not flag real builtins."""
-        from conscribe.stubs.generator import _unresolved_names
+    def test_builtin_names_are_used_as_is(self):
+        def f(a: Exception, b: property) -> BaseException: ...
 
-        source = (
-            "from typing import Any\n"
-            "def f(a: Exception, b: property) -> BaseException: ...\n"
-        )
-        assert _unresolved_names(source) == []
-        assert "Exception" in dir(builtins)
-
-    def test_literal_string_args_are_not_treated_as_names(self):
-        """``Literal['a']`` must not produce a bogus ``a = Any`` alias."""
-        from conscribe.stubs.generator import _unresolved_names
-
-        source = (
-            "from typing import Any, Literal\n"
-            "def f(mode: Literal['fast', 'slow']) -> Any: ...\n"
-        )
-        assert _unresolved_names(source) == []
+        assert _signature(f) == "def f(a: Exception, b: property) -> BaseException: ..."

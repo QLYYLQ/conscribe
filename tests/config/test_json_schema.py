@@ -713,20 +713,28 @@ class TestTypeRepresentation:
         # or may use "type": ["string", "null"]
         has_anyof = "anyOf" in desc_prop
         has_type_list = isinstance(desc_prop.get("type"), list)
-        has_null_ref = any(
-            item.get("type") == "null"
-            for item in desc_prop.get("anyOf", [])
-        ) if has_anyof else False
+        has_null = any(item.get("type") == "null" for item in desc_prop.get("anyOf", [])) or (
+            has_type_list and "null" in desc_prop["type"]
+        )
 
         assert has_anyof or has_type_list, (
             f"Expected Optional[str] to use anyOf or type list for nullable. "
             f"Got: {desc_prop}"
         )
+        assert has_null, f"Expected a null branch for Optional[str]. Got: {desc_prop}"
 
 
 # ===================================================================
 # Degraded fields in JSON Schema
 # ===================================================================
+
+def _build_degraded(registrar: Any) -> LayerConfigResult:
+    """Build a layer whose fields degrade; the DegradationWarning is part of the contract."""
+    from conscribe.exceptions import DegradationWarning
+
+    with pytest.warns(DegradationWarning, match="degrades to Any"):
+        return build_layer_config(registrar)
+
 
 class _IncompatibleType:
     """A type Pydantic cannot serialize."""
@@ -760,7 +768,7 @@ class TestDegradedFieldsJsonSchema:
 
     def test_x_degraded_fields_present(self) -> None:
         """JSON schema contains x-degraded-fields when degradation occurred."""
-        result = build_layer_config(_degraded_json_reg)
+        result = _build_degraded(_degraded_json_reg)
         schema = generate_layer_json_schema(result)
 
         assert "x-degraded-fields" in schema
@@ -779,7 +787,7 @@ class TestDegradedFieldsJsonSchema:
 
     def test_degraded_property_has_description(self) -> None:
         """Degraded field property has a description with [degraded] prefix."""
-        result = build_layer_config(_degraded_json_reg)
+        result = _build_degraded(_degraded_json_reg)
         schema = generate_layer_json_schema(result)
 
         auth_prop = _find_property_in_schema(schema, "auth")
@@ -789,7 +797,7 @@ class TestDegradedFieldsJsonSchema:
 
     def test_degraded_property_has_x_degraded_from(self) -> None:
         """Degraded field property has x-degraded-from extension."""
-        result = build_layer_config(_degraded_json_reg)
+        result = _build_degraded(_degraded_json_reg)
         schema = generate_layer_json_schema(result)
 
         auth_prop = _find_property_in_schema(schema, "auth")
@@ -837,7 +845,7 @@ class TestDegradedFieldsMultiModelJsonSchema:
 
     def test_multi_model_x_degraded_fields_present(self) -> None:
         """Multi-model schema has x-degraded-fields with the degraded key."""
-        result = build_layer_config(_multi_degraded_reg)
+        result = _build_degraded(_multi_degraded_reg)
         schema = generate_layer_json_schema(result)
 
         assert "x-degraded-fields" in schema
@@ -848,7 +856,7 @@ class TestDegradedFieldsMultiModelJsonSchema:
     def test_multi_model_defs_annotated(self) -> None:
         """In multi-model schema, the degraded model inside $defs has
         x-degraded-from and description on the degraded property."""
-        result = build_layer_config(_multi_degraded_reg)
+        result = _build_degraded(_multi_degraded_reg)
         schema = generate_layer_json_schema(result)
 
         # Multi-model schema should have $defs
@@ -861,7 +869,7 @@ class TestDegradedFieldsMultiModelJsonSchema:
 
     def test_multi_model_clean_model_not_annotated(self) -> None:
         """The clean (non-degraded) model in $defs has no x-degraded-from."""
-        result = build_layer_config(_multi_degraded_reg)
+        result = _build_degraded(_multi_degraded_reg)
         schema = generate_layer_json_schema(result)
 
         temp_prop = _find_property_in_schema(schema, "temperature")
@@ -904,7 +912,7 @@ class TestDegradedFieldDescriptionAppend:
     def test_existing_description_preserved_and_appended(self) -> None:
         """When a degraded field already has a description, the degradation
         info is appended rather than replacing it."""
-        result = build_layer_config(_desc_degraded_reg)
+        result = _build_degraded(_desc_degraded_reg)
         schema = generate_layer_json_schema(result)
 
         auth_prop = _find_property_in_schema(schema, "auth")
@@ -914,3 +922,296 @@ class TestDegradedFieldDescriptionAppend:
         assert "Authentication handler" in desc
         # Degradation info should be appended
         assert "[degraded]" in desc
+
+
+# ===================================================================
+# conscribe 2.0: deterministic schemas, published == in-process
+# ===================================================================
+
+import subprocess  # noqa: E402
+import sys  # noqa: E402
+import textwrap  # noqa: E402
+
+from pydantic import create_model  # noqa: E402
+
+from conscribe.config.json_schema import _DeterministicJsonSchema  # noqa: E402
+
+from tests.config.artifact_parity import normalize_schema, schema_of, same_value  # noqa: E402
+
+
+_SEED_SCRIPT = textwrap.dedent(
+    """
+    import json
+    from typing import Protocol, runtime_checkable
+    from conscribe import create_registrar
+    from conscribe.config.builder import build_layer_config
+    from conscribe.config.codegen import generate_layer_config_source
+    from conscribe.config.json_schema import generate_layer_json_schema
+
+    @runtime_checkable
+    class P(Protocol):
+        def run(self) -> None: ...
+
+    reg = create_registrar("seeded", P, discriminator_field="kind")
+
+    class Base(metaclass=reg.Meta):
+        __abstract__ = True
+        def run(self) -> None: ...
+
+    class Tagged(Base):
+        __registry_key__ = "tagged"
+        def __init__(
+            self,
+            tags: frozenset[str] = frozenset({"alpha", "beta", "gamma", "delta", "eps"}),
+            names: set[str] = {"zeta", "eta", "theta", "iota"},
+        ):
+            pass
+
+    result = build_layer_config(reg)
+    print(json.dumps(generate_layer_json_schema(result), sort_keys=True))
+    print(generate_layer_config_source(result))
+    """
+)
+
+
+def _run_with_seed(seed: str) -> str:
+    env = {**__import__("os").environ, "PYTHONHASHSEED": seed}
+    proc = subprocess.run(
+        [sys.executable, "-c", _SEED_SCRIPT], capture_output=True, text=True, env=env, check=True,
+    )
+    return proc.stdout
+
+
+class TestDeterminism:
+    """Published artifacts do not depend on ``PYTHONHASHSEED``."""
+
+    def test_set_defaults_are_sorted(self) -> None:
+        model = create_model(
+            "SetDefaults",
+            tags=(frozenset[str], frozenset({"b", "c", "a"})),
+            nested=(dict[str, set[int]], {"k": {3, 1, 2}}),
+        )
+        schema = model.model_json_schema(schema_generator=_DeterministicJsonSchema)
+        assert schema["properties"]["tags"]["default"] == ["a", "b", "c"]
+        assert schema["properties"]["nested"]["default"] == {"k": [1, 2, 3]}
+
+    def test_schema_and_source_identical_across_hash_seeds(self) -> None:
+        outputs = {_run_with_seed(seed) for seed in ("1", "2", "3")}
+        assert len(outputs) == 1
+
+
+class TestPublishedSchemaParity:
+    """The published schema equals the in-process schema (``x-`` keys aside)."""
+
+    @pytest.mark.parametrize("registrar", [
+        _single_reg, _multi_reg, _description_reg, _constraint_reg, _required_reg,
+        _default_reg, _basic_types_reg, _complex_types_reg, _open_reg, _disc_const_reg,
+    ])
+    def test_layer_schema(self, registrar: Any) -> None:
+        result = build_layer_config(registrar)
+        published = generate_layer_json_schema(result)
+        stripped = {k: v for k, v in published.items() if not k.startswith("x-")}
+        assert same_value(normalize_schema(stripped), normalize_schema(schema_of(result.union_type)))
+
+    def test_factory_fields_publish_no_default(self) -> None:
+        def make() -> list[str]:
+            return ["*"]
+
+        model = create_model("FactorySchema", globs=(list[str], Field(default_factory=make)))
+        prop = schema_of(model)["properties"]["globs"]
+        assert "default" not in prop
+
+
+# ===================================================================
+# The composed schema is the top-level model's own schema (F3)
+# ===================================================================
+
+from conscribe.config.composed import ComposedConfigResult, build_composed_config  # noqa: E402
+from conscribe.config.json_schema import generate_composed_json_schema  # noqa: E402
+
+
+@runtime_checkable
+class _SinkProto(Protocol):
+    def run(self) -> None: ...
+
+
+def _sink_and_hook(*, inline_only: bool) -> dict[str, Any]:
+    sink = create_registrar("js_sink", _SinkProto, discriminator_field="sink_id", inline_only=inline_only)
+    hook = create_registrar("js_hook", _SinkProto, discriminator_field="hook_id")
+
+    class _SinkBase(metaclass=sink.Meta):
+        __abstract__ = True
+
+        def run(self) -> None: ...
+
+    class Disk(_SinkBase):
+        __registry_key__ = "disk"
+
+        def __init__(self, tags: frozenset[str] = frozenset({"b", "a"}), rotate: bool = False): ...
+
+    class Net(_SinkBase):
+        __registry_key__ = "net"
+
+    class _HookBase(metaclass=hook.Meta):
+        __abstract__ = True
+
+        def run(self) -> None: ...
+
+    class Writer(_HookBase):
+        __registry_key__ = "writer"
+        __wiring__ = {"archive": {"registry": "js_sink", "keys": ["disk", "net"]}}
+
+        # (``label`` keeps the 1.x extractor off its single-parameter check,
+        # which raises on a lone ``Optional[list[X]]`` under Python 3.10.)
+        def __init__(self, archive: Optional[list[_SinkProto]] = None, label: str = "w"): ...
+
+    return {"js_sink": sink, "js_hook": hook}
+
+
+class TestComposedSchemaIsTheModelSchema:
+    @pytest.mark.parametrize("mode", ["forbid", "ignore", "allow"])
+    @pytest.mark.parametrize("inline", [True, False])
+    def test_published_equals_model_json_schema(self, conscribe_isolated, inline: bool, mode: str) -> None:
+        result = build_composed_config(
+            _sink_and_hook(inline_only=inline), inline_wiring=inline, top_level_extra=mode,
+        )
+        top = result.top_level_type
+        published = generate_composed_json_schema(result)
+        assert published == top.model_json_schema(schema_generator=_DeterministicJsonSchema)
+        assert published["x-composed-layers"] == result.dependency_order
+        assert published["x-inline-wiring"] is inline
+        assert ("x-inline-only-layers" in published) is inline
+        assert ("not" in published) is (inline and mode != "forbid")
+        assert published.get("additionalProperties") == {"forbid": False, "ignore": None, "allow": True}[mode]
+        # Set-valued defaults are sorted, independently of PYTHONHASHSEED.
+        disk = published["$defs"][result.layer_results["js_sink"].per_key_models["disk"].__name__]
+        assert disk["properties"]["tags"]["default"] == ["a", "b"]
+
+    def test_nothing_is_added_to_the_model_schema(self) -> None:
+        """A result whose top-level model carries no extensions publishes none."""
+        top = create_model("ComposedConfig", hook=(list[int], []))
+        result = ComposedConfigResult(
+            layer_results={}, top_level_type=top, dependency_order=["hook"], inline_wiring=True,
+        )
+        published = generate_composed_json_schema(result)
+        assert published == top.model_json_schema()
+        assert not any(key.startswith("x-") for key in published)
+
+
+class TestDegradedMarkerIdempotent:
+    def test_marker_carried_by_the_field_is_kept(self) -> None:
+        """When the field's own schema already carries ``x-degraded-from``
+        (its FieldInfo), the layer schema adds no second hint."""
+        model = create_model(
+            "MarkedConfig",
+            kind=(Any, "marked"),
+            auth=(Any, Field(default=None, description="auth", json_schema_extra={"x-degraded-from": "httpx.Auth"})),
+        )
+        result = LayerConfigResult(
+            union_type=model,
+            per_key_models={"marked": model},
+            layer_name="probe",
+            discriminator_field="kind",
+            degraded_fields={"marked": [DegradedField("auth", "httpx.Auth", "pkg.Client")]},
+        )
+        schema = generate_layer_json_schema(result)
+        prop = schema["properties"]["auth"]
+        assert prop["x-degraded-from"] == "httpx.Auth"
+        assert prop["description"] == "auth"
+        assert schema["x-degraded-fields"] == {"marked": [{"field": "auth", "original_type": "httpx.Auth"}]}
+
+
+# ===================================================================
+# Render review fixes (2.0.0)
+# ===================================================================
+
+import dataclasses  # noqa: E402
+import enum  # noqa: E402
+
+from pydantic import ConfigDict  # noqa: E402
+
+from conscribe.config.json_schema import _presort  # noqa: E402
+
+
+class _Mode(enum.Enum):
+    A = "a"
+
+
+class _FrozenTag(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    rank: int = 1
+    labels: frozenset[str] = frozenset({"x", "y", "z", "w"})
+
+
+class _Tagged(BaseModel):
+    tags: frozenset[_FrozenTag] = frozenset({_FrozenTag(rank=2), _FrozenTag(rank=1)})
+    by_alias: set[str] = Field(default={"q", "p"}, alias="byAlias")
+    order: tuple[str, ...] = ("z", "y")
+
+
+@dataclasses.dataclass
+class _Box:
+    items: set[str] = dataclasses.field(default_factory=lambda: {"b", "a", "c"})
+    count: int = 0
+
+
+class TestSetMembersInsideInstances:
+    """R03: set members are sorted at any depth, also inside model and
+    dataclass instances (pydantic cannot dump a set of models in python
+    mode: the instance is walked next to its JSON dump)."""
+
+    def test_models_and_dataclasses(self) -> None:
+        assert _presort(_Tagged()) == {
+            "tags": [
+                {"rank": 1, "labels": ["w", "x", "y", "z"]},
+                {"rank": 2, "labels": ["w", "x", "y", "z"]},
+            ],
+            "byAlias": ["p", "q"],
+            "order": ["z", "y"],  # sequences keep their order
+        }
+        assert _presort(_Box()) == {"items": ["a", "b", "c"], "count": 0}
+        assert _presort([_Box()]) == [{"items": ["a", "b", "c"], "count": 0}]
+
+    def test_instances_without_sets_are_left_to_pydantic(self) -> None:
+        tag = _FrozenTag.model_construct(rank=3, labels=("b", "a"))
+        assert _presort(tag) is tag
+
+    def test_published_default_of_a_model_instance(self) -> None:
+        model = create_model("HoldsInstance", tagged=(_Tagged, _Tagged()))
+        schema = model.model_json_schema(schema_generator=_DeterministicJsonSchema)
+        default = schema["properties"]["tagged"]["default"]
+        assert default["tags"][0] == {"rank": 1, "labels": ["w", "x", "y", "z"]}
+        assert default["byAlias"] == ["p", "q"]
+
+    def test_set_members_are_ordered_by_their_json_form(self) -> None:
+        """Members sort by type name, then canonical JSON text (the order of
+        composed default instances): enum members by value, types grouped."""
+        assert _presort({_Mode.A, "b", 1}) == [1, _Mode.A, "b"]
+        assert _presort(frozenset({"é", "z", "a"})) == ["a", "z", "é"]
+
+
+class TestDegradedHintOnOneKeyLayers:
+    def test_root_properties_are_annotated_when_defs_exist(self, conscribe_isolated) -> None:
+        """R04: a one-key layer's schema is the per-key model; nested models or
+        enums in ``$defs`` do not move its properties there."""
+        reg = create_registrar("r04_solo", _LLMProto, discriminator_field="kind")
+
+        class _Base(metaclass=reg.Meta):
+            __abstract__ = True
+
+            async def chat(self, messages: list[dict]) -> str:
+                return ""
+
+        class Solo(_Base):
+            __registry_key__ = "solo"
+
+            def __init__(self, handle: _IncompatibleType = None, mode: _Mode = _Mode.A):  # type: ignore[assignment]
+                pass
+
+        result = _build_degraded(reg)
+        schema = generate_layer_json_schema(result)
+        assert list(schema["$defs"]) == ["_Mode"]
+        handle = schema["properties"]["handle"]
+        assert handle["x-degraded-from"] == result.degraded_fields["solo"][0].original_type_repr
+        assert handle["description"].startswith("[degraded] Type was: ")
+        assert "x-degraded-from" not in schema["properties"]["mode"]

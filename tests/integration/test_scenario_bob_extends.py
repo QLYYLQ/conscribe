@@ -234,9 +234,7 @@ class TestBobRunBenchmark:
         for agent_name in ["builtin", "bridged_variant", "manual_agent"]:
             agent_cls = R.get(agent_name)
             agent = agent_cls()
-            result = asyncio.get_event_loop().run_until_complete(
-                agent.step("benchmark task")
-            )
+            result = asyncio.run(agent.step("benchmark task"))
             results[agent_name] = result
 
         assert len(results) == 3

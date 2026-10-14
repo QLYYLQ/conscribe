@@ -2,26 +2,28 @@
 
 Covers:
 - Tier 3: __config_schema__ (highest priority, direct return, preserves model_config)
-- Tier 3 variant: single-param BaseModel auto-detect
+- Single-param BaseModel: an ordinary nested field in 2.0 (1.x flattened it;
+  the opt-in ``__config_from_param__`` is covered in test_extractor_v2.py)
 - Tier 1: pure __init__ signature (typed params, defaults, **kwargs, *args, naming)
 - Tier 1.5: docstring descriptions merged into fields
 - Tier 2: Annotated[T, Field()] metadata preservation
 - MRO awareness (child/grandchild inheritance)
-- Edge cases (inspect.signature failure, get_type_hints failure, etc.)
+- Edge cases (unreadable signature, resolution without typing.get_type_hints, etc.)
 - Error cases (invalid __config_schema__)
 
 Organized by tier with class-based grouping per Test* convention.
 """
 from __future__ import annotations
 
-import inspect
+import sys
 from typing import Annotated, Any, Optional, Protocol, runtime_checkable
 from unittest.mock import patch
 
 import pytest
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from conscribe.config.extractor import extract_config_schema
+from conscribe.exceptions import DegradationWarning, ExtractionWarning, WiringResolutionError
 
 
 # ===================================================================
@@ -112,11 +114,11 @@ class TestTier3ConfigSchema:
 
 
 # ===================================================================
-# Tier 3 variant: Single-param BaseModel auto-detect
+# Single-param BaseModel: a nested field in 2.0
 # ===================================================================
 
-# Module-level BaseModel classes for Tier 3 variant tests.
-# Must be at module scope so get_type_hints() can resolve them
+# Module-level BaseModel classes for the single-parameter tests.
+# Must be at module scope so the annotations resolve
 # (from __future__ import annotations stringifies annotations).
 
 class _SingleParamConfig(BaseModel):
@@ -143,18 +145,44 @@ class _TwoParamTarget:
         pass
 
 
-class TestTier3SingleParamBaseModel:
-    """Tests for auto-detecting single BaseModel param in __init__."""
+class TestSingleParamBaseModel:
+    """A single BaseModel parameter is an ordinary nested field (2.0).
 
-    def test_single_basemodel_param_returns_type(self) -> None:
-        """__init__(self, config: MyConfig) returns MyConfig."""
+    1.x returned the parameter's model as the whole config ("Tier 3
+    variant"), silently dropping the parameter name, wiring receptors and
+    ``**kwargs`` knobs.  Flattening is now the explicit
+    ``__config_from_param__`` opt-in.
+    """
+
+    def test_single_basemodel_param_is_a_nested_field(self) -> None:
+        """__init__(self, config: MyConfig) -> a model with a ``config`` field."""
         result = extract_config_schema(_SingleParamTarget)
-        assert result is _SingleParamConfig
+        assert result is not _SingleParamConfig
+        assert set(result.model_fields) == {"config"}
+        assert result.model_fields["config"].annotation is _SingleParamConfig
+        assert result.model_fields["config"].is_required()
+        validated = result.model_validate({"config": {"model_id": "m"}})
+        assert validated.config == _SingleParamConfig(model_id="m")
 
-    def test_single_annotated_basemodel_param_unwraps(self) -> None:
-        """__init__(self, config: Annotated[MyConfig, ...]) unwraps and returns MyConfig."""
+    def test_single_annotated_basemodel_param_is_a_nested_field(self) -> None:
+        """Annotated[MyConfig, ...] is unwrapped for the field type, not flattened."""
         result = extract_config_schema(_AnnotatedParamTarget)
-        assert result is _SingleParamConfig
+        assert set(result.model_fields) == {"config"}
+        field = result.model_fields["config"]
+        assert field.annotation is _SingleParamConfig
+        assert "some metadata" in field.metadata
+
+    def test_old_flat_keys_get_a_targeted_error(self) -> None:
+        """The 1.x flat shape is rejected with a message naming the fix."""
+        result = extract_config_schema(_SingleParamTarget)
+        with pytest.raises(ValidationError) as excinfo:
+            result.model_validate({"model_id": "m"})
+        error = excinfo.value.errors()[0]
+        assert error["type"] == "legacy_flat_config"
+        assert error["msg"] == (
+            "'config' is a nested block in conscribe 2.0; write {config: {...}} "
+            "or set __config_from_param__ = 'config'"
+        )
 
     def test_two_params_falls_to_tier1(self) -> None:
         """__init__(self, config: MyConfig, extra: int) has 2 params, falls to Tier 1."""
@@ -640,35 +668,47 @@ class TestMROAwareness:
 class TestEdgeCases:
     """Tests for edge cases and graceful degradation."""
 
-    def test_inspect_signature_fails_returns_none(self) -> None:
-        """If inspect.signature() raises, return None."""
+    def test_unreadable_signature_warns_and_allows_extra(self) -> None:
+        """An ``__init__`` whose signature cannot be read is reported.
+
+        conscribe cannot know the parameters, so it says so with an
+        ``ExtractionWarning`` and the config accepts unknown keys instead of
+        silently forbidding every knob the runtime takes.
+        """
+
+        class Opaque:
+            """A callable whose signature ``inspect`` cannot read."""
+
+            __signature__ = "not a signature"
+
+            def __call__(self, *args: Any, **kwargs: Any) -> None: ...
+
+        class MyClass:
+            __init__ = Opaque()
+
+        with pytest.warns(ExtractionWarning, match="cannot read the signature"):
+            result = extract_config_schema(MyClass)
+        assert result is not None
+        assert result.model_fields == {}
+        assert result.model_config.get("extra") == "allow"
+        assert result(name="anything").model_extra == {"name": "anything"}
+
+    def test_resolution_does_not_use_typing_get_type_hints(self) -> None:
+        """Annotations resolve per parameter, in the declaring scope.
+
+        1.x called ``typing.get_type_hints`` on the ``__init__`` and fell back
+        to raw strings; 2.0 never uses it (it adds an implicit ``Optional``
+        on 3.10 and resolves inherited annotations in the wrong module).
+        """
 
         class MyClass:
             def __init__(self, *, name: str):
                 pass
 
-        with patch(
-            "conscribe.config.extractor.inspect.signature",
-            side_effect=ValueError("cannot inspect"),
-        ):
+        with patch("typing.get_type_hints", side_effect=Exception("not used")):
             result = extract_config_schema(MyClass)
-            assert result is None
-
-    def test_get_type_hints_fails_falls_back_to_annotations(self) -> None:
-        """If get_type_hints() raises, falls back to raw annotations."""
-
-        class MyClass:
-            def __init__(self, *, name: str):
-                pass
-
-        with patch(
-            "conscribe.config.extractor.get_type_hints",
-            side_effect=Exception("cannot resolve hints"),
-        ):
-            result = extract_config_schema(MyClass)
-            # Fallback extracts from __annotations__, should still work
-            assert result is not None
-            assert "name" in result.model_fields
+        assert result is not None
+        assert result.model_fields["name"].annotation is str
 
     def test_annotated_with_non_fieldinfo_metadata_graceful(self) -> None:
         """Annotated with arbitrary (non-FieldInfo) metadata does not crash."""
@@ -686,11 +726,16 @@ class TestEdgeCases:
             ):
                 pass
 
-        result = extract_config_schema(MyClass)
+        # ``Marker`` is local to this test function: conscribe cannot see it
+        # (PEP 563 strings), so ``name`` degrades to Any with an
+        # ExtractionWarning instead of crashing.
+        with pytest.warns(ExtractionWarning, match="local to the function"):
+            result = extract_config_schema(MyClass)
         assert result is not None
         assert "name" in result.model_fields
         assert "count" in result.model_fields
         assert result.model_fields["count"].default == 5
+        assert [d.reason for d in result.__degraded_fields__] == ["function_locals"]
 
     def test_default_none_with_optional_type(self) -> None:
         """Default value None with Optional type works correctly."""
@@ -705,35 +750,52 @@ class TestEdgeCases:
         assert result.model_fields["base_url"].default is None
 
     def test_cls_with_only_self_and_kwargs(self) -> None:
-        """__init__(self, **kwargs) -- no explicit params, should return None or empty model."""
+        """__init__(self, **kwargs) -- no named params, but the constructor
+        accepts any keyword: an empty, open model (never ``None``, which the
+        builder turns into a closed discriminator-only model)."""
 
         class MyClass:
             def __init__(self, **kwargs: Any):
                 pass
 
         result = extract_config_schema(MyClass)
-        # No named params besides self -- should return None
-        assert result is None
+        assert result is not None
+        assert result.model_fields == {}
+        assert result.model_config.get("extra") == "allow"
+        assert result(anything=1).model_extra == {"anything": 1}
 
     def test_cls_with_only_self_and_args(self) -> None:
-        """__init__(self, *args) -- no explicit params, should return None."""
+        """__init__(self, *args) -- *args keeps the documented open policy."""
 
         class MyClass:
             def __init__(self, *args: Any):
                 pass
 
         result = extract_config_schema(MyClass)
-        assert result is None
+        assert result is not None
+        assert result.model_fields == {}
+        assert result.model_config.get("extra") == "allow"
 
     def test_cls_with_only_self_args_and_kwargs(self) -> None:
-        """__init__(self, *args, **kwargs) -- no explicit params, should return None."""
+        """__init__(self, *args, **kwargs) -- an empty, open model."""
 
         class MyClass:
             def __init__(self, *args: Any, **kwargs: Any):
                 pass
 
         result = extract_config_schema(MyClass)
-        assert result is None
+        assert result is not None
+        assert result.model_fields == {}
+        assert result.model_config.get("extra") == "allow"
+
+    def test_closed_constructor_without_params_returns_none(self) -> None:
+        """Nothing to configure and nothing accepted: ``None``."""
+
+        class MyClass:
+            def __init__(self) -> None:
+                pass
+
+        assert extract_config_schema(MyClass) is None
 
 
 # ===================================================================
@@ -820,12 +882,12 @@ class TestTierPriority:
         result = extract_config_schema(MyClass)
         assert result is SchemaA
 
-    def test_single_param_basemodel_takes_priority_over_signature(self) -> None:
-        """Single BaseModel param wins over treating it as a plain Tier 1 field."""
+    def test_single_param_basemodel_is_not_flattened_without_opt_in(self) -> None:
+        """Without ``__config_from_param__`` the parameter stays a nested field."""
         # Uses module-level _SingleParamTarget / _SingleParamConfig
         result = extract_config_schema(_SingleParamTarget)
-        # Should return the config directly, not a dynamic model with 'config' field
-        assert result is _SingleParamConfig
+        assert result is not _SingleParamConfig
+        assert set(result.model_fields) == {"config"}
 
     def test_extra_policy_not_overridden_on_tier3(self) -> None:
         """Tier 3 schema's extra policy is never overridden, even with **kwargs."""
@@ -1015,19 +1077,51 @@ class TestMROKwargsResolution:
         assert result is not None
         assert result.model_config.get("extra") == "forbid"
 
-    def test_scope_truncation_sets_extra_allow(self) -> None:
+    def test_scope_truncation_sets_extra_allow(self, tmp_path, monkeypatch) -> None:
         """When MRO chain is truncated by scope, extra='allow'."""
+        import importlib
+        import uuid
+
+        site = tmp_path / "site-packages"
+        pkg = f"ext_{uuid.uuid4().hex[:8]}"
+        (site / pkg).mkdir(parents=True)
+        (site / pkg / "__init__.py").write_text(
+            "class ExtBase:\n"
+            "    def __init__(self, host: str = 'h', **kwargs):\n"
+            "        super().__init__(**kwargs)\n"
+        )
+        monkeypatch.syspath_prepend(str(site))
+        ext = importlib.import_module(pkg)
+
+        class _ScopeChild(ext.ExtBase):
+            def __init__(self, z: float, **kwargs: Any):
+                super().__init__(**kwargs)
+
+        result = extract_config_schema(_ScopeChild, mro_scope="local")
+        assert result is not None
+        assert list(result.model_fields) == ["z"]
+        assert result.model_config.get("extra") == "allow"
+        full = extract_config_schema(_ScopeChild, mro_scope="third_party")
+        assert list(full.model_fields) == ["z", "host"]
+        assert full.model_config.get("extra") == "forbid"
+        del sys.modules[pkg]
+
+    def test_base_model_parent_is_never_cut_by_scope(self) -> None:
+        """pydantic's BaseModel ends the chain naturally (B4): a model with
+        its own ``__init__(z, **kwargs)`` keeps its fields under any scope."""
         from pydantic import BaseModel
 
         class _ScopeChild(BaseModel):
             z: float
+            w: int = 2
 
             def __init__(self, z: float, **kwargs: Any):
                 super().__init__(z=z, **kwargs)
 
-        result = extract_config_schema(_ScopeChild, mro_scope="local")
-        assert result is not None
-        assert result.model_config.get("extra") == "allow"
+        for scope in ("local", "third_party", []):
+            result = extract_config_schema(_ScopeChild, mro_scope=scope)
+            assert list(result.model_fields) == ["z", "w"]
+            assert result.model_config.get("extra") == "forbid"
 
     def test_no_kwargs_backward_compatible(self) -> None:
         """Class without **kwargs behaves exactly as before."""
@@ -1180,7 +1274,8 @@ class TestTypeDegradation:
 
     def test_incompatible_type_degraded(self) -> None:
         """Class with an incompatible param returns schema with field as Any."""
-        result = extract_config_schema(_ClassWithIncompatibleParam)
+        with pytest.warns(DegradationWarning, match="auth"):
+            result = extract_config_schema(_ClassWithIncompatibleParam)
         assert result is not None
         assert "auth" in result.model_fields
         assert "name" in result.model_fields
@@ -1190,7 +1285,8 @@ class TestTypeDegradation:
 
     def test_degraded_fields_metadata_attached(self) -> None:
         """model.__degraded_fields__ exists and contains correct info."""
-        result = extract_config_schema(_ClassWithIncompatibleParam)
+        with pytest.warns(DegradationWarning):
+            result = extract_config_schema(_ClassWithIncompatibleParam)
         assert result is not None
         degraded = getattr(result, "__degraded_fields__", None)
         assert degraded is not None
@@ -1200,6 +1296,8 @@ class TestTypeDegradation:
         # original type repr should mention _IncompatibleType
         auth_df = [df for df in degraded if df.field_name == "auth"][0]
         assert "_IncompatibleType" in auth_df.original_type_repr
+        assert auth_df.reason == "pydantic_incompatible"
+        assert auth_df.source_class.endswith("_ClassWithIncompatibleParam")
 
     def test_compatible_class_no_degradation(self) -> None:
         """Class with all compatible types has no __degraded_fields__."""
@@ -1210,7 +1308,8 @@ class TestTypeDegradation:
 
     def test_degraded_model_validates(self) -> None:
         """Degraded model can validate data (Any accepts anything)."""
-        result = extract_config_schema(_ClassWithIncompatibleParam)
+        with pytest.warns(DegradationWarning):
+            result = extract_config_schema(_ClassWithIncompatibleParam)
         assert result is not None
         instance = result(name="test", auth="any_value", count=5)
         assert instance.name == "test"
@@ -1495,8 +1594,11 @@ class TestWiringSurvivesEmptyInit:
 
         assert extract_config_schema(Plain) is None
 
-    def test_unresolvable_registry_still_returns_none(self) -> None:
-        """A wiring entry that cannot resolve must not fabricate a model."""
+    def test_unresolvable_registry_raises(self) -> None:
+        """A wiring entry that cannot resolve is an error, never a silent drop.
+
+        1.x returned ``None`` here (every receptor of the class vanished).
+        """
 
         class Broken:
             __wiring__ = {"llm": "no_such_registry_anywhere"}
@@ -1504,7 +1606,8 @@ class TestWiringSurvivesEmptyInit:
 
             def __init__(self) -> None: ...
 
-        assert extract_config_schema(Broken) is None
+        with pytest.raises(WiringResolutionError, match="unknown registry 'no_such_registry_anywhere'"):
+            extract_config_schema(Broken)
 
     def test_selectable_from_config_end_to_end(self) -> None:
         """The point of the fix: the dependency becomes selectable."""

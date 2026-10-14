@@ -1,6 +1,7 @@
 """Regression tests for wired-field *shape* in generated configs.
 
-Two independent bugs, both in ``_apply_wiring`` / ``_replace_str_with_literal``:
+Two independent 1.x bugs in the extractor's wiring pass (the 2.0 shape
+rules are in ``conscribe.config.extractor``'s module docstring):
 
 Bug 1 — slot-less wired entries were emitted as **required** config fields.
     A ``__wiring__`` key with no runtime slot (no ``__init__`` parameter and
@@ -20,7 +21,6 @@ The shapes mirror ``spectragent``'s ``EnvironmentBase`` / ``BrowserUseAgent``.
 """
 from __future__ import annotations
 
-import sys
 from typing import (
     Annotated,
     Any,
@@ -230,9 +230,17 @@ class TestSlotLessWiringIsOptional:
 class TestSlotFulWiringStaysRequired:
     """A wired entry that *does* have a runtime slot must not become optional."""
 
-    def test_init_param_slot_stays_required(self, fragment_registrar):
+    def test_annotated_only_init_param_slot_keeps_its_default(self, fragment_registrar):
+        """A receptor is a field whether or not annotated-only would keep it.
+
+        1.x rebuilt a parameter filtered out by ``__config_annotated_only__``
+        from the slot alone, dropping its default (it became required).  In
+        2.0 the receptor is built from the parameter itself: its default,
+        shape and description survive.
+        """
+
         class Agent:
-            __config_annotated_only__ = True  # filters ``observation`` out
+            __config_annotated_only__ = True  # would filter ``observation`` out
             __wiring__ = {"observation": ("slot_observation", ["browser.dom"])}
 
             def __init__(
@@ -240,6 +248,20 @@ class TestSlotFulWiringStaysRequired:
                 observation: str = "browser.dom",
                 max_steps: Annotated[int, Field(default=10, description="steps")] = 10,
             ):
+                self.observation = observation
+
+        model = extract_config_schema(Agent)
+        field = model.model_fields["observation"]
+        assert field.is_required() is False
+        assert field.default == "browser.dom"
+        assert get_origin(field.annotation) is Literal
+
+    def test_required_init_param_slot_stays_required(self, fragment_registrar):
+        class Agent:
+            __config_annotated_only__ = True
+            __wiring__ = {"observation": ("slot_observation", ["browser.dom"])}
+
+            def __init__(self, observation: str):
                 self.observation = observation
 
         model = extract_config_schema(Agent)
@@ -313,9 +335,6 @@ class TestContainerReceptor:
         assert _is_list(annotation), annotation
         assert sorted(_literal_members(annotation)) == ["browser", "docker"]
 
-    @pytest.mark.skipif(
-        sys.version_info < (3, 10), reason="PEP 604 unions need 3.10+"
-    )
     def test_pep604_union_container_is_matched(self, capability_registrar):
         """``dict[str, X] | None`` — ``get_origin`` returns ``types.UnionType``.
 

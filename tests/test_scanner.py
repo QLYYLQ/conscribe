@@ -3,16 +3,20 @@ from __future__ import annotations
 
 import sys
 import textwrap
+import uuid
+import warnings
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 import pytest
 
+from conscribe.exceptions import ExtractionWarning
 from conscribe.scanner import (
     RegistrarDefinition,
     find_packages,
     scan_registrar_definitions,
 )
+from conscribe.testing import isolated_registries
 
 
 # ===================================================================
@@ -136,17 +140,39 @@ class TestScanRegistrarDefinitions:
         assert len(results) == 0
 
     def test_syntax_error_skipped(self, tmp_path: Path) -> None:
-        """Files with syntax errors are skipped without crashing."""
+        """Files with syntax errors are skipped (with a warning naming them)."""
         (tmp_path / "bad.py").write_text("def broken(:\n", encoding="utf-8")
         _write_py(tmp_path / "good.py", """\
             from conscribe import create_registrar
             R = create_registrar("agent", AgentProto)
         """)
 
-        results = scan_registrar_definitions(tmp_path)
+        with pytest.warns(ExtractionWarning, match=r"scan skipped .*bad\.py because it does not parse"):
+            results = scan_registrar_definitions(tmp_path)
 
         assert len(results) == 1
         assert results[0].name == "agent"
+
+    def test_null_bytes_skipped_with_warning(self, tmp_path: Path) -> None:
+        (tmp_path / "binary.py").write_bytes(b"x = 1\x00\n")
+
+        with pytest.warns(ExtractionWarning, match=r"binary\.py"):
+            assert scan_registrar_definitions(tmp_path) == []
+
+    def test_coding_declaration_is_honoured(self, tmp_path: Path) -> None:
+        """PEP 263: a latin-1 file is decoded like Python decodes it."""
+        (tmp_path / "latin.py").write_bytes(
+            b"# -*- coding: latin-1 -*-\n"
+            b"from conscribe import create_registrar\n"
+            b"NAME = '\xe9t\xe9'\n"
+            b"R = create_registrar('summer', SummerProto)\n"
+        )
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            results = scan_registrar_definitions(tmp_path)
+
+        assert [r.name for r in results] == ["summer"]
 
     def test_empty_directory(self, tmp_path: Path) -> None:
         """Empty directory returns empty list."""
@@ -192,6 +218,74 @@ class TestScanRegistrarDefinitions:
 
         results = scan_registrar_definitions(tmp_path)
         assert len(results) == 0
+
+    def test_nested_statement_bodies(self, tmp_path: Path) -> None:
+        """Calls inside every kind of compound statement are found."""
+        _write_py(tmp_path / "nested.py", """\
+            from conscribe import create_registrar
+
+            if FLAG:
+                A = create_registrar("if_body", P)
+            else:
+                B = create_registrar("if_else", P)
+            for _ in range(1):
+                C = create_registrar("for_body", P)
+            else:
+                D = create_registrar("for_else", P)
+            while False:
+                E = create_registrar("while_body", P)
+            else:
+                F = create_registrar("while_else", P)
+            with CONTEXT:
+                G = create_registrar("with_body", P)
+            try:
+                H = create_registrar("try_body", P)
+            except ValueError:
+                I = create_registrar("try_handler", P)
+            else:
+                J = create_registrar("try_else", P)
+            finally:
+                K = create_registrar("try_finally", P)
+            match MODE:
+                case "a":
+                    L = create_registrar("match_case", P)
+                case _:
+                    M = create_registrar("match_default", P)
+
+
+            class Holder:
+                N = create_registrar("class_body", P)
+
+
+            async def setup():
+                async with CONTEXT:
+                    O = create_registrar("async_with_body", P)
+                async for _ in STREAM:
+                    Q = create_registrar("async_for_body", P)
+        """)
+
+        names = [d.name for d in scan_registrar_definitions(tmp_path)]
+
+        assert names == [
+            "if_body", "if_else", "for_body", "for_else", "while_body", "while_else",
+            "with_body", "try_body", "try_handler", "try_else", "try_finally",
+            "match_case", "match_default", "class_body", "async_with_body", "async_for_body",
+        ]
+
+    @pytest.mark.skipif(sys.version_info < (3, 11), reason="except* needs Python 3.11")
+    def test_try_star_bodies(self, tmp_path: Path) -> None:
+        _write_py(tmp_path / "star.py", """\
+            from conscribe import create_registrar
+
+            try:
+                A = create_registrar("star_body", P)
+            except* ValueError:
+                B = create_registrar("star_handler", P)
+        """)
+
+        assert [d.name for d in scan_registrar_definitions(tmp_path)] == [
+            "star_body", "star_handler",
+        ]
 
     def test_sorted_by_file_then_line(self, tmp_path: Path) -> None:
         """Results are sorted by file path, then line number."""
@@ -473,3 +567,253 @@ class TestCLIList:
         assert exit_code == 1
         captured = capsys.readouterr()
         assert "no Python packages found" in captured.err
+
+
+# ===================================================================
+# list / summarize_registries with strict discover()
+# ===================================================================
+
+_WORKERS = """\
+    from typing import Protocol, runtime_checkable
+
+    from conscribe import create_registrar
+
+
+    @runtime_checkable
+    class WorkerProto(Protocol):
+        def work(self) -> str: ...
+
+
+    WorkerReg = create_registrar("_scan_worker", WorkerProto)
+
+
+    class Base(metaclass=WorkerReg.Meta):
+        __abstract__ = True
+
+        def work(self) -> str:
+            return ""
+
+
+    class AlphaWorker(Base):
+        def work(self) -> str:
+            return "alpha"
+"""
+
+
+@pytest.fixture
+def worker_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """``<root>/<pkg>/{__init__,registry}.py`` with one registered worker.
+
+    The working directory is the project root.  Yields ``(root, pkg)``; the
+    package's modules and registrations are removed afterwards.
+    """
+    root = tmp_path / "proj"
+    name = f"scanproj_{uuid.uuid4().hex[:10]}"
+    _write_py(root / name / "__init__.py", "")
+    _write_py(root / name / "registry.py", _WORKERS)
+    monkeypatch.chdir(root)
+    before = set(sys.modules)
+    with isolated_registries():
+        try:
+            yield root, name
+        finally:
+            for module in [m for m in sys.modules if m not in before]:
+                if module == name or module.startswith(name + "."):
+                    del sys.modules[module]
+
+
+class TestListStrictDiscover:
+    """list_registries() / summarize_registries() / ``conscribe list``."""
+
+    def test_list_registries_forwards_exclude_and_allow_missing(self, worker_project) -> None:
+        from conscribe.scanner import list_registries
+
+        root, name = worker_project
+        _write_py(root / name / "broken.py", "VALUE = undefined_name\n")
+        _write_py(root / name / "optional.py", "import scan_missing_dependency_xyz\n")
+
+        # Strict: the original NameError (3.10 wraps it in an ImportError naming the module).
+        with pytest.raises((NameError, ImportError), match="undefined_name"):
+            list_registries(root, discover_packages=[name], exclude=[f"{name}.optional"])
+
+        summaries = list_registries(
+            root,
+            discover_packages=[name],
+            layer_filter="_scan_worker",
+            exclude=[f"{name}.broken"],
+            allow_missing=["scan_missing_dependency_xyz"],
+        )
+        assert [e.key for e in summaries[0].entries] == ["alpha_worker"]
+
+    def test_summarize_registries_imports_nothing(
+        self, worker_project, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from conscribe.scanner import summarize_registries
+
+        root, name = worker_project
+        assert name not in sys.modules
+        assert all(s.name != "_scan_worker" for s in summarize_registries(root))
+
+        monkeypatch.syspath_prepend(str(root))
+        __import__(f"{name}.registry")
+        (summary,) = summarize_registries(root, layer_filter="_scan_worker")
+        assert summary.entries[0].file_path == f"{name}/registry.py"
+
+    def test_directory_sharing_a_prefix_with_root_is_not_under_it(
+        self, worker_project, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Classes of ``/x/proj`` are not listed for root ``/x/pro``."""
+        from conscribe.scanner import summarize_registries
+
+        root, name = worker_project
+        monkeypatch.syspath_prepend(str(root))
+        __import__(f"{name}.registry")
+        prefix_root = root.parent / root.name[:-1]
+        prefix_root.mkdir()
+
+        assert summarize_registries(root, layer_filter="_scan_worker")[0].entry_count == 1
+        assert summarize_registries(prefix_root, layer_filter="_scan_worker")[0].entry_count == 0
+
+    def test_cli_list_reports_a_broken_module_cleanly(
+        self, worker_project, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from conscribe.cli import main
+
+        root, name = worker_project
+        _write_py(root / name / "broken.py", "VALUE = undefined_name\n")
+
+        code = main(["list", "--discover", name])
+        err = capsys.readouterr().err
+        assert code == 1
+        assert err.startswith(f"Error: could not import module '{name}.broken'")
+        assert "NameError" in err and "broken.py, line 1" in err
+        assert f"--exclude {name}.broken" in err
+        assert "Traceback" not in err
+
+        code = main(["list", "--discover", name, "--exclude", f"{name}.broken"])
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "Registry: _scan_worker (WorkerProto)" in out
+        assert "alpha_worker" in out
+
+    def test_cli_list_auto_detects_packages_and_allows_missing(
+        self, worker_project, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from conscribe.cli import main
+
+        root, name = worker_project
+        _write_py(root / name / "optional.py", "import scan_missing_dependency_xyz\n")
+
+        code = main(["list", "--layer", "_scan_worker"])
+        err = capsys.readouterr().err
+        assert code == 1
+        assert "--allow-missing scan_missing_dependency_xyz" in err
+
+        code = main(["list", "--layer", "_scan_worker", "--allow-missing", "scan_missing_dependency_xyz"])
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "alpha_worker" in out
+
+    def test_cli_list_unknown_layer(
+        self, worker_project, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from conscribe.cli import main
+
+        _, name = worker_project
+        code = main(["list", "--discover", name, "--layer", "_scan_nope"])
+        err = capsys.readouterr().err
+        assert code == 1
+        assert err.startswith("Error: registry '_scan_nope' not found. Available: ")
+        assert "_scan_worker" in err
+
+    def test_cli_list_missing_package(
+        self, worker_project, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from conscribe.cli import main
+
+        code = main(["list", "--discover", "scanproj_does_not_exist"])
+        err = capsys.readouterr().err
+        assert code == 1
+        assert "could not import module 'scanproj_does_not_exist'" in err
+        assert "ModuleNotFoundError" in err
+
+    def test_cli_list_path_without_a_match_says_so(
+        self, worker_project, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from conscribe.cli import main
+
+        root, name = worker_project
+        code = main(["list", "--discover", name, "--path", "elsewhere"])
+        out = capsys.readouterr().out
+        assert code == 0
+        assert out.startswith("No registered classes are defined under 'elsewhere'")
+        assert "relative to" in out
+
+        code = main(["list", "--discover", name, "--layer", "_scan_worker", "--path", "elsewhere"])
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "No registered classes in registry '_scan_worker' are defined under 'elsewhere'" in out
+
+    def test_cli_list_path_forms(
+        self, worker_project, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """``pkg``, ``./pkg``, ``pkg/``, an absolute path and a file all select the entry."""
+        from conscribe.cli import main
+
+        root, name = worker_project
+        forms = [name, f"./{name}", f"{name}/", str(root / name), f"{name}/registry.py", "."]
+        for form in forms:
+            code = main(["list", "--discover", name, "--layer", "_scan_worker", "--path", form])
+            out = capsys.readouterr().out
+            assert code == 0
+            assert "alpha_worker" in out, form
+
+    def test_cli_list_path_trailing_separator_is_a_directory(
+        self, worker_project, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """``<pkg>/reg/`` does not match ``<pkg>/registry.py`` (``<pkg>/reg`` does)."""
+        from conscribe.cli import main
+
+        root, name = worker_project
+        main(["list", "--discover", name, "--path", f"{name}/reg"])
+        assert "alpha_worker" in capsys.readouterr().out
+        main(["list", "--discover", name, "--path", f"{name}/reg/"])
+        assert "No registered classes" in capsys.readouterr().out
+
+    def test_cli_list_path_outside_the_root(
+        self, worker_project, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from conscribe.cli import main
+
+        root, name = worker_project
+        code = main(["list", "--discover", name, "--path", str(tmp_path / "other")])
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "No registered classes" in out
+
+
+class TestCLIScanWarnings:
+    def test_unparseable_file_is_reported(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from conscribe.cli import main
+
+        (tmp_path / "bad.py").write_text("def broken(:\n", encoding="utf-8")
+        _write_py(tmp_path / "layers.py", """\
+            from conscribe import create_registrar
+            R = create_registrar("agent", AgentProto)
+        """)
+
+        code = main(["scan", "--path", str(tmp_path)])
+        captured = capsys.readouterr()
+        assert code == 0
+        assert "Warning: scan skipped" in captured.err and "bad.py" in captured.err
+        assert "agent" in captured.out
+
+    def test_not_a_directory(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from conscribe.cli import main
+
+        code = main(["scan", "--path", str(tmp_path / "missing")])
+        err = capsys.readouterr().err
+        assert code == 1
+        assert err.startswith("Error: ") and "is not a directory" in err

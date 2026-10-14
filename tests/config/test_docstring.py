@@ -14,7 +14,6 @@ Covers:
 from __future__ import annotations
 
 from unittest.mock import patch
-import pytest
 
 from conscribe.config.docstring import parse_param_descriptions
 
@@ -343,3 +342,37 @@ class TestInitDocstring:
 
         result = parse_param_descriptions(MyClass)
         assert result == {"name": "The name field from init."}
+
+
+class TestParseCache:
+    """Parsing is cached per docstring text; callers always get a fresh dict."""
+
+    def test_fresh_dict_per_call(self) -> None:
+        class MyClass:
+            """My class.
+
+            Args:
+                name: The name.
+            """
+
+        first = parse_param_descriptions(MyClass)
+        first["name"] = "mutated"
+        first["extra"] = "added"
+        assert parse_param_descriptions(MyClass) == {"name": "The name."}
+
+    def test_same_text_parsed_once(self) -> None:
+        from conscribe.config import docstring
+
+        doc = "Thing.\n\nArgs:\n    unique_cache_probe: probe.\n"
+
+        class A:
+            __doc__ = doc
+
+        class B:
+            __doc__ = doc
+
+        before = docstring._parse_cached.cache_info().hits
+        assert parse_param_descriptions(A) == parse_param_descriptions(B) == {
+            "unique_cache_probe": "probe."
+        }
+        assert docstring._parse_cached.cache_info().hits >= before + 1

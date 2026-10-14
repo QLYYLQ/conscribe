@@ -704,11 +704,13 @@ class TestCapabilityRelativeKeysE2E:
 
         assert compute_registry_fingerprint(Agent) != before
 
-    def test_stub_type_narrows_across_capabilities(self):
-        """collector.py call site: narrowing still resolves a common base."""
+    def test_stub_type_is_the_protocol_across_capabilities(self):
+        """collector.py call site: an injected attribute is typed as the registry
+        protocol however many capabilities the relative key expands to (2.0 no
+        longer narrows to the implementations' common base)."""
         from conscribe.stubs.collector import collect_class_stub_info
 
-        _, ActionBase = _build_action_layer("e2e_relkey_action5")
+        _build_action_layer("e2e_relkey_action5")
         Agent = create_registrar(
             "e2e_relkey_agent5", AgentProtocol, discriminator_field="name"
         )
@@ -730,7 +732,7 @@ class TestCapabilityRelativeKeysE2E:
         info = collect_class_stub_info(PortableAgent)
         assert info is not None
         attr = next(a for a in info.injected_attrs if a.name == "action")
-        assert attr.resolved_type is ActionBase
+        assert attr.resolved_type is ActionProtocol
 
     def test_composed_config_inlines_every_candidate(self):
         """Composed config widens the union, not just the Literal."""

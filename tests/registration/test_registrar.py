@@ -950,3 +950,263 @@ class TestPydanticGenericCompatibility:
         BracketClass = R.Meta("Foo[bar]", (Base,), {"do_work": lambda self: "b"})
 
         assert len(R.keys()) == 1
+
+
+# ===================================================================
+# unregister(key, *, missing_ok)
+# ===================================================================
+
+class TestUnregister:
+    def _registrar_with(self, *keys: str):
+        R = create_registrar("test_unregister", SimpleProto)
+        classes = {}
+        for key in keys:
+            classes[key] = type(key.title(), (), {"do_work": lambda self: ""})
+            R.register(key)(classes[key])
+        return R, classes
+
+    def test_returns_removed_class(self) -> None:
+        R, classes = self._registrar_with("a", "b")
+        assert R.unregister("a") is classes["a"]
+        assert R.keys() == ["b"]
+
+    def test_missing_ok_is_idempotent(self) -> None:
+        R, classes = self._registrar_with("a")
+        assert R.unregister("a", missing_ok=True) is classes["a"]
+        assert R.unregister("a", missing_ok=True) is None
+        assert R.unregister("a", missing_ok=True) is None
+
+    def test_missing_key_raises_key_not_found(self) -> None:
+        R, _ = self._registrar_with("a")
+        with pytest.raises(KeyNotFoundError, match="missing_ok=True") as info:
+            R.unregister("zzz")
+        assert isinstance(info.value, KeyError)
+        assert R.keys() == ["a"]
+
+
+# ===================================================================
+# inline_only layer flag
+# ===================================================================
+
+class TestInlineOnly:
+    def test_default_is_false(self) -> None:
+        from conscribe import LayerRegistrar
+
+        R = create_registrar("test_inline_default", SimpleProto)
+        assert R.inline_only is False
+        assert R.Meta.inline_only is False
+        assert LayerRegistrar.inline_only is False
+
+    def test_flag_exposed_on_registrar_and_metaclass(self) -> None:
+        R = create_registrar("test_inline_on", SimpleProto, inline_only=True)
+        assert R.inline_only is True
+        assert R.Meta.inline_only is True
+
+    def test_flag_never_visible_on_registered_classes(self) -> None:
+        """A metaclass attribute would leak into dataclass/pydantic defaults."""
+        from dataclasses import MISSING, dataclass
+
+        R = create_registrar("test_inline_leak", SimpleProto, inline_only=True)
+
+        class Base(metaclass=R.Meta):
+            __abstract__ = True
+
+            def do_work(self) -> str:
+                return ""
+
+        @dataclass
+        class Impl(Base):
+            inline_only: bool
+
+        assert not hasattr(Impl, "inline_only")
+        assert Impl.__dataclass_fields__["inline_only"].default is MISSING
+        assert R.get("impl") is Impl
+
+    def test_non_bool_rejected_before_anything_is_created(self) -> None:
+        from conscribe.registration.registry import get_registry
+
+        before = get_registry("test_inline_bad")
+        with pytest.raises(TypeError, match="inline_only must be a bool"):
+            create_registrar("test_inline_bad", SimpleProto, inline_only="yes")
+        assert get_registry("test_inline_bad") is before
+
+    def test_create_auto_registrar_flag(self) -> None:
+        from conscribe import LayerRegistry, create_auto_registrar
+
+        registry = LayerRegistry("test_inline_auto", SimpleProto)
+        assert create_auto_registrar(registry, default_key_transform).inline_only is False
+        meta = create_auto_registrar(registry, default_key_transform, inline_only=True)
+        assert meta.inline_only is True
+        with pytest.raises(TypeError, match="inline_only"):
+            create_auto_registrar(registry, default_key_transform, inline_only=1)
+
+    def test_combined_metaclass_reports_first_base(self) -> None:
+        A = create_registrar("test_inline_a", SimpleProto, inline_only=True)
+        B = create_registrar("test_inline_b", SimpleProto)
+        assert (A.Meta | B.Meta).inline_only is True
+        assert (B.Meta | A.Meta).inline_only is False
+
+
+# ===================================================================
+# Atomic registration: Path C register() and the propagation hook
+# ===================================================================
+
+class TestAtomicPathC:
+    def test_register_failure_after_add_undoes_binding_and_attributes(
+        self, monkeypatch
+    ) -> None:
+        import conscribe.wiring
+
+        R = create_registrar("test_atomic_c", SimpleProto)
+        Other = create_registrar("test_atomic_c_other", SimpleProto)
+
+        class Target:
+            def do_work(self) -> str:
+                return ""
+
+        Other.register("elsewhere")(Target)  # a legitimate registration elsewhere
+        before = dict(Target.__dict__)
+
+        def failing_inject(cls: type) -> None:
+            cls.partially_injected = True
+            raise RuntimeError("injection failed")
+
+        monkeypatch.setattr(conscribe.wiring, "inject_wired_descriptors", failing_inject)
+        with pytest.raises(RuntimeError, match="injection failed"):
+            R.register("target", propagate=True)(Target)
+
+        assert R.get_or_none("target") is None
+        assert dict(Target.__dict__) == before  # no key, no stamp, no hook, no partial attr
+        assert Other.get("elsewhere") is Target  # untouched
+
+    def test_propagate_hook_failure_purges_subclass(self, monkeypatch) -> None:
+        import conscribe.wiring
+
+        R = create_registrar("test_atomic_hook", SimpleProto)
+
+        @R.register("root", propagate=True)
+        class Root:
+            def do_work(self) -> str:
+                return ""
+
+        real_inject = conscribe.wiring.inject_wired_descriptors
+
+        def failing_for_child(cls: type) -> None:
+            if cls.__name__ == "Child":
+                raise RuntimeError("child injection failed")
+            real_inject(cls)
+
+        monkeypatch.setattr(conscribe.wiring, "inject_wired_descriptors", failing_for_child)
+        with pytest.raises(RuntimeError, match="child injection failed"):
+            class Child(Root):
+                pass
+
+        assert R.keys() == ["root"]
+
+    def test_propagate_hook_duplicate_key_leaves_nothing(self) -> None:
+        R = create_registrar("test_atomic_hook_dup", SimpleProto)
+
+        @R.register("root", propagate=True)
+        class Root:
+            def do_work(self) -> str:
+                return ""
+
+        class Taken(Root):
+            pass
+
+        with pytest.raises(DuplicateKeyError):
+            class Clash(Root):
+                __registry_key__ = "taken"
+
+        assert sorted(R.keys()) == ["root", "taken"]
+        assert R.get("taken") is Taken
+
+    def test_register_stamps_registry_origin(self) -> None:
+        R = create_registrar("test_stamp_c", SimpleProto)
+
+        @R.register("stamped")
+        class Stamped:
+            def do_work(self) -> str:
+                return ""
+
+        assert Stamped.__registry_origin__ == id(Stamped)
+
+
+
+# ===================================================================
+# Keys of register() and the propagation hook (spec 4.9)
+# ===================================================================
+
+class TestPathCKeys:
+    @pytest.mark.parametrize(
+        ("key", "fragment"),
+        [
+            (["a", "b"], "register() takes one key; to register a class under several keys"),
+            ("", "a registry key must be a non-empty str"),
+            (7, "a registry key must be a non-empty str, got int 7"),
+        ],
+    )
+    def test_register_rejects_invalid_keys(self, key, fragment) -> None:
+        from conscribe import InvalidRegistryKeyError
+        from conscribe.testing import isolated_registries
+
+        with isolated_registries():
+            R = create_registrar("test_register_keys", SimpleProto)
+
+            class Target:
+                def do_work(self) -> str:
+                    return ""
+
+            before = dict(Target.__dict__)
+            with pytest.raises(InvalidRegistryKeyError) as info:
+                R.register(key)(Target)
+            assert fragment in str(info.value)
+            assert info.value.source == "register(key=...)"
+            assert R.keys() == []
+            assert dict(Target.__dict__) == before
+
+    def test_hook_rejects_an_empty_explicit_key(self) -> None:
+        """1.x silently fell back to the inferred key for a falsy __registry_key__."""
+        from conscribe import InvalidRegistryKeyError
+        from conscribe.testing import isolated_registries
+
+        with isolated_registries():
+            R = create_registrar("test_hook_keys", SimpleProto)
+
+            @R.register("root", propagate=True)
+            class Root:
+                def do_work(self) -> str:
+                    return ""
+
+            with pytest.raises(InvalidRegistryKeyError, match="non-empty str"):
+                class Empty(Root):
+                    __registry_key__ = ""
+            assert R.keys() == ["root"]
+
+
+class TestStackedRegister:
+    def test_each_decorator_undoes_only_its_own_work(self) -> None:
+        """Deliberate (review m3): when an outer @register fails, the inner
+        registration of the same class statement stays."""
+        from conscribe.testing import isolated_registries
+
+        with isolated_registries():
+            Inner = create_registrar("test_stack_inner", SimpleProto)
+            Outer = create_registrar("test_stack_outer", SimpleProto)
+
+            @Outer.register("taken")
+            class Holder:
+                def do_work(self) -> str:
+                    return ""
+
+            def define() -> None:
+                @Outer.register("taken")
+                @Inner.register("x")
+                class X:
+                    def do_work(self) -> str:
+                        return ""
+
+            with pytest.raises(DuplicateKeyError, match="taken"):
+                define()
+            assert Inner.keys() == ["x"]
+            assert Outer.get("taken") is Holder

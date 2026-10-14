@@ -346,3 +346,60 @@ class TestCreateRegistrarValidation:
         )
         assert R.discriminator_fields == ["model_type", "provider"]
         assert R._key_separator == "."
+
+
+class TestDiamondAtomicity:
+    """A diamond class whose registration fails in either registry is
+    purged from both (``LLM.Meta | Agent.Meta`` registers in Agent first,
+    then in LLM)."""
+
+    @staticmethod
+    def _layers(suffix: str):
+        LLM = create_registrar(f"llm_atomic_{suffix}", LLMProtocol)
+        Agent = create_registrar(f"agent_atomic_{suffix}", AgentProtocol)
+
+        class DualBase(metaclass=LLM.Meta | Agent.Meta):
+            __abstract__ = True
+
+            async def chat(self, messages: list[dict]) -> str:
+                return "ok"
+
+            async def step(self, task: str) -> str:
+                return "ok"
+
+            def reset(self) -> None:
+                pass
+
+        return LLM, Agent, DualBase
+
+    def test_collision_in_second_registry_purges_first(self):
+        from conscribe.exceptions import DuplicateKeyError
+
+        LLM, Agent, DualBase = self._layers("outer")
+
+        class Holder(DualBase):
+            __registry_key__ = "k"
+            __skip_registries__ = [Agent._registry.name]
+
+        with pytest.raises(DuplicateKeyError, match="llm_atomic_outer"):
+            class Dual(DualBase):
+                __registry_key__ = "k"
+
+        assert Agent.keys() == []  # registered there first, then purged
+        assert LLM.get_all() == {"k": Holder}
+
+    def test_collision_in_first_registry_registers_nowhere(self):
+        from conscribe.exceptions import DuplicateKeyError
+
+        LLM, Agent, DualBase = self._layers("inner")
+
+        class Holder(DualBase):
+            __registry_key__ = "taken"
+            __skip_registries__ = [LLM._registry.name]
+
+        with pytest.raises(DuplicateKeyError, match="agent_atomic_inner"):
+            class Dual(DualBase):
+                __registry_key__ = ["fresh", "taken"]
+
+        assert Agent.get_all() == {"taken": Holder}
+        assert LLM.keys() == []

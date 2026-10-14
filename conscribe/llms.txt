@@ -4,46 +4,64 @@
 
 Conscribe targets framework developers building config-driven frameworks with pluggable layers (agents, LLM providers, browser backends, etc.). It eliminates manual registry boilerplate and generates Pydantic-based config schemas from constructor signatures.
 
-- Python >= 3.9, Pydantic v2
+- Python >= 3.10, pydantic >= 2.7, < 3 (version 2.0.0; upgrading from 1.x: see the migration guide below)
 - Two subsystems: registration (metaclass-based) and config typing (signature reflection)
-- Three registration paths: inheritance (auto), bridge (external classes), decorator (manual)
-- Four config tiers: plain `__init__` -> docstring -> Annotated[Field] -> explicit BaseModel
-- The `__init__` signature is the *primary* schema source, not the only one: `__wiring__` receptors are contributed on top of it, so a class with `def __init__(self) -> None` still emits its wired fields
+- Three registration paths: inheritance (auto), bridge (external classes), decorator (manual); registration is atomic and registry keys must be non-empty strings
+- Four config tiers: plain `__init__` -> docstring -> Annotated[Field] -> explicit BaseModel (`__config_schema__`, whose validators and `model_config` apply)
+- The `__init__` signature is the *primary* schema source, not the only one: `__wiring__` receptors are contributed on top of it, so a class with `def __init__(self) -> None` (or no `__init__` at all) still emits its wired fields
+- Fail-fast diagnostics: declarations conscribe cannot honour raise (`WiringResolutionError` with every problem in `.problems`, `ConfigAnnotationError`, `ConfigDeclarationError`, `ConfigRenderError`, `EmptyLayerError`, `InvalidRegistryKeyError`) at class creation or build time, naming the class, field and fix. Warnings cover extraction limits, degraded types, stale stubs and registrations kept by test isolation (`ExtractionWarning`, `DegradationWarning`, `StaleStubWarning`, `IsolationWarning`, all `ConscribeWarning` subclasses); escalate them in pytest with `filterwarnings = error::conscribe.ConscribeWarning`
+- `discover(*packages, strict=True, allow_missing=(), exclude=())` imports packages to register their classes; import failures raise by default; `allow_missing` names optional dependencies whose `ModuleNotFoundError` may be skipped, while `exclude` names modules/packages to skip entirely
+- Test isolation: `conscribe.testing.isolated_registries()` restores registry state on exit while retaining registrations made by newly imported modules that remain imported; opt-in pytest plugin `conscribe.testing.pytest_plugin` provides the `conscribe_isolated` fixture
 - Hierarchical keys with dotted segments (e.g., `"openai.azure"`) and tree queries
 - Cross-registry diamond inheritance via `|` operator (`metaclass=LLM.Meta | Agent.Meta`)
-- Cross-registry wiring via `__wiring__`: constrain config fields to `Literal[...]` from other registries (auto-discovery, explicit subset, required+optional subset, or literal list modes)
-- Capability-relative wiring keys: against a registry with a `key_separator`, `__wiring__` may name a bare trailing segment (`"click"`) which expands to every matching fully-qualified key (`browser.click`, `desktop.click`), so a class need not name a provider; a key that already contains the separator is passed through unchanged
-- `.pyi` stub generation for wired attributes: `generate-stubs` CLI command produces PEP 484 stubs so IDEs (PyCharm, VS Code, mypy) can see runtime-injected dependencies. Type narrowing resolves wired attributes to the most specific common ancestor of constrained classes (e.g., subset `["terminal.bash", "terminal.zsh"]` → type `Terminal`, not root protocol)
+- Cross-registry wiring via `__wiring__`: constrain config fields to `Literal[...]` keys of other registries. Three modes: a registry name (all keys), a `(registry, keys)` or `(registry, required_keys, optional_keys)` tuple (explicit subset), a plain list (literal values, no registry). The two registry-backed modes may also be written as a dict (for example, `{"registry": "env", "default": "bash"}`); optional `keys` / `optional_keys` restrict the keys, while `declare_only=True` declares a constraint without injection and cannot be combined with `default`. Every wiring problem raises; `validate_wiring(registrars)` reports all of them at once
+- Capability-relative wiring keys: against a registry with a `key_separator`, `__wiring__` may name a bare trailing segment (`"click"`) which expands to every matching fully-qualified key (`browser.click`, `desktop.click`), so a class need not name a provider; a key that already contains the separator is passed through unchanged; a `default` key is never expanded
+- Wired attributes the framework injects (no constructor parameter, no class annotation) get a `WiredField` placeholder that raises a clear `AttributeError` until injected; look placeholders up with `wired_field(cls, name)` / `wired_fields(cls)`
+- `.pyi` stub generation for injected attributes: `generate-stubs` / `write_layer_stubs()` type them as the target registry's protocol; stale conscribe stubs are reported (`StaleStubWarning`) or deleted with `--prune` / `prune=True`
+- Composed config: several layers in one schema, wired fields inlined as the target layer's discriminated union; the top level refuses unknown sections (`top_level_extra="forbid"` by default); inline-only layers (`create_registrar(..., inline_only=True)`) have no top-level section; a wiring `default` becomes a default config instance
+- Config models, generated Python and JSON Schema preserve field declarations. JSON Schema cannot run Python validators; validators that cannot be reproduced in source produce an `ExtractionWarning` and a header note. Unsupported defaults or types raise `ConfigRenderError`
+- Introspection API (`conscribe.introspect`): `init_param_names`, `receptor_slots`, `wiring_slots`, `annotation_shape`, `is_classvar`, `config_from_param`
+- `compute_registry_fingerprint()` hashes the layer's config source, JSON Schema, version and settings; it does not hash `.pyi` stubs. For composed configs, track every layer plus `inline_wiring` / `top_level_extra`
 - Predicate-based filter system with opt-out controls (`__skip_registries__`, `__propagate__`, `__registration_filter__`)
-- Nested compound discrimination: each key segment maps to a nested Pydantic sub-model with params split by MRO level
-- Designed and tested for compatibility with mainstream Python frameworks: Pydantic, Django, SQLAlchemy, attrs, dataclasses, and any class hierarchy using standard Python MRO
-- Full usability under complex scenarios: Pydantic BaseModel + Generic[T] multi-inheritance, metaclass conflict resolution, and automatic type degradation for Pydantic-incompatible third-party types
+- Nested compound discrimination: each key segment maps to a nested Pydantic sub-model; parameters are assigned to levels by the leaf's constructor
+- Uses standard Python MRO; tested with pydantic models and pydantic dataclasses, stdlib dataclasses (including `slots=True` re-creation), attrs, and classes that bring their own metaclass (`bridge()` resolves metaclass conflicts)
+- Supports Pydantic BaseModel + Generic[T] multiple inheritance and metaclass conflict resolution. Pydantic-incompatible types and names imported only under `if TYPE_CHECKING:` degrade to `Any` with warnings; unresolved names absent from those imports raise `ConfigAnnotationError`
 
 ## Docs
 
 All paths are relative to this file's directory (`conscribe/`).
 
 - [Overview](docs/overview.md): Core concepts, two-subsystem architecture, learning path. Start here.
-- [Guide: Framework Developer](docs/guide-alice.md): Tutorial for building a framework with conscribe. Covers registrar creation, base class setup, config generation, external class integration, CLI usage. Includes hierarchical keys, diamond inheritance, and nested config.
-- [Guide: Framework User](docs/guide-bob.md): Tutorial for consuming a conscribe-based framework. Covers config tiers, MRO parameter collection, scope control, open/closed schemas, nested config validation.
+- [Guide: Framework Developer](docs/guide-alice.md): Tutorial for building a framework with conscribe. Covers registrar creation, base class setup, discovery, config generation and validation, testing declarations, external class integration, wiring, composed config, CLI usage.
+- [Guide: Framework User](docs/guide-bob.md): Tutorial for consuming a conscribe-based framework. Covers config tiers, MRO parameter collection, scope control, open/closed schemas, nested and composed configs, reading validation errors.
+- [Migrating to 2.0](docs/migrating-to-2.0.md): What breaks when upgrading from conscribe 1.x and how to fix it, with a checklist for frameworks built on conscribe.
+- [Testing](docs/testing.md): Registry isolation for tests: `isolated_registries()`, capture/activate of module-level fakes, the pytest plugin.
 - [Registration Deep-Dive](docs/registration.md): Internals of the registration subsystem. Registry, metaclass, key transform, protocol checking, bridge metaclass conflict resolution, filter system, hierarchical keys, cross-registry diamond inheritance.
-- [Config Typing Deep-Dive](docs/config-typing.md): Config pipeline internals. Extract -> build -> generate. Flat and nested modes, codegen, JSON Schema, fingerprinting.
+- [Config Typing Deep-Dive](docs/config-typing.md): Config pipeline internals. Extract -> build -> generate. Flat and nested modes, wiring, composed config, codegen, JSON Schema, fingerprinting.
 - [MRO and Type Degradation](docs/mro-and-degradation.md): MRO-aware `**kwargs` chain resolution, scope classification, type degradation for Pydantic-incompatible types.
 - [API Reference](docs/api-reference.md): Full API signatures, parameters, return types, and usage examples for all public functions and classes.
 - [Recipes](docs/recipes.md): Task-oriented "how do I X?" answers with code snippets.
-- [CLI Reference](docs/cli.md): Command-line interface usage, batch config files, and examples.
+- [CLI Reference](docs/cli.md): Command-line interface usage and examples.
 
 ## Optional
 
 - [Source: registration/registrar.py](registration/registrar.py): `create_registrar()` and `LayerRegistrar` implementation.
+- [Source: registration/auto.py](registration/auto.py): AutoRegistrar metaclass factory and registration validation.
 - [Source: registration/meta_base.py](registration/meta_base.py): `AutoRegistrarBase` and `MetaRegistrarType` for `|` operator.
 - [Source: registration/filters.py](registration/filters.py): Predicate-based filter system.
+- [Source: registration/isolation.py](registration/isolation.py): `isolated_registries()` and `RegistryIsolation`.
+- [Source: discover.py](discover.py): `discover()`, `import_failures()`, `clear_import_failures()`.
+- [Source: wiring.py](wiring.py): `__wiring__` grammar, resolution, `validate_wiring()`, `WiredField` placeholders.
+- [Source: introspect.py](introspect.py): Public introspection API.
+- [Source: exceptions.py](exceptions.py): Errors, warnings and `WiringProblem`.
 - [Source: config/extractor.py](config/extractor.py): `extract_config_schema()` with tier logic.
 - [Source: config/builder.py](config/builder.py): `build_layer_config()` discriminated union builder (flat and nested modes).
-- [Source: config/mro.py](config/mro.py): `collect_mro_params()` MRO walker.
+- [Source: config/composed.py](config/composed.py): `build_composed_config()`, inline wiring, inline-only layers.
+- [Source: config/codegen.py](config/codegen.py): Python source generation.
+- [Source: config/json_schema.py](config/json_schema.py): JSON Schema generation.
+- [Source: config/mro.py](config/mro.py): Constructor chain walker and `collect_mro_params()`.
 - [Source: config/degradation.py](config/degradation.py): Type degradation to `Any`.
-- [Source: wiring.py](wiring.py): Cross-registry wiring resolution (`__wiring__` → `Literal[...]`).
-- [Source: stubs/collector.py](stubs/collector.py): Stub data collection with type narrowing (`narrowest_common_base`).
-- [Source: stubs/generator.py](stubs/generator.py): `.pyi` source rendering (partial stubs with `__getattr__` fallback).
-- [Source: stubs/writer.py](stubs/writer.py): `write_layer_stubs()` file I/O.
+- [Source: stubs/collector.py](stubs/collector.py): Which wired attributes a stub declares.
+- [Source: stubs/generator.py](stubs/generator.py): `.pyi` source rendering.
+- [Source: stubs/writer.py](stubs/writer.py): `write_layer_stubs()` file I/O, stale-stub report and prune.
 - [Source: scanner.py](scanner.py): AST-based registrar scanning and runtime registry listing (`scan`, `list` CLI).

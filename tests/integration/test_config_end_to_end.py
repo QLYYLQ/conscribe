@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Annotated, Protocol, runtime_checkable
 
 import pytest
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
 from conscribe import (
     LayerConfigResult,
@@ -26,6 +26,7 @@ from conscribe import (
     load_cached_fingerprint,
     save_fingerprint,
 )
+from conscribe.exceptions import DegradationWarning
 
 
 # ===================================================================
@@ -568,8 +569,6 @@ class TestDegradationEndToEnd:
 
     def test_full_pipeline_with_degradation(self) -> None:
         """Register -> extract -> build -> codegen -> verify warning."""
-        from typing import Any
-
         LR = create_registrar(
             "transport", LLMProtocol,
             strip_suffixes=["Transport"],
@@ -595,8 +594,9 @@ class TestDegradationEndToEnd:
             async def chat(self, messages: list[dict]) -> str:
                 return "httpx"
 
-        # Build
-        result = build_layer_config(LR)
+        # Build (the degraded field is reported)
+        with pytest.warns(DegradationWarning, match=r"HttpxTransport\.auth: .*degrades to Any"):
+            result = build_layer_config(LR)
         assert "httpx" in result.per_key_models
 
         # Degraded fields should be present
@@ -647,7 +647,8 @@ class TestDegradationEndToEnd:
             async def chat(self, messages: list[dict]) -> str:
                 return "httpx"
 
-        result = build_layer_config(LR)
+        with pytest.warns(DegradationWarning, match=r"HttpxTransport\.auth: .*degrades to Any"):
+            result = build_layer_config(LR)
         schema = generate_layer_json_schema(result)
 
         assert "x-degraded-fields" in schema
