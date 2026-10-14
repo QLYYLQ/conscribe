@@ -13,7 +13,6 @@ pip install conscribe
 
 Requires Python >= 3.10 and pydantic >= 2.7, < 3. Install `conscribe[docstring]` to turn docstring `Args:` sections into field descriptions.
 
-> **Upgrading from 1.x?** conscribe 2.0 raises errors for declaration problems that 1.x silently dropped. The [migration guide](https://github.com/QLYYLQ/conscribe/blob/master/conscribe/docs/migrating-to-2.0.md) lists what changes and how to fix it; the [CHANGELOG](https://github.com/QLYYLQ/conscribe/blob/master/CHANGELOG.md) has the full list.
 
 ---
 
