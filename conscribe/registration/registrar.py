@@ -24,7 +24,11 @@ from typing import (
     Callable,
     Generic,
     TypeVar,
+    TYPE_CHECKING,
 )
+
+if TYPE_CHECKING:
+    from conscribe.config.provenance import ConfigProvenance
 
 from conscribe.exceptions import InvalidRegistryKeyError
 from conscribe.registration import registry as _registry_mod
@@ -425,6 +429,19 @@ class LayerRegistrar(Generic[P]):
             target_cls,
             mro_scope=cls._mro_scope,
             mro_depth=cls._mro_depth,
+        )
+
+    @classmethod
+    def get_config_provenance(cls, key: str) -> ConfigProvenance:
+        """Declaration evidence for :meth:`get_config_schema` with this layer's settings.
+
+        Like ``get_config_schema``, this is per-class extraction before a
+        builder adds discriminators or composes/nests layers.
+        """
+        from conscribe.config.extractor import extract_config_provenance
+
+        return extract_config_provenance(
+            cls._registry.get(key), mro_scope=cls._mro_scope, mro_depth=cls._mro_depth,
         )
 
 

@@ -170,6 +170,7 @@ from conscribe.config.mro import (
     mro_scope_problem,
     walk_init_chain,
 )
+from conscribe.config.provenance import ConfigProvenance
 from conscribe.exceptions import (
     ConfigDeclarationError,
     DegradationWarning,
@@ -190,7 +191,10 @@ _GENERATED_MARKER = "__conscribe_generated__"
 #: Error type raised by the old-shape guard.
 LEGACY_FLAT_ERROR = "legacy_flat_config"
 
-__all__ = ["LEGACY_FLAT_ERROR", "extract_config_schema", "extract_own_init_params"]
+__all__ = [
+    "LEGACY_FLAT_ERROR", "extract_config_schema", "extract_config_provenance",
+    "extract_own_init_params",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -259,10 +263,69 @@ def extract_config_schema(
     """
     schema = getattr(cls, "__config_schema__", None)
     if schema is not None:
-        return _tier3(cls, schema)
+        return _tier3(cls, schema)[0]
     scope = _mro_setting(cls, "__config_mro_scope__", "mro_scope", mro_scope, mro_scope_problem)
     depth = _mro_setting(cls, "__config_mro_depth__", "mro_depth", mro_depth, mro_depth_problem)
     return _Extraction(cls, walk_init_chain(cls, scope=scope, depth=depth)).run()
+
+
+def extract_config_provenance(
+    cls: type,
+    mro_scope: str | list[str] = "local",
+    mro_depth: int | None = None,
+) -> ConfigProvenance:
+    """Extract immutable declaration provenance using the schema extraction path.
+
+    Accepts the same settings and raises the same declaration errors and
+    warnings as :func:`extract_config_schema`. It performs extraction (and
+    its normal factory handling); it is not a source-code-only static scan.
+    It neither changes the returned schema nor adds JSON Schema extensions.
+    Input explicit/default selection and actual runtime injection belong to
+    the consuming framework, not this declaration record.
+    """
+    from conscribe.wiring import wiring_provenance
+
+    schema = getattr(cls, "__config_schema__", None)
+    if schema is not None:
+        schema, wiring = _tier3(cls, schema)
+        history = wiring_provenance(cls)
+        fields = _schema_provenance_fields(schema, "schema", wiring, history)
+        return ConfigProvenance(
+            cls=cls, path="schema", fields=fields, exclusions=(),
+            constructor_chain=None, wiring=history, source_model=schema,
+            schema_declared_on=_attribute_owner(cls, "__config_schema__"),
+            mro=cls.__mro__,
+        )
+    scope = _mro_setting(cls, "__config_mro_scope__", "mro_scope", mro_scope, mro_scope_problem)
+    depth = _mro_setting(cls, "__config_mro_depth__", "mro_depth", mro_depth, mro_depth_problem)
+    extraction = _Extraction(cls, walk_init_chain(cls, scope=scope, depth=depth))
+    model = extraction.run()
+    return extraction.provenance(model, scope=scope, depth=depth)
+
+
+def _attribute_owner(cls: type, name: str) -> type | None:
+    return next((owner for owner in cls.__mro__ if name in vars(owner)), None)
+
+
+def _schema_provenance_fields(model: type[BaseModel], source: Any, wiring: _Wiring, history: Any) -> dict:
+    from conscribe.config.provenance import ConfigFieldProvenance, FieldDeclaration, _receptor
+
+    fields = {}
+    for name in model.model_fields:
+        owner = _ann.annotation_owner(model, name) or model
+        declarations = tuple(
+            FieldDeclaration(
+                name, source, base,
+                status="included" if base is owner else "overridden",
+                reason=None if base is owner else "overridden",
+            )
+            for base in model.__mro__ if name in _ann.own_annotations(base)
+        ) or (FieldDeclaration(name, source, owner),)
+        fields[name] = ConfigFieldProvenance(
+            name, source, owner, None, declarations,
+            _receptor(wiring.slots.get(name)), history.get(name),
+        )
+    return fields
 
 
 def _mro_setting(
@@ -392,8 +455,8 @@ def _own_init_params(cls: type) -> list[InitParam] | None:
 # ---------------------------------------------------------------------------
 
 
-def _tier3(cls: type, schema: Any) -> type[BaseModel]:
-    """Check a ``__config_schema__`` against the class's wiring; return it as is."""
+def _tier3(cls: type, schema: Any) -> tuple[type[BaseModel], _Wiring]:
+    """Check a ``__config_schema__``; return it and the wiring evidence as read."""
     if not (isinstance(schema, type) and _safe_issubclass(schema, BaseModel)):
         raise InvalidConfigSchemaError(cls.__qualname__, schema)
     wiring = _Wiring.prepare(cls)
@@ -437,7 +500,7 @@ def _tier3(cls: type, schema: Any) -> type[BaseModel]:
                 f"or remove 'default' from the wiring entry.",
                 name,
             )
-    return schema
+    return schema, wiring
 
 
 # ---------------------------------------------------------------------------
@@ -550,12 +613,16 @@ class _Extraction:
         self.legacy_param: str | None = None
         self._docs: dict[str, str] | None = None
         self._runtime: InitChain | None = None
+        self._wiring: _Wiring | None = None
+        self.exclusions: dict[str, str] = {}
+        self.source_model: type[BaseModel] | None = None
 
     # -- driver ---------------------------------------------------------------
 
     def run(self) -> type[BaseModel] | None:
         self._warn_if_unreadable()
         wiring = _Wiring.prepare(self.cls)
+        self._wiring = wiring
         from_param = config_from_param(self.cls)
         if from_param is not None:
             return self._flatten(from_param, wiring)
@@ -582,6 +649,77 @@ class _Extraction:
         if not self.fields and extra == "forbid":
             return None  # the builder's discriminator-only model says the same
         return self._create(f"{self.cls.__name__}Config", extra, guard=guard)
+
+    def provenance(self, model: type[BaseModel] | None, *, scope: Any, depth: int | None) -> ConfigProvenance:
+        """Freeze the decisions made by this extraction, without re-extracting."""
+        from conscribe.config.provenance import (
+            ConfigFieldProvenance, FieldDeclaration, _constructor, _receptor,
+        )
+        from conscribe.wiring import wiring_provenance
+
+        assert self._wiring is not None
+        history = wiring_provenance(self.cls)
+        constructor = _constructor(self.chain)
+        fields = {}
+        annotation_history: dict[str, list[tuple[type, bool]]] | None = None
+        if self.source_model is not None:
+            fields.update(_schema_provenance_fields(
+                self.source_model, "flattened", self._wiring, history,
+            ))
+        for name in (() if model is None else model.model_fields):
+            if name in fields:
+                continue
+            slot = self._wiring.slots.get(name)
+            param = self.chain.get(name)
+            if param is None and slot is not None and slot.via == "init":
+                if self._runtime is None:
+                    self._runtime = walk_init_chain(self.cls)
+                param = self._runtime.get(name)
+            entry = history.get(name)
+            if param is not None:
+                source, owner, init_owner = param.source, param.declared_on, param.init_owner
+                chain = constructor if self.chain.get(name) is not None else _constructor(self._runtime)
+                declarations = tuple(d for d in chain.declarations if d.name == name)
+            elif slot is not None:
+                source, owner, init_owner = "annotation", slot.declared_on or self.cls, None
+                from conscribe.introspect import _annotation_slots
+
+                if annotation_history is None:
+                    annotation_history = {}
+                    _annotation_slots(self.cls, history=annotation_history)
+                declarations = tuple(
+                    FieldDeclaration(
+                        name, source, declared_on,
+                        status="excluded" if pseudo else "included" if declared_on is owner else "overridden",
+                        reason="pseudo_field" if pseudo else None if declared_on is owner else "overridden",
+                    )
+                    for declared_on, pseudo in reversed(annotation_history.get(name, []))
+                )
+            else:
+                # Slot-less fields come from the wiring owner, not the leaf.
+                assert entry is not None and not entry.excluded
+                source, owner, init_owner = "wiring", entry.winner.declared_on, None
+                declarations = (FieldDeclaration(name, source, owner),)
+            fields[name] = ConfigFieldProvenance(
+                name, source, owner, init_owner, declarations, _receptor(slot), entry,
+            )
+        exclusions = tuple(
+            FieldDeclaration(
+                p.name, p.source, p.declared_on, p.init_owner,
+                "excluded", self.exclusions[p.name],
+            )
+            for p in self.chain.params if p.name in self.exclusions
+        )
+        flattened = config_from_param(self.cls)
+        return ConfigProvenance(
+            cls=self.cls, path="flattened" if flattened is not None else "reflection",
+            fields=fields, exclusions=exclusions, constructor_chain=constructor,
+            wiring=history, source_model=self.source_model, flattened_param=flattened,
+            schema_declared_on=_attribute_owner(self.cls, "__config_from_param__") if flattened else None,
+            mro_scope=scope if isinstance(scope, str) else tuple(sorted(scope)),
+            mro_depth=depth,
+            mro=self.cls.__mro__,
+        )
 
     # -- knobs ----------------------------------------------------------------
 
@@ -625,6 +763,7 @@ class _Extraction:
                 f"yourself.",
                 param.name,
             )
+        self.exclusions[param.name] = "positional_only" if not param.keyword else "private_name"
         return False
 
     def knob(self, param: InitParam) -> _Knob:
@@ -684,6 +823,7 @@ class _Extraction:
             and knob.name != self.legacy_param
             and not _declares_field(knob)
         ):
+            self.exclusions[knob.name] = "annotated_only"
             return None
         if knob.status == "error" and knob.res is not None:
             knob.res.raise_if_error(self.cls)
@@ -989,6 +1129,7 @@ class _Extraction:
             )
 
         instance = self._flatten_default(knob, model, fail)
+        self.source_model = model
         for name in wiring.resolved:
             if name in model.model_fields:
                 raise fail(

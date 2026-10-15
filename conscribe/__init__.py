@@ -40,14 +40,22 @@ from conscribe.registration import (
 from conscribe.registration.registry import get_registry
 from conscribe.wiring import (
     WiredField,
+    WiringDeclaration,
+    WiringProvenance,
     check_wiring_declaration,
     inject_wired_descriptors,
     validate_wiring,
     wired_field,
     wired_fields,
+    wiring_provenance,
 )
 from conscribe.config import (
     ComposedConfigResult,
+    ConfigFieldProvenance,
+    ConfigProvenance,
+    ConstructorProvenance,
+    FieldDeclaration,
+    ReceptorProvenance,
     DegradedField,
     LayerConfigResult,
     MROScope,
@@ -55,6 +63,7 @@ from conscribe.config import (
     build_layer_config,
     compute_registry_fingerprint,
     extract_config_schema,
+    extract_config_provenance,
     generate_composed_config_source,
     generate_composed_json_schema,
     generate_layer_config_source,
@@ -68,7 +77,7 @@ from conscribe.config.composed import (
     TopLevelExtra,
 )
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 __all__ = [
     # Registration API
@@ -84,6 +93,9 @@ __all__ = [
     "discover",
     # Wiring API
     "WiredField",
+    "WiringDeclaration",
+    "WiringProvenance",
+    "wiring_provenance",
     "inject_wired_descriptors",
     "wired_field",
     "wired_fields",
@@ -92,6 +104,12 @@ __all__ = [
     # Config API
     "MROScope",
     "extract_config_schema",
+    "extract_config_provenance",
+    "ConfigProvenance",
+    "ConfigFieldProvenance",
+    "ConstructorProvenance",
+    "FieldDeclaration",
+    "ReceptorProvenance",
     "build_layer_config",
     "build_composed_config",
     "LayerConfigResult",

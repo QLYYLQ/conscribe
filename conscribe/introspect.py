@@ -124,6 +124,10 @@ class ReceptorSlot:
     parameter: inspect.Parameter | None
     default: Any = field(default=inspect.Parameter.empty, repr=False)
     default_factory: Any = field(default=None, repr=False)
+    #: The constructor accepting the value (may differ from declared_on).
+    init_owner: type | None = None
+    #: The owner of the annotation actually used, including class fallback.
+    annotation_declared_on: type | None = None
 
 
 @dataclass(frozen=True)
@@ -311,7 +315,9 @@ def _require_class(cls: Any) -> None:
         )
 
 
-def _annotation_slots(cls: type) -> dict[str, type]:
+def _annotation_slots(
+    cls: type, *, history: dict[str, list[tuple[type, bool]]] | None = None,
+) -> dict[str, type]:
     """``{name: declaring class}`` of class-level annotation slots along the MRO."""
     slots: dict[str, type] = {}
     for klass in reversed(cls.__mro__):
@@ -330,7 +336,10 @@ def _annotation_slots(cls: type) -> dict[str, type]:
                 owner: Any = context
             else:
                 owner = klass
-            if _ann.is_pseudo_field(raw, owner):
+            pseudo = _ann.is_pseudo_field(raw, owner)
+            if history is not None:
+                history.setdefault(name, []).append((klass, pseudo))
+            if pseudo:
                 slots.pop(name, None)
                 continue
             slots[name] = klass
@@ -338,6 +347,7 @@ def _annotation_slots(cls: type) -> dict[str, type]:
 
 
 def _init_slot(param: InitParam, annotated_on: type | None) -> ReceptorSlot:
+    annotation_owner = param.declared_on
     pydantic_type = _pydantic_field_type(param)
     if pydantic_type is not None:
         annotation, context = pydantic_type, _ann.class_context(param.declared_on)
@@ -350,6 +360,7 @@ def _init_slot(param: InitParam, annotated_on: type | None) -> ReceptorSlot:
                 from_class.status == "resolved" or resolved.status == "unannotated"
             ):
                 annotation, context = _slot_annotation(from_class)
+                annotation_owner = annotated_on
     default, factory, runtime_default = _init_default(param, annotation)
     parameter = param.parameter
     if runtime_default is not parameter.default:
@@ -363,6 +374,8 @@ def _init_slot(param: InitParam, annotated_on: type | None) -> ReceptorSlot:
         parameter=parameter,
         default=default,
         default_factory=factory,
+        init_owner=param.init_owner,
+        annotation_declared_on=annotation_owner if annotation is not None else None,
     )
 
 
@@ -382,6 +395,7 @@ def _annotation_slot(cls: type, name: str, owner: type) -> ReceptorSlot:
         parameter=None,
         default=default,
         default_factory=factory,
+        annotation_declared_on=owner if annotation is not None else None,
     )
 
 

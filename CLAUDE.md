@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Conscribe** (`conscribe` package, v2.0.0) — A Python library for automatic class registration and config typing stub generation for layered Python architectures. It targets framework developers building config-driven frameworks with pluggable layers (agents, LLM providers, etc.). The main downstream user is af. Python >= 3.10 (tested on 3.10–3.14), pydantic >= 2.7, < 3.
+**Conscribe** (`conscribe` package, v2.1.0) — A Python library for automatic class registration and config typing stub generation for layered Python architectures. It targets framework developers building config-driven frameworks with pluggable layers (agents, LLM providers, etc.). The main downstream user is af. Python >= 3.10 (tested on 3.10–3.14), pydantic >= 2.7, < 3.
 
 Core capabilities:
 1. **Auto-registration**: Classes inheriting a base are automatically registered in their layer's registry (via metaclass). Also supports bridging external classes and explicit `@register` decorators. Keys are validated, registration is atomic, `isolated_registries()` scopes registrations for tests.
@@ -21,6 +21,7 @@ Core capabilities:
 5. **`.pyi` stub generation**: Generates PEP 484 `.pyi` files declaring injected wired attributes, typed as the target registry's protocol. Stale conscribe stubs are reported or pruned.
 6. **Composed config**: Combines multiple layers into a single JSON Schema / Python source with inline wiring — wired fields become the target layer's full discriminated union. Strict top level (`top_level_extra="forbid"`), inline-only layers, default instances.
 7. **Introspection** (`conscribe.introspect`): the public rules for which names reach a constructor and which attributes receive wired values.
+8. **Declaration provenance**: `extract_config_provenance()` / `Registrar.get_config_provenance(key)` expose frozen per-class field origins, constructor history and honest truncation evidence; `wiring_provenance()` exposes winner/override/exclusion history without registry lookups. This is separate from input explicit/default selection and runtime injection, which consumers record.
 
 ## Commands
 
@@ -98,6 +99,7 @@ pytest is pre-configured in `pyproject.toml` with `--cov=conscribe --cov-report=
 - `inject_wired_descriptors(cls)` — called from every registration path at class creation (before class decorators run). Installs a placeholder unless: the entry is `declare_only`; the class body binds the name; the class body annotates the name; an inherited binding can hold the value (plain value, writable descriptor, `cached_property`, same-registry placeholder); the name is a constructor parameter (`introspect.init_param_names`). Shadows inherited read-only properties, methods, other-registry placeholders and tombstones.
 - `wired_field(cls, name)` / `wired_fields(cls)` — placeholder lookups through the MRO `__dict__`s, never invoking descriptors; only names injectable per the merged wiring and not constructor parameters at query time.
 - `collect_wiring_from_mro(cls)` — merged raw `__wiring__` dict.
+- `wiring_provenance(cls)` — read-only mapping including exclusions, with frozen `WiringProvenance` / `WiringDeclaration` records from the same MRO merge/parser. Histories are leaf-first; overridden malformed declarations retain immutable problem details, while effective grammar errors raise. This API also validates excluded names (ordinary parsing drops them).
 
 ### Introspection (`conscribe/introspect.py`)
 
@@ -110,6 +112,7 @@ Public, pure reflection (no registry lookups, no imports), scope-free (MRO scope
 - `_fieldinfo.py` — builds fresh `Field(...)` objects from explicit attribute lists (never re-passes a user's `FieldInfo`). `config_field()` carries a parameter's declaration into a config field (refuses `exclude=`, turns `deprecated=` into a JSON-schema marker, enforces one default source, the 2.0 None rule); `inline_field()` / `narrow_keys()` for composed inline receptors.
 - `_utils.py` — init-definer rules: `constructor_definer()` / `own_init()` (2.0: Protocol placeholders and copied `__init__` functions are not definers), `find_init_definer()` (1.x rule, only for compat views), pydantic model / dataclass detection.
 - `mro.py` — `walk_init_chain(cls, scope=..., depth=...)`: one walker, runtime view (scope-free, for introspection) and config view (cut by scope/depth). Init-less classes are skipped before scope/depth; pydantic models and pydantic dataclasses end the chain; unreadable signatures cut it (`extra="allow"`). `collect_mro_params()` is the 1.x wrapper. `classify_class_scope()`; `MROScope`.
+- `provenance.py` — immutable `ConfigProvenance`, `ConfigFieldProvenance`, `FieldDeclaration`, `ConstructorProvenance` and `ReceptorProvenance`; only class references and immutable declaration metadata, never mutable defaults or FieldInfo. `extract_config_provenance` uses the same extraction pipeline and records real filter decisions. No provenance is injected into generated models, source or JSON Schema.
 - `extractor.py` — `extract_config_schema(cls, mro_scope, mro_depth)`. Paths: Tier 3 `__config_schema__` (returned by extraction; builds inherit it, default unset `extra` to `"forbid"`, and inline wired fields when composing; wired entries with a runtime slot must be schema fields); `__config_from_param__` (opt-in flattening of a single pydantic-model parameter; the model subclasses it); constructor reflection (Tier 1 / 1.5 / 2). Every path reaches the wiring pass. Defaults: one source; dataclass/attrs/pydantic factories read from the field; pure factories become literal defaults. Wired fields: every non-None, non-container union member maps to the wiring `Literal`, containers to `list[Literal]`; slot-less and `declare_only` entries are `Optional[Literal[...]] = None`; a dict-form default makes the key the default. Classes that 1.x flattened get the `legacy_flat_config` guard (`__legacy_flat_keys__`). Returns `None` only when there is no knob, no receptor and a closed constructor.
 - `degradation.py` — Type degradation for Pydantic-incompatible field types (try-first, zero overhead on the happy path); `DegradedField.reason` is `pydantic_incompatible`, `type_checking_only` or `function_locals`.
 - `docstring.py` — Tier 1.5 descriptions via the optional `docstring-parser` (empty when it is not installed).
@@ -191,7 +194,7 @@ A registered pydantic model (or pydantic dataclass) whose own `__init__` only fo
 
 ### Deferred scope
 
-Per-class `__config_rules__` (F6), nested-mode wiring / Tier-3 support, typed `WiredField[T]` and shared annotation-AST refactors are deferred to 2.1. The sibling `af` repository is outside this release task.
+Per-class `__config_rules__` (F6), nested-mode wiring / Tier-3 support, typed `WiredField[T]` and shared annotation-AST refactors remain deferred beyond 2.1. The 2.1 release adds declaration provenance only; it does not implement those historical proposals. Changes to the sibling `af` repository require their own task scope.
 
 ### Known Integration Traps
 

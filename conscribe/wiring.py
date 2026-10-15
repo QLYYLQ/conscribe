@@ -107,13 +107,15 @@ import types
 import weakref
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 from conscribe.exceptions import WiringProblem, WiringResolutionError
 
 __all__ = [
     "ResolvedWiring",
     "WiredField",
+    "WiringDeclaration",
+    "WiringProvenance",
     "WiringSpec",
     "check_wiring_declaration",
     "collect_wiring_from_mro",
@@ -124,6 +126,7 @@ __all__ = [
     "validate_wiring",
     "wired_field",
     "wired_fields",
+    "wiring_provenance",
 ]
 
 _PY314 = sys.version_info >= (3, 14)
@@ -175,6 +178,41 @@ class WiringSpec:
     optional_keys: tuple[str, ...] | None = field(default=None)
     default_key: str | None = None
     declare_only: bool = False
+
+
+@dataclass(frozen=True)
+class WiringDeclaration:
+    """One class's declaration of a wiring name, without mutable raw values.
+
+    ``disposition`` describes the declaration in the queried class's MRO:
+    ``winner`` for the effective spec, ``excluded`` for an effective ``None``,
+    and ``overridden`` for every older declaration.  ``excluded`` separately
+    records whether this declaration was ``None``, including when overridden.
+    ``spec`` is also ``None`` for an overridden malformed declaration; its
+    ``problems`` preserve immutable ``(kind, registry_name, detail)`` tuples.
+    """
+
+    name: str
+    declared_on: type
+    spec: WiringSpec | None
+    disposition: Literal["winner", "overridden", "excluded"]
+    excluded: bool = False
+    problems: tuple[tuple[str, str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class WiringProvenance:
+    """The immutable declaration history of one wiring name.
+
+    ``declarations`` follows the queried class's MRO, leaf first.  ``winner``
+    is its first declaration, including an exclusion; ``excluded`` indicates
+    that the name is absent from the effective wiring.
+    """
+
+    name: str
+    declarations: tuple[WiringDeclaration, ...]
+    winner: WiringDeclaration
+    excluded: bool
 
 
 @dataclass
@@ -296,7 +334,9 @@ def _parse_own(klass: type, wiring: Mapping[Any, Any]) -> dict[Any, _Entry]:
     return entries
 
 
-def _merge(cls: type) -> tuple[dict[Any, _Entry], list[tuple[type, Any]]]:
+def _merge(
+    cls: type, *, history: dict[Any, list[_Entry]] | None = None
+) -> tuple[dict[Any, _Entry], list[tuple[type, Any]]]:
     """Merge ``__wiring__`` along the MRO (base first, so subclasses win).
 
     Returns:
@@ -304,6 +344,9 @@ def _merge(cls: type) -> tuple[dict[Any, _Entry], list[tuple[type, Any]]]:
         order, exclusions included (``entry.excluded``), and every class in
         the MRO whose own ``__wiring__`` is neither ``None`` nor a mapping,
         together with the offending value.
+
+    When supplied, ``history`` collects each name's declarations base first
+    during this same walk, without changing merge or validation semantics.
     """
     merged: dict[Any, _Entry] = {}
     not_mappings: list[tuple[type, Any]] = []
@@ -315,13 +358,19 @@ def _merge(cls: type) -> tuple[dict[Any, _Entry], list[tuple[type, Any]]]:
         if not isinstance(wiring, Mapping):
             not_mappings.append((klass, wiring))
             continue
-        merged.update(_parse_own(klass, wiring))
+        own = _parse_own(klass, wiring)
+        merged.update(own)
+        if history is not None:
+            for name, entry in own.items():
+                history.setdefault(name, []).append(entry)
     return merged, not_mappings
 
 
-def _merged_entries(cls: type) -> tuple[dict[Any, _Entry], list[tuple[type, Any]]]:
+def _merged_entries(
+    cls: type, *, history: dict[Any, list[_Entry]] | None = None
+) -> tuple[dict[Any, _Entry], list[tuple[type, Any]]]:
     """Like :func:`_merge`, with the ``None`` exclusions applied."""
-    merged, not_mappings = _merge(cls)
+    merged, not_mappings = _merge(cls, history=history)
     return {k: e for k, e in merged.items() if not e.excluded}, not_mappings
 
 
@@ -402,6 +451,28 @@ def _overlap_detail(keys: list[str]) -> str:
     )
 
 
+def _entry_name_problems(param_name: Any) -> list[str]:
+    """The shared grammar for a wiring entry's name."""
+    if not isinstance(param_name, str):
+        return [
+            f"parameter name must be a str, got {_type_name(param_name)} {param_name!r}"
+        ]
+    if not param_name.isidentifier():
+        return [f"parameter name {param_name!r} is not a valid Python identifier"]
+    if keyword.iskeyword(param_name):
+        return [
+            f"parameter name {param_name!r} is a Python keyword, so it can be neither a "
+            f"constructor parameter nor an attribute; rename the entry"
+        ]
+    if param_name.startswith("__") and param_name.endswith("__"):
+        return [
+            f"parameter name {param_name!r} is a dunder name, which Python reserves for "
+            f"special attributes (a placeholder there would replace {param_name}); "
+            f"use an ordinary attribute name"
+        ]
+    return []
+
+
 def _check_entry(
     param_name: Any, value: Any
 ) -> tuple[WiringSpec | None, list[tuple[str, str, str]]]:
@@ -411,28 +482,10 @@ def _check_entry(
         ``(spec, problems)`` where ``spec`` is ``None`` whenever there is at
         least one problem, and each problem is ``(kind, registry_name, detail)``.
     """
-    malformed: list[str] = []
+    malformed = _entry_name_problems(param_name)
     non_str: list[str] = []
     empty: list[str] = []
     registry_name = ""
-
-    if not isinstance(param_name, str):
-        malformed.append(
-            f"parameter name must be a str, got {_type_name(param_name)} {param_name!r}"
-        )
-    elif not param_name.isidentifier():
-        malformed.append(f"parameter name {param_name!r} is not a valid Python identifier")
-    elif keyword.iskeyword(param_name):
-        malformed.append(
-            f"parameter name {param_name!r} is a Python keyword, so it can be neither a "
-            f"constructor parameter nor an attribute; rename the entry"
-        )
-    elif param_name.startswith("__") and param_name.endswith("__"):
-        malformed.append(
-            f"parameter name {param_name!r} is a dunder name, which Python reserves for "
-            f"special attributes (a placeholder there would replace {param_name}); "
-            f"use an ordinary attribute name"
-        )
 
     spec_kwargs: dict[str, Any] = {}
 
@@ -714,6 +767,65 @@ def parse_wiring(cls: type) -> list[WiringSpec]:
     if problems:
         raise WiringResolutionError(problems=problems)
     return [item.spec for item in parsed if item.spec is not None]
+
+
+def wiring_provenance(cls: type) -> Mapping[str, WiringProvenance]:
+    """Snapshot wiring declarations and their owners without registry lookups.
+
+    The read-only mapping includes excluded names and follows the same
+    first-declaration order as :func:`parse_wiring`.  Each value records the
+    declarations in leaf-first MRO order, including overridden specs,
+    ``declare_only`` constraints and explicit ``None`` exclusions.  The
+    snapshot contains no mutable raw wiring values; later class or nested
+    mapping/list mutations appear only in a subsequent call.
+
+    Effective declarations receive the same grammar validation as
+    :func:`parse_wiring`.  Overridden malformed declarations are retained
+    with ``spec=None`` and immutable ``problems`` rather than raised.  This
+    API also validates excluded entry names, because those names are part
+    of its public result (unlike :func:`parse_wiring`, which drops them).
+
+    Raises:
+        WiringResolutionError: For malformed effective declarations,
+            non-mapping ``__wiring__`` attributes or invalid excluded names.
+    """
+    history: dict[Any, list[_Entry]] = {}
+    entries, not_mappings = _merged_entries(cls, history=history)
+    owner_key = _owner_key(cls)
+    head, parsed = _parse_entries(cls, owner_key, entries, not_mappings)
+    problems = head + [p for item in parsed for p in item.problems]
+    for name, declarations in history.items():
+        winner = declarations[-1]
+        if winner.excluded:
+            problems.extend(
+                _make_problem(cls, owner_key, name, "", "malformed", detail, winner.declared_on)
+                for detail in _entry_name_problems(name)
+            )
+    if problems:
+        raise WiringResolutionError(problems=problems)
+
+    result: dict[str, WiringProvenance] = {}
+    for name, entries_for_name in history.items():
+        declarations = tuple(
+            WiringDeclaration(
+                name=name,
+                declared_on=entry.declared_on,
+                spec=entry.spec,
+                disposition=(
+                    "overridden" if index else "excluded" if entry.excluded else "winner"
+                ),
+                excluded=entry.excluded,
+                problems=entry.problems,
+            )
+            for index, entry in enumerate(reversed(entries_for_name))
+        )
+        result[name] = WiringProvenance(
+            name=name,
+            declarations=declarations,
+            winner=declarations[0],
+            excluded=declarations[0].excluded,
+        )
+    return types.MappingProxyType(result)
 
 
 def check_wiring_declaration(cls: type) -> None:

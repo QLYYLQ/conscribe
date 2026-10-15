@@ -4,7 +4,7 @@
 
 Conscribe targets framework developers building config-driven frameworks with pluggable layers (agents, LLM providers, browser backends, etc.). It eliminates manual registry boilerplate and generates Pydantic-based config schemas from constructor signatures.
 
-- Python >= 3.10, pydantic >= 2.7, < 3 (version 2.0.0; upgrading from 1.x: see the migration guide below)
+- Python >= 3.10, pydantic >= 2.7, < 3 (version 2.1.0; upgrading from 1.x: see the migration guide below)
 - Two subsystems: registration (metaclass-based) and config typing (signature reflection)
 - Three registration paths: inheritance (auto), bridge (external classes), decorator (manual); registration is atomic and registry keys must be non-empty strings
 - Four config tiers: plain `__init__` -> docstring -> Annotated[Field] -> explicit BaseModel (`__config_schema__`, whose validators and `model_config` apply)
@@ -20,6 +20,7 @@ Conscribe targets framework developers building config-driven frameworks with pl
 - `.pyi` stub generation for injected attributes: `generate-stubs` / `write_layer_stubs()` type them as the target registry's protocol; stale conscribe stubs are reported (`StaleStubWarning`) or deleted with `--prune` / `prune=True`
 - Composed config: several layers in one schema, wired fields inlined as the target layer's discriminated union; the top level refuses unknown sections (`top_level_extra="forbid"` by default); inline-only layers (`create_registrar(..., inline_only=True)`) have no top-level section; a wiring `default` becomes a default config instance
 - Config models, generated Python and JSON Schema preserve field declarations. JSON Schema cannot run Python validators; validators that cannot be reproduced in source produce an `ExtractionWarning` and a header note. Unsupported defaults or types raise `ConfigRenderError`
+- Declaration provenance: `extract_config_provenance(cls, mro_scope="local", mro_depth=None)` / `Registrar.get_config_provenance(key)` return frozen field and constructor evidence, real exclusion reasons, full MRO, wiring history and schema/flattened origins. `wiring_provenance(cls)` is registry-free. Ownership is recorded separately for field declarations, runtime receptors and wiring; user-input presence and actual injection belong to the consumer. No provenance fields are inserted into generated source or JSON Schema.
 - Introspection API (`conscribe.introspect`): `init_param_names`, `receptor_slots`, `wiring_slots`, `annotation_shape`, `is_classvar`, `config_from_param`
 - `compute_registry_fingerprint()` hashes the layer's config source, JSON Schema, version and settings; it does not hash `.pyi` stubs. For composed configs, track every layer plus `inline_wiring` / `top_level_extra`
 - Predicate-based filter system with opt-out controls (`__skip_registries__`, `__propagate__`, `__registration_filter__`)
@@ -39,6 +40,7 @@ All paths are relative to this file's directory (`conscribe/`).
 - [Registration Deep-Dive](docs/registration.md): Internals of the registration subsystem. Registry, metaclass, key transform, protocol checking, bridge metaclass conflict resolution, filter system, hierarchical keys, cross-registry diamond inheritance.
 - [Config Typing Deep-Dive](docs/config-typing.md): Config pipeline internals. Extract -> build -> generate. Flat and nested modes, wiring, composed config, codegen, JSON Schema, fingerprinting.
 - [MRO and Type Degradation](docs/mro-and-degradation.md): MRO-aware `**kwargs` chain resolution, scope classification, type degradation for Pydantic-incompatible types.
+- [Declaration Provenance](docs/provenance.md): Immutable public field origins, MRO history, exclusions, wiring owners and extraction boundaries.
 - [API Reference](docs/api-reference.md): Full API signatures, parameters, return types, and usage examples for all public functions and classes.
 - [Recipes](docs/recipes.md): Task-oriented "how do I X?" answers with code snippets.
 - [CLI Reference](docs/cli.md): Command-line interface usage and examples.
@@ -54,6 +56,7 @@ All paths are relative to this file's directory (`conscribe/`).
 - [Source: wiring.py](wiring.py): `__wiring__` grammar, resolution, `validate_wiring()`, `WiredField` placeholders.
 - [Source: introspect.py](introspect.py): Public introspection API.
 - [Source: exceptions.py](exceptions.py): Errors, warnings and `WiringProblem`.
+- [Source: config/provenance.py](config/provenance.py): Frozen declaration-provenance records.
 - [Source: config/extractor.py](config/extractor.py): `extract_config_schema()` with tier logic.
 - [Source: config/builder.py](config/builder.py): `build_layer_config()` discriminated union builder (flat and nested modes).
 - [Source: config/composed.py](config/composed.py): `build_composed_config()`, inline wiring, inline-only layers.

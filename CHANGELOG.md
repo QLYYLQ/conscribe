@@ -5,6 +5,38 @@ All notable changes to conscribe are documented here.
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0]
+
+### Added
+
+- Public declaration provenance: `extract_config_provenance()` and
+  `Registrar.get_config_provenance(key)` return immutable snapshots of actual
+  config fields, their declaring classes and constructor owners, inherited
+  declarations, observed exclusion reasons, schema/flattened model origins,
+  full Python MRO and the constructor walk's truncation evidence. The registrar
+  method uses the same scope/depth settings as `get_config_schema()`.
+- `wiring_provenance()` exposes the effective wiring declaration, inherited
+  overrides, explicit `None` exclusions and `declare_only` constraints using
+  the existing parser, without registry lookups. Runtime receptor ownership
+  remains distinct from the class that declares wiring.
+- `InitChain.declarations` preserves shadowed parameters actually read by the
+  constructor walker. `ReceptorSlot.init_owner` and
+  `ReceptorSlot.annotation_declared_on` identify generated-constructor and
+  annotation-fallback ownership separately.
+
+### Compatibility and limits
+
+Existing config validation and generated source/JSON Schema shapes are unchanged.
+Provenance records use frozen dataclasses, tuples and read-only mappings, with
+class references for owners; they contain no mutable defaults or FieldInfo.
+Consumers record input explicit/default selection and actual injection separately.
+Extraction provenance performs ordinary schema extraction, including its existing
+warnings, errors and factory handling. It describes per-class extraction before
+builder discriminators, nested layout and composition. Constructor history stops
+where the real walk stops; it does not invent parameter names beyond unreadable,
+scope/depth or non-forwarding boundaries. The standalone wiring provenance API
+also validates excluded entry names because they are present in its result.
+
 ## [2.0.0]
 
 conscribe 1.x dropped many declaration problems silently: an unknown

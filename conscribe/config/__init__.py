@@ -15,7 +15,11 @@ from conscribe.config.composed import (
     build_composed_config,
 )
 from conscribe.config.degradation import DegradedField
-from conscribe.config.extractor import extract_config_schema
+from conscribe.config.extractor import extract_config_provenance, extract_config_schema
+from conscribe.config.provenance import (
+    ConfigFieldProvenance, ConfigProvenance, ConstructorProvenance,
+    DeclarationStatus, FieldDeclaration, FieldSource, ReceptorProvenance,
+)
 from conscribe.config.fingerprint import (
     compute_registry_fingerprint,
     load_cached_fingerprint,
@@ -29,6 +33,14 @@ from conscribe.config.mro import MROScope
 
 __all__ = [
     "extract_config_schema",
+    "extract_config_provenance",
+    "ConfigProvenance",
+    "ConfigFieldProvenance",
+    "ConstructorProvenance",
+    "FieldDeclaration",
+    "ReceptorProvenance",
+    "FieldSource",
+    "DeclarationStatus",
     "build_layer_config",
     "build_composed_config",
     "LayerConfigResult",

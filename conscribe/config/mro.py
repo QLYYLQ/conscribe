@@ -300,6 +300,10 @@ class InitChain:
             pydantic dataclass, or a class whose ``__init__`` takes no
             ``**kwargs``.  ``None`` when the walk reached ``object``, was
             cut, or the constructor forwards nothing.
+        declarations: Every named parameter actually read, in walk order,
+            including declarations shadowed by a nearer constructor. Unlike
+            :attr:`params`, names are not deduplicated. Nothing beyond an
+            early stop or a non-forwarding constructor is inferred.
     """
 
     cls: type
@@ -314,6 +318,7 @@ class InitChain:
     unreadable: tuple[type, ...] = ()
     definers: tuple[type, ...] = ()
     terminal: type | None = None
+    declarations: tuple[InitParam, ...] = ()
 
     def names(self) -> tuple[str, ...]:
         """Names the constructor accepts *by keyword*, child first."""
@@ -503,6 +508,7 @@ def walk_init_chain(
             kind="model",
             definer=definer,
             params=params,
+            declarations=params,
             var_keyword=True,
             definers=(cls,) if params else (),
         )
@@ -518,6 +524,7 @@ def walk_init_chain(
             kind="pydantic_dataclass",
             definer=definer,
             params=params,
+            declarations=params,
             var_keyword=True,
             definers=(definer,) if params else (),
         )
@@ -548,6 +555,7 @@ def walk_init_chain(
 
     kind: ChainKind = reading.kind
     params: list[InitParam] = list(reading.params(0))
+    declarations = list(params)
     seen = {p.name for p in params}
     definers: list[type] = [definer] if params else []
     var_keyword = reading.var_keyword
@@ -576,7 +584,9 @@ def walk_init_chain(
             # wherever pydantic is installed -- they validate fields and
             # forward nothing -- so they come before the scope / depth cut.
             if _is_base_model(klass):
-                added = _model_params(cls, level=visited + 1, seen=seen)
+                declared = _model_params(cls, level=visited + 1, seen=set())
+                declarations.extend(declared)
+                added = [p for p in declared if p.name not in seen]
                 params.extend(added)
                 seen.update(p.name for p in added)
                 if added:
@@ -584,7 +594,9 @@ def walk_init_chain(
                 terminal = klass
                 break
             if is_pydantic_dataclass(klass):
-                added = _pydantic_dataclass_params(klass, level=visited + 1, seen=seen)
+                declared = _pydantic_dataclass_params(klass, level=visited + 1, seen=set())
+                declarations.extend(declared)
+                added = [p for p in declared if p.name not in seen]
                 params.extend(added)
                 seen.update(p.name for p in added)
                 if added:
@@ -607,7 +619,9 @@ def walk_init_chain(
                 unreadable.append(klass)
                 break
 
-            added = [p for p in parent.params(visited) if p.name not in seen]
+            declared = list(parent.params(visited))
+            declarations.extend(declared)
+            added = [p for p in declared if p.name not in seen]
             params.extend(added)
             seen.update(p.name for p in added)
             if added:
@@ -629,6 +643,7 @@ def walk_init_chain(
         unreadable=tuple(unreadable),
         definers=tuple(definers),
         terminal=terminal,
+        declarations=tuple(declarations),
     )
 
 
