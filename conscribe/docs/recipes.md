@@ -549,7 +549,7 @@ if load_cached_fingerprint(cache, "llm") != current:
     save_fingerprint(cache, "llm", current)
 ```
 
-The fingerprint never raises: a layer that cannot be generated gets a fingerprint of its error, so a fix counts as a change. For composed configs, track every participating layer and the composition options (`inline_wiring` and `top_level_extra`). Regenerate stubs separately.
+The fingerprint never raises: a layer that cannot be generated gets a fingerprint of its error, so a fix counts as a change. For composed configs, track every participating layer and the composition options (`inline_wiring`, `top_level_extra` and `coverage`). Regenerate stubs separately.
 
 ## Wiring
 
@@ -873,6 +873,21 @@ layer 'archiver' is inline-only; write its instances under: hook[trace_writer].a
 ```
 
 `result.inline_only_layers` lists where each inline-only layer can be written, and `result.top_level_layers` the layers that do have a section. An inline-only layer that no receptor can hold, or one passed with `inline_wiring=False`, raises `ConfigDeclarationError`.
+
+### How do I build a config schema from only the packages one config needs?
+
+Import those packages, pass the layers that have implementations, and say that the build is partial:
+
+```python
+from conscribe import build_composed_config
+
+layers = {name: reg for name, reg in all_layers.items() if reg.get_all()}  # leave empty layers out
+result = build_composed_config(layers, coverage="partial")
+for item in result.unresolved_wiring:
+    print(item, item.missing_keys, item.missing_optional_keys, item.registry_empty)
+```
+
+A complete build (the default) refuses a `declare_only` entry that names an unregistered key and any receptor wired to an empty registry. A partial build leaves those keys out of the entry's `Literal[...]`, and keeps a receptor wired to an empty registry when its default selects no implementation (`None`; `[]` or a `default_factory` on a list receptor). That field then accepts only values that select nothing (omitted, `null`, `[]`); any other value fails with the error type `no_implementation`, naming the empty layer. `result.unresolved_wiring` says what was left out, for your framework to show or check (for example, a declared action no imported capability provides). Keep a complete build where everything is imported (code generation, a test), so typos and layers that packaging left empty are still caught. Details: [Partial builds](config-typing.md#partial-builds).
 
 ### How do I handle circular wiring in composed config?
 

@@ -45,7 +45,14 @@ from conscribe.config._render import (
 )
 from conscribe.config._render import _comment
 from conscribe.config.builder import LayerConfigResult
-from conscribe.config.extractor import LEGACY_FLAT_ERROR, _reject_legacy_flat_keys
+from conscribe.config.extractor import (
+    NO_IMPLEMENTATION_ATTR,
+    LEGACY_FLAT_ERROR,
+    NO_IMPLEMENTATION_ERROR_TYPE,
+    NO_IMPLEMENTATION_MESSAGE,
+    _report_no_implementation,
+    _reject_legacy_flat_keys,
+)
 from conscribe.exceptions import ConfigRenderError, ExtractionWarning
 
 
@@ -137,6 +144,7 @@ class _GeneratedFile:
     def __init__(self) -> None:
         self.ctx = RenderContext()
         self.ctx.register_validator(_reject_legacy_flat_keys, _legacy_flat_guard)
+        self.ctx.register_validator(_report_no_implementation, _no_implementation_report)
         self.blocks: list[str] = []
         #: Emitted compound discriminators: name -> (placeholder, (fields, separator)).
         self.functions: dict[str, tuple[str, tuple[Any, ...]]] = {}
@@ -243,6 +251,10 @@ class _GeneratedFile:
             )
         for field_name, registry in (getattr(model, "__wired_fields__", None) or {}).items():
             comments.setdefault(field_name, []).append(f"wired from: {registry}")
+        for field_name, registry in (getattr(model, NO_IMPLEMENTATION_ATTR, None) or {}).items():
+            comments.setdefault(field_name, []).append(
+                f"wired from: {registry} (no implementation in this build)"
+            )
         return "\n" + render_model_class(
             model, self.ctx, field_comments=comments, title=self._titles.get(id(model)),
             **options,
@@ -653,6 +665,11 @@ def _generate_composed_source(result: Any) -> tuple[str, RenderContext]:
     ]
     if refuser is not None:
         header.append(f"# Inline-only layers: {', '.join(refuser.layers)}")
+    if result.coverage != "complete":
+        header.append(
+            f"# Coverage: {result.coverage} (built from part of the implementations; "
+            f"not the whole catalog)"
+        )
     degraded: dict[str, list[Any]] = {}
     for name, lr in layers.items():
         for key, fields in lr.degraded_fields.items():
@@ -809,6 +826,66 @@ def _legacy_flat_guard(model: type[BaseModel], name: str, decorator: Any, ctx: R
         f"def {name}(cls, data: {any_}) -> {any_}:",
         f"    return {helper}(cls, data)",
     ]
+
+
+def _no_implementation_report(
+    model: type[BaseModel], name: str, decorator: Any, ctx: RenderContext,
+) -> list[str]:
+    """Class-body lines reproducing a partial build's report on fields left without a key.
+
+    The emitted class gets the same ``__no_implementation_fields__`` table and a
+    ``mode="wrap"`` field validator calling the module-level helper
+    :func:`_no_implementation_helper` renders once, so a value selecting an
+    implementation fails with the in-process error (type
+    ``no_implementation``, same message and context).
+
+    Raises:
+        ConfigRenderError: The model refuses a field its table does not name.
+    """
+    table = getattr(model, NO_IMPLEMENTATION_ATTR, None)
+    fields = getattr(getattr(decorator, "info", None), "fields", ())
+    if not isinstance(table, Mapping) or not all(isinstance(table.get(f), str) for f in fields):
+        raise ConfigRenderError(
+            model.__name__, name, describe(table),
+            "the model reports values of fields without an implementation, but its "
+            "__no_implementation_fields__ table does not name the target layer of each "
+            f"({list(fields)}), so the generated refusal could not name it",
+        )
+    ns = ctx.ns
+    helper = ctx.module_function(
+        "_report_no_implementation", _report_no_implementation,
+        lambda placeholder: _no_implementation_helper(placeholder, ns),
+    )
+    any_ = ns.helper("typing", "Any")
+    return [
+        f"{NO_IMPLEMENTATION_ATTR} = {render_value(dict(table), ctx)}",
+        "",
+        f"@{ns.helper('pydantic', 'field_validator')}"
+        f"({', '.join(repr(f) for f in fields)}, mode='wrap')",
+        f"@{ns.builtin('classmethod')}",
+        f"def {name}(cls, value: {any_}, handler: {any_}, info: {any_}) -> {any_}:",
+        f"    return {helper}(cls, value, handler, info)",
+    ]
+
+
+def _no_implementation_helper(placeholder: str, ns: ModuleNamespace) -> str:
+    """Source of the module-level refusal helper (mirrors the extractor's)."""
+    any_ = ns.helper("typing", "Any")
+    return "\n".join([
+        "",
+        "# Partial build: a wired field whose target layer has no implementation it",
+        "# accepts takes only values that select none; any other value is refused.",
+        f"def {placeholder}(cls: {any_}, value: {any_}, handler: {any_}, info: {any_}) -> {any_}:",
+        "    try:",
+        "        return handler(value)",
+        f"    except {ns.helper('pydantic', 'ValidationError')}:",
+        f"        raise {ns.helper('pydantic_core', 'PydanticCustomError')}(",
+        f"            {NO_IMPLEMENTATION_ERROR_TYPE!r},",
+        f"            {NO_IMPLEMENTATION_MESSAGE!r},",
+        f'            {{"field": info.field_name, "layer": cls.{NO_IMPLEMENTATION_ATTR}[info.field_name]}},',
+        "        ) from None",
+        "",
+    ])
 
 
 def _legacy_flat_helper(placeholder: str, ns: ModuleNamespace) -> str:

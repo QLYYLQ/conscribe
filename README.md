@@ -244,7 +244,7 @@ A wired field is called a *receptor*. Its *runtime slot*, when present, is a con
 
 Inheritance: a child's `__wiring__` merges with its parent's (a child entry replaces the parent's entry). Use `None` to exclude: `{"llm": None}`.
 
-Every wiring problem is an error. `build_layer_config()` and `build_composed_config()` check every registered class first and report all problems at once; grammar mistakes fail when the class is created. See [Fail-Fast Diagnostics](#fail-fast-diagnostics).
+Every wiring problem is an error. `build_layer_config()` and `build_composed_config()` check every registered class first and report all problems at once; grammar mistakes fail when the class is created. A composed build of part of the implementations relaxes two of these checks on request (`coverage="partial"`, see [Composed Config](#composed-config-multi-layer-inline-wiring)). See [Fail-Fast Diagnostics](#fail-fast-diagnostics).
 
 #### Capability-relative keys
 
@@ -345,6 +345,22 @@ except ValidationError as exc:
 path='traces/' name='disk'
 layer 'archiver' is inline-only; write its instances under: hook[trace_writer].archive
 ```
+
+A framework that imports only the packages one config names can say so with `coverage="partial"`. The build then leaves out keys of `declare_only` entries that are not registered, and keeps a receptor wired to an empty registry when its default selects no implementation (`None`, `[]`). Such a field accepts only values that select nothing, and any other value fails with the error type `no_implementation`, naming the empty layer. `result.unresolved_wiring` lists what the build left out. The default, `coverage="complete"`, keeps every check, so run it where everything is imported (code generation, CI):
+
+```python
+# Only an android capability was imported: its two actions, and no archiver at all.
+result = build_composed_config({"action": Action, "agent": Agent, "hook": Hook}, coverage="partial")
+for item in result.unresolved_wiring:
+    print(item, item.missing_optional_keys, item.registry_empty)
+```
+
+```
+agent[dom].action ('scroll', 'drag') False
+hook[trace_writer].archive () True
+```
+
+The full example, with the rules for what a partial build still refuses, is in [Partial builds](conscribe/docs/config-typing.md#partial-builds).
 
 ### Cross-Registry Diamond Inheritance
 
@@ -491,11 +507,11 @@ None
 
 | API | Purpose |
 |-----|---------|
-| `extract_config_schema(cls, mro_scope, mro_depth)` | Extract a pydantic model from `__init__` + `__wiring__` |
+| `extract_config_schema(cls, mro_scope, mro_depth, *, coverage="complete")` | Extract a pydantic model from `__init__` + `__wiring__` |
 | `build_layer_config(registrar)` | Build the discriminated union (flat or nested mode) |
 | `generate_layer_config_source(result)` | Generate Python source |
 | `generate_layer_json_schema(result)` | Generate JSON Schema |
-| `build_composed_config(registrars, *, inline_wiring=True, top_level_extra="forbid")` | Build a multi-layer composed config |
+| `build_composed_config(registrars, *, inline_wiring=True, top_level_extra="forbid", coverage="complete")` | Build a multi-layer composed config (`coverage="partial"`: from part of the implementations) |
 | `generate_composed_json_schema(result)` | Generate the composed JSON Schema |
 | `generate_composed_config_source(result)` | Generate composed Python source |
 | `write_layer_stubs(registrar, output_dir=None, *, prune=False)` | Write `.pyi` stubs for injected attributes (`conscribe.stubs`) |

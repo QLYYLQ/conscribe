@@ -42,6 +42,42 @@ Wiring dependencies between layers must be acyclic; a
 (``a -> b -> a``: ``a`` wires ``b``, ``b`` wires ``a``).  ``declare_only``
 entries hold no configs and add no dependency.
 
+Partial builds
+--------------
+
+``coverage="complete"`` (the default) expects every implementation the
+declarations name to be registered, which catches misspelled keys and
+layers that packaging left empty.  ``coverage="partial"`` says that the
+build deliberately holds only part of the implementations (the framework
+imported only the packages one configuration names), and changes exactly
+two wiring rules:
+
+* keys a ``declare_only`` entry names that are not registered are left out
+  of its ``Literal[...]`` instead of raising (the framework's own runtime
+  negotiation judges them);
+* an entry whose target registry is empty is kept when it is
+  ``declare_only``, slot-less, or a receptor whose default selects no
+  implementation: ``None``, or on a multi-instance receptor an empty
+  list / tuple / set or a ``default_factory``.
+
+A field left without a key (an empty target registry, or a
+``declare_only`` entry none of whose keys is registered) accepts only the
+values that select no implementation -- omitted (its default), ``None``
+where the field admits it, ``[]`` for a multi-instance receptor -- so a
+config the complete build accepts stays valid as long as it names no
+missing implementation.  Any other value fails with a pydantic error of
+type ``no_implementation`` (:data:`NO_IMPLEMENTATION_ERROR_TYPE`) naming
+the field and its empty layer; the JSON schema states the same (``null``
+or an array with ``maxItems: 0``).
+
+Everything else is checked as in a complete build: unknown registries,
+unknown keys of other entries, receptors wired to an empty registry
+without such a default (still ``empty_registry``), defaults, and layers
+passed in without implementations (``EmptyLayerError``; leave such a
+layer out of the build).  Every entry the build resolved incompletely is
+listed in :attr:`ComposedConfigResult.unresolved_wiring`, and the
+top-level schema says ``x-coverage: "partial"``.
+
 Top level
 ---------
 
@@ -167,22 +203,34 @@ from conscribe.config.builder import (
     _qualified_name,
     _union_member_keys,
 )
+from conscribe.config.extractor import (
+    COVERAGE_MODES,
+    NO_IMPLEMENTATION_ERROR_TYPE,
+    NO_IMPLEMENTATION_MESSAGE,
+    Coverage,
+    _partial,
+)
 from conscribe.exceptions import (
     CircularWiringError,
     ConfigDeclarationError,
     EmptyLayerError,
 )
 from conscribe.introspect import WiringSlot, wiring_slots
-from conscribe.wiring import parse_wiring, validate_wiring
+from conscribe.wiring import _Unresolved, _validate_wiring, parse_wiring
 
 __all__ = [
+    "COVERAGE_MODES",
     "INLINE_ONLY_ERROR_TYPE",
     "INLINE_ONLY_MESSAGE",
     "INLINE_WIRED_ATTR",
+    "NO_IMPLEMENTATION_ERROR_TYPE",
+    "NO_IMPLEMENTATION_MESSAGE",
     "TOP_LEVEL_EXTRA_MODES",
     "ComposedConfigResult",
+    "Coverage",
     "ReceptorLocation",
     "TopLevelExtra",
+    "UnresolvedWiring",
     "build_composed_config",
 ]
 
@@ -257,6 +305,45 @@ class ReceptorLocation:
 
 
 @dataclasses.dataclass(frozen=True)
+class UnresolvedWiring:
+    """A wiring entry that a partial build resolved incompletely.
+
+    One entry of one registered class, in one ``coverage="partial"``
+    build: a ``declare_only`` entry naming keys that are not registered, or
+    an entry whose target registry is empty.  ``str()`` renders its config
+    path like :class:`ReceptorLocation` (``agent[browser_use.dom].action``).
+
+    Attributes:
+        owner_layer: The layer (its name in the build) whose class declares
+            the entry.
+        owner_key: The class's registry key in that layer.
+        name: The entry's name (its config field).
+        registry_name: The registry the entry targets.
+        declare_only: Whether the entry is a declaration-only constraint.
+        keys: The registered keys the field accepts, in ``Literal`` order.
+            Empty when none resolved: the field then accepts only values
+            that select no implementation (see the module docstring).
+        missing_keys: The required keys the entry declares (as written)
+            that are not registered.
+        missing_optional_keys: The optional keys likewise.
+        registry_empty: The target registry has no registered class.
+    """
+
+    owner_layer: str
+    owner_key: str
+    name: str
+    registry_name: str
+    declare_only: bool
+    keys: tuple[str, ...]
+    missing_keys: tuple[str, ...]
+    missing_optional_keys: tuple[str, ...]
+    registry_empty: bool
+
+    def __str__(self) -> str:
+        return f"{self.owner_layer}[{self.owner_key}].{self.name}"
+
+
+@dataclasses.dataclass(frozen=True)
 class ComposedConfigResult:
     """Result of building a composed config from multiple layers.
 
@@ -278,6 +365,11 @@ class ComposedConfigResult:
             inline-only layer.
         top_level_extra: The top-level model's extra policy (``"forbid"``,
             ``"ignore"`` or ``"allow"``, see :data:`TopLevelExtra`).
+        coverage: ``"complete"`` or ``"partial"`` (see :data:`Coverage`).
+        unresolved_wiring: Every wiring entry a partial build resolved
+            incompletely, ordered by owner layer (dependency order), owner
+            key (sorted) and entry (``__wiring__`` order).  Always empty in
+            a complete build.
     """
 
     layer_results: dict[str, LayerConfigResult]
@@ -288,6 +380,8 @@ class ComposedConfigResult:
         default_factory=dict,
     )
     top_level_extra: str = "forbid"
+    coverage: str = "complete"
+    unresolved_wiring: tuple[UnresolvedWiring, ...] = ()
 
     @property
     def top_level_layers(self) -> list[str]:
@@ -300,6 +394,7 @@ def build_composed_config(
     *,
     inline_wiring: bool = True,
     top_level_extra: TopLevelExtra = "forbid",
+    coverage: Coverage = "complete",
 ) -> ComposedConfigResult:
     """Build a composed config from multiple layer registrars.
 
@@ -319,6 +414,14 @@ def build_composed_config(
             (default: unknown top-level keys are refused), ``"ignore"``
             (dropped) or ``"allow"`` (kept in ``model_extra``).  Inline-only
             layer names are refused in every mode.
+        coverage: ``"complete"`` (default): every implementation a wiring
+            declaration names must be registered.  ``"partial"``: the
+            registered implementations are deliberately incomplete;
+            unregistered keys of ``declare_only`` entries are left out, and
+            an entry wired to an empty registry keeps its default and
+            accepts only values that select no implementation (see the
+            module docstring).  Both are reported in
+            :attr:`ComposedConfigResult.unresolved_wiring`.
 
     Returns:
         A ``ComposedConfigResult`` with per-layer results and a top-level model.
@@ -327,12 +430,14 @@ def build_composed_config(
         TypeError: If *registrars* is not a mapping, or maps a layer name to
             something that is not a registrar created by
             ``create_registrar()`` (every such layer is named).
-        ValueError: If *top_level_extra* is not one of the accepted values,
-            or a registrar has no discriminator configuration.
+        ValueError: If *top_level_extra* or *coverage* is not one of the
+            accepted values, or a registrar has no discriminator
+            configuration.
         EmptyLayerError: If any requested layer has no registered classes
             (every empty layer is named).
         WiringResolutionError: If any registered class of any layer has
-            wiring problems (every problem is listed in ``problems``).
+            wiring problems (every problem is listed in ``problems``; a
+            partial build tolerates what the module docstring lists).
         CircularWiringError: If wiring dependencies form a cycle (one
             actual cycle is named).
         ConfigDeclarationError: If a layer name cannot be a top-level field
@@ -349,6 +454,7 @@ def build_composed_config(
             or several layers share the registry a wiring entry targets.
     """
     _check_top_level_extra(top_level_extra)
+    partial = _partial(coverage, "build_composed_config")
     _check_registrars(registrars)
     _check_layer_names(registrars)
     _reject_empty_layers(registrars)
@@ -357,7 +463,7 @@ def build_composed_config(
     # which they would otherwise hide.
     for registrar in registrars.values():
         _check_buildable(registrar)
-    validate_wiring(registrars)
+    unresolved = _validate_wiring(registrars, partial=partial)
     if not inline_wiring:
         _reject_inline_only_without_inline_wiring(registrars)
 
@@ -377,7 +483,7 @@ def build_composed_config(
     for layer_name in order:
         registrar = registrars[layer_name]
         classes = registrar.get_all()
-        result = _build_validated_layer(registrar, names=names)
+        result = _build_validated_layer(registrar, names=names, partial=partial)
         _check_key_constraints(result, classes)
         if inline_wiring:
             result = _replace_wired_literals_with_unions(
@@ -399,6 +505,7 @@ def build_composed_config(
         extra=top_level_extra,
         inline_only_paths=paths,
         inline_wiring=inline_wiring,
+        coverage=coverage,
     )
 
     return ComposedConfigResult(
@@ -408,6 +515,8 @@ def build_composed_config(
         inline_wiring=inline_wiring,
         inline_only_layers=locations,
         top_level_extra=top_level_extra,
+        coverage=coverage,
+        unresolved_wiring=_unresolved_wiring(registrars, order, unresolved),
     )
 
 
@@ -418,6 +527,27 @@ def _check_top_level_extra(top_level_extra: Any) -> None:
             f"build_composed_config(): top_level_extra must be one of "
             f"{list(TOP_LEVEL_EXTRA_MODES)}, got {top_level_extra!r}"
         )
+
+
+def _unresolved_wiring(
+    registrars: Mapping[str, Any],
+    order: list[str],
+    unresolved: Mapping[type, tuple[_Unresolved, ...]],
+) -> tuple[UnresolvedWiring, ...]:
+    """Locate the incompletely resolved entries of each class in the build.
+
+    One record per ``(layer, key)`` the class is registered under, ordered
+    by layer (dependency order), key (sorted) and entry (declaration order).
+    """
+    if not unresolved:
+        return ()
+    records: list[UnresolvedWiring] = []
+    for layer in order:
+        classes = registrars[layer].get_all()
+        for key in sorted(classes):
+            for entry in unresolved.get(classes[key], ()):
+                records.append(UnresolvedWiring(owner_layer=layer, owner_key=key, **entry._asdict()))
+    return tuple(records)
 
 
 # ---------------------------------------------------------------------------
@@ -1515,6 +1645,7 @@ def _build_top_level_model(
     extra: str = "forbid",
     inline_only_paths: Mapping[str, tuple[str, ...]] | None = None,
     inline_wiring: bool = True,
+    coverage: str = "complete",
 ) -> type[BaseModel]:
     """Build the top-level ComposedConfig model.
 
@@ -1531,6 +1662,7 @@ def _build_top_level_model(
         extra: The extra policy (``top_level_extra``).
         inline_only_paths: Full receptor paths per inline-only layer.
         inline_wiring: Recorded as ``x-inline-wiring``.
+        coverage: ``"partial"`` is recorded as ``x-coverage``.
     """
     inline_only_paths = dict(inline_only_paths or {})
     field_defs: dict[str, Any] = {}
@@ -1556,7 +1688,7 @@ def _build_top_level_model(
         module=__name__,
         config={
             "json_schema_extra": _top_level_schema_extra(
-                dependency_order, inline_wiring, inline_only_paths, extra,
+                dependency_order, inline_wiring, inline_only_paths, extra, coverage,
             ),
         },
         validators=validators,
@@ -1581,12 +1713,15 @@ def _top_level_schema_extra(
     inline_wiring: bool,
     inline_only_paths: Mapping[str, tuple[str, ...]],
     extra: str,
+    coverage: str = "complete",
 ) -> dict[str, Any]:
     """The top-level ``json_schema_extra`` (JSON-serializable, deterministic)."""
     schema_extra: dict[str, Any] = {
         "x-composed-layers": list(dependency_order),
         "x-inline-wiring": inline_wiring,
     }
+    if coverage != "complete":
+        schema_extra["x-coverage"] = coverage
     if inline_only_paths:
         schema_extra["x-inline-only-layers"] = {
             layer: list(paths) for layer, paths in inline_only_paths.items()

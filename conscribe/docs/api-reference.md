@@ -171,16 +171,17 @@ Same as `build_layer_config(cls)`.
 
 `build_config().union_type`.
 
-#### `get_config_schema(key) -> type[BaseModel] | None`
+#### `get_config_schema(key, *, coverage="complete") -> type[BaseModel] | None`
 
-`extract_config_schema()` of the class registered under `key`, with the registrar's `mro_scope` / `mro_depth`: the per-class model without the discriminator field. `None` when the class has nothing to configure.
+`extract_config_schema()` of the class registered under `key`, with the registrar's `mro_scope` / `mro_depth`: the per-class model without the discriminator field. `None` when the class has nothing to configure. `coverage="partial"` applies the wiring rules of a [partial build](config-typing.md#partial-builds).
 
-#### `get_config_provenance(key) -> ConfigProvenance`
+#### `get_config_provenance(key, *, coverage="complete") -> ConfigProvenance`
 
 `extract_config_provenance()` of the registered class using this registrar's
 scope/depth settings, matching `get_config_schema(key)`. Class overrides still
 win. Like `get_config_schema`, this is the per-class view before builder-added
 discriminators, nested layout or composition, including on nested registrars.
+Pass `coverage="partial"` to explain a class of a partial build.
 
 ---
 
@@ -295,7 +296,7 @@ Rules:
 - Every key is a `str`; explicit key lists must not be empty; a key cannot be both required and optional.
 - `__wiring__` is merged along the MRO, base classes first. A subclass entry replaces the inherited entry whole; `{"name": None}` removes an inherited entry. `__wiring__ = None` on a class declares nothing (it keeps every inherited entry).
 - Against a registry with a `key_separator`, an explicit key may be a bare trailing segment (a capability-relative key): `"click"` expands to every registered key ending in `.click` (`browser.click`, `desktop.click`). All matches are kept, and the consuming framework decides which one it uses. A key that contains the separator passes through unchanged. A `default` key is never expanded, so it must be spelled exactly as registered.
-- The grammar is checked when a class registers, so a malformed entry fails the class statement with `WiringResolutionError`. Registry lookups (unknown registries or keys, empty registries, bad defaults, `declare_only` contradictions) happen when a config is built, and every problem of the build is reported in one error.
+- The grammar is checked when a class registers, so a malformed entry fails the class statement with `WiringResolutionError`. Registry lookups (unknown registries or keys, empty registries, bad defaults, `declare_only` contradictions) happen when a config is built, and every problem of the build is reported in one error. A [partial composed build](#build_composed_config) tolerates unregistered `declare_only` keys and empty registries behind fields with a default that selects nothing; nothing at registration depends on what is registered.
 
 `__wiring__` is not supported on classes of nested-mode layers yet (`ConfigDeclarationError` at build time).
 
@@ -508,6 +509,8 @@ extract_config_schema(
     cls: type,
     mro_scope: str | list[str] = "local",
     mro_depth: int | None = None,
+    *,
+    coverage: Coverage = "complete",
 ) -> type[BaseModel] | None
 ```
 
@@ -518,9 +521,9 @@ The config model of one class, without the discriminator. In order:
 3. Constructor reflection: a model built from everything the constructor accepts (following `**kwargs` chains within `mro_scope` / `mro_depth`), with the wiring receptors.
 4. `None` when the class has no configurable constructor parameter (a *knob*), no wiring entry and a closed constructor (one that accepts no arbitrary extra arguments).
 
-`__config_mro_scope__` / `__config_mro_depth__` on the class override the arguments.
+`__config_mro_scope__` / `__config_mro_depth__` on the class override the arguments. `coverage="partial"` resolves the class's wiring with the rules of a [partial build](config-typing.md#partial-builds), for a class of a catalog that deliberately holds part of the implementations. A Tier-3 schema is still returned verbatim, and its fields' defaults are not checked (the composed build does that).
 
-**Raises:** `InvalidConfigSchemaError` (`__config_schema__` is not a `BaseModel` subclass); `WiringResolutionError`; `ConfigAnnotationError` (a typo or broken `Annotated` metadata in an annotation a knob needs); `ConfigDeclarationError` (contradictory declarations: two defaults, `Field(exclude=...)`, a bad `__config_from_param__`, a Tier-3 schema missing a wired field, a `Literal` member that is not a wiring key, an invalid MRO setting, a required parameter no config can pass, a private wiring name, a name colliding with a `model_*` member of `BaseModel`). **Warns:** `DegradationWarning`, `ExtractionWarning`.
+**Raises:** `ValueError` (unknown `coverage`); `InvalidConfigSchemaError` (`__config_schema__` is not a `BaseModel` subclass); `WiringResolutionError`; `ConfigAnnotationError` (a typo or broken `Annotated` metadata in an annotation a knob needs); `ConfigDeclarationError` (contradictory declarations: two defaults, `Field(exclude=...)`, a bad `__config_from_param__`, a Tier-3 schema missing a wired field, a `Literal` member that is not a wiring key, an invalid MRO setting, a required parameter no config can pass, a private wiring name, a name colliding with a `model_*` member of `BaseModel`). **Warns:** `DegradationWarning`, `ExtractionWarning`.
 
 See [Config Typing Deep-Dive](config-typing.md#extraction-extractorpy).
 
@@ -531,6 +534,8 @@ extract_config_provenance(
     cls: type,
     mro_scope: str | list[str] = "local",
     mro_depth: int | None = None,
+    *,
+    coverage: Coverage = "complete",
 ) -> ConfigProvenance
 ```
 
@@ -579,6 +584,7 @@ build_composed_config(
     *,
     inline_wiring: bool = True,
     top_level_extra: TopLevelExtra = "forbid",
+    coverage: Coverage = "complete",
 ) -> ComposedConfigResult
 ```
 
@@ -589,8 +595,9 @@ Combines several layers into one top-level model with a `list[<layer union>]` fi
 | `registrars` | `{section name: registrar}`. Section names must be valid identifiers, not private, not `BaseModel` attributes, without the `model_` prefix. |
 | `inline_wiring` | `True`: wired fields hold the target layer's configs (default instances for default keys; `declare_only` entries stay key selectors). `False`: wired fields stay `Literal[...]` keys. |
 | `top_level_extra` | `"forbid"` (unknown top-level keys are refused; the JSON schema says `additionalProperties: false`), `"ignore"` or `"allow"`. Inline-only layer names are refused in every mode. |
+| `coverage` | `"complete"` (every implementation a wiring declaration names must be registered) or `"partial"` (the registered implementations are deliberately incomplete): unregistered keys of `declare_only` entries are left out, and an entry wired to an empty registry is kept when it is `declare_only`, slot-less, or has a default that selects no implementation (`None`; on a multi-instance receptor also an empty list, tuple or set, or a `default_factory`). A field left without a key accepts only values that select no implementation (omitted, `null` where it admits `None`, `[]` on a multi-instance receptor) and reports any other value as `no_implementation`. Everything else is checked as in a complete build. See [Partial builds](config-typing.md#partial-builds). |
 
-**Raises:** `TypeError` (not a mapping of registrars); `ValueError` (bad `top_level_extra`, a layer without a discriminator); `EmptyLayerError` (every empty layer named); `WiringResolutionError` (every problem of the build); `CircularWiringError`; `ConfigDeclarationError` (bad section names, layer declaration problems, key constraints that reject every key, wiring keys that select no config model, a default key whose config cannot be built from defaults, a non-empty container default or scalar `default_factory` under inline wiring, an inline-only layer without a writable location, an inline-only layer with `inline_wiring=False`, two sections sharing the registry a wiring entry targets).
+**Raises:** `TypeError` (not a mapping of registrars); `ValueError` (bad `top_level_extra` or `coverage`, a layer without a discriminator); `EmptyLayerError` (every empty layer named); `WiringResolutionError` (every problem of the build); `CircularWiringError`; `ConfigDeclarationError` (bad section names, layer declaration problems, key constraints that reject every key, wiring keys that select no config model, a default key whose config cannot be built from defaults, a non-empty container default or scalar `default_factory` under inline wiring, an inline-only layer without a writable location, an inline-only layer with `inline_wiring=False`, two sections sharing the registry a wiring entry targets).
 
 ### `ComposedConfigResult`
 
@@ -604,11 +611,33 @@ Frozen dataclass:
 | `inline_wiring` | Whether wired fields were inlined |
 | `inline_only_layers` | `{layer: (ReceptorLocation, ...)}`: where each inline-only layer's instances are written; empty without inline-only layers |
 | `top_level_extra` | The top-level extra policy |
+| `coverage` | `"complete"` or `"partial"` |
+| `unresolved_wiring` | `(UnresolvedWiring, ...)`: every entry a partial build resolved incompletely, by owner layer (dependency order), owner key and declaration order; empty in a complete build |
 | `top_level_layers` (property) | `dependency_order` without the inline-only layers |
 
 ### `ReceptorLocation`
 
 Frozen dataclass naming one receptor that holds an inline-only layer's configs: `owner_layer`, `owner_key`, `receptor`, `target_layer`, `keys` (the target keys it accepts). `str()` renders it as a config path: `hook[trace_writer].archive`.
+
+### `UnresolvedWiring`
+
+Frozen dataclass naming one wiring entry a partial build resolved incompletely, once per `(layer, key)` its class is registered under:
+
+| Field | Description |
+|-------|-------------|
+| `owner_layer`, `owner_key` | Where the declaring class sits in the build |
+| `name` | The entry (its config field) |
+| `registry_name` | The registry it targets |
+| `declare_only` | Whether it is a declaration-only constraint |
+| `keys` | The registered keys the field accepts; empty when none resolved (the field then accepts only values that select no implementation) |
+| `missing_keys`, `missing_optional_keys` | Declared keys (as written, capability-relative ones unexpanded) that are not registered |
+| `registry_empty` | The target registry has no registered class |
+
+`str()` renders the config path: `agent[dom].action`.
+
+### `Coverage`, `NO_IMPLEMENTATION_ERROR_TYPE`
+
+`Coverage = Literal["complete", "partial"]`, accepted by `build_composed_config()`, `extract_config_schema()`, `extract_config_provenance()` and the registrar's `get_config_schema()` / `get_config_provenance()`; `conscribe.config.composed.COVERAGE_MODES` lists the values. `NO_IMPLEMENTATION_ERROR_TYPE = "no_implementation"`, the pydantic error type of a value that selects an implementation for a field a partial build left without a key (`loc` ends at the field; context `field` and `layer`; message `this build holds no implementation of layer 'archiver' that 'archive' accepts; leave 'archive' out`). `conscribe.config.composed` also exports the message template `NO_IMPLEMENTATION_MESSAGE`.
 
 ### `TopLevelExtra`, `INLINE_ONLY_ERROR_TYPE`
 

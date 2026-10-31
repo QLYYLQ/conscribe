@@ -37,6 +37,11 @@ Two attribute sets, two consumers:
   ``Strict``, ...) are dropped -- they were written for the key string.
   Plain markers (objects pydantic ignores, e.g. a frozen dataclass a
   framework reads back from ``FieldInfo.metadata``) are kept.
+
+:func:`no_implementation_field` builds the field a partial composed build gives
+a wired field left without a key: a type accepting only values that select
+no implementation, the :data:`INLINE_FIELD_ATTRS`, the deprecated marker
+and the default.
 """
 from __future__ import annotations
 
@@ -65,6 +70,8 @@ __all__ = [
     "is_deprecated",
     "is_pydantic_interpreted",
     "narrow_keys",
+    "no_implementation_default_problem",
+    "no_implementation_field",
 ]
 
 #: ``FieldInfo`` attributes carried from a user's ``Field(...)`` into the
@@ -561,6 +568,84 @@ def inline_field(
 
     kept = inline_metadata(src.metadata, container=container)
     field_type = Annotated[tuple([inline_type, *kept])] if kept else inline_type  # type: ignore[misc]
+    return field_type, Field(**kwargs)
+
+
+#: Empty values of these types select no instance of a multi-instance
+#: receptor (its config field is a list, which accepts them).
+_EMPTY_LIST_LIKE: tuple[type, ...] = (list, tuple, set, frozenset)
+
+
+def no_implementation_default_problem(
+    default: Any, default_factory: Any, *, container: bool,
+) -> str | None:
+    """Why a wired field's default cannot stand in for an empty target registry.
+
+    ``None`` when it can: the default is ``None``, or, on a multi-instance
+    receptor (*container*), an empty list, tuple, set or frozenset, or comes
+    from a ``default_factory`` (carried as it is, as for any list receptor).
+    Otherwise the reason, to follow the field's name in a message.
+
+    Args:
+        default: The default; ``PydanticUndefined`` or
+            ``inspect.Parameter.empty`` when there is none.
+        default_factory: The ``default_factory``, or ``None``.
+        container: The field holds several instances.
+    """
+    if default_factory is not None:
+        return None if container else "takes its default from a default_factory instead of None"
+    if default is PydanticUndefined or default is inspect.Parameter.empty:
+        return "has no default"
+    if default is None or (container and isinstance(default, _EMPTY_LIST_LIKE) and not default):
+        return None
+    return f"defaults to {default!r}"
+
+
+def no_implementation_field(
+    src: FieldInfo, *, container: bool, optional: bool,
+) -> tuple[Any, FieldInfo]:
+    """Build the ``(type, FieldInfo)`` of a wired field left without a key.
+
+    A partial composed build gives this field to a wired entry that resolved
+    to no key (its target registry is empty, or none of the keys a
+    ``declare_only`` entry names is registered).  Its type accepts exactly
+    the values that select no implementation: ``None`` for a single-instance
+    field, an empty list for a multi-instance receptor (*container*), also
+    ``None`` when *optional*.  The owning model wraps the field in a
+    validator that reports any other value as ``no_implementation``.  It
+    keeps what documents the field (:data:`INLINE_FIELD_ATTRS` and the
+    deprecated marker) and *src*'s default or ``default_factory``; an empty
+    collection default becomes ``[]``, as the list field would make it.  The
+    default is never validated (``validate_default=False``), so omitting the
+    field always yields it.
+
+    Args:
+        src: The field the entry would otherwise have (read only; never
+            handed back to pydantic).  Its default passes
+            :func:`no_implementation_default_problem`.
+        container: The entry is a multi-instance receptor.
+        optional: The field admits ``None`` (always true for a
+            single-instance field, whose only value is ``None``).
+    """
+    # NoneType, not None: pydantic < 2.8 reads a ``None`` type in a
+    # ``create_model`` definition as "no annotation".
+    field_type: Any = type(None)
+    if container:
+        field_type = Annotated[list[Any], annotated_types.MaxLen(0)]
+        if optional:
+            field_type = Optional[field_type]
+    kwargs: dict[str, Any] = {
+        attr: getattr(src, attr)
+        for attr in INLINE_FIELD_ATTRS
+        if getattr(src, attr, None) is not None
+    }
+    if is_deprecated(src):
+        kwargs["json_schema_extra"] = {"deprecated": True}
+    kwargs["validate_default"] = False
+    if src.default_factory is not None:
+        kwargs["default_factory"] = src.default_factory
+    elif src.default is not PydanticUndefined:
+        kwargs["default"] = None if src.default is None else []
     return field_type, Field(**kwargs)
 
 

@@ -51,6 +51,11 @@ settings. Class-level `__config_mro_scope__` and `__config_mro_depth__` override
 win, just as with `get_config_schema`. Use this method when explaining a layer
 instead of reproducing its private settings.
 
+Both take `coverage="partial"` for a class of a [partial
+build](config-typing.md#partial-builds), where some implementations its wiring
+names were deliberately not imported; the wiring then resolves with the same
+relaxed rules as the build.
+
 The result describes the per-class schema **before** a builder adds a
 discriminator, assigns nested paths or inlines composed wiring. This also applies
 to `get_config_provenance` on a nested-mode registrar: it matches that registrar's

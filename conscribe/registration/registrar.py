@@ -28,6 +28,7 @@ from typing import (
 )
 
 if TYPE_CHECKING:
+    from conscribe.config.extractor import Coverage
     from conscribe.config.provenance import ConfigProvenance
 
 from conscribe.exceptions import InvalidRegistryKeyError
@@ -412,11 +413,14 @@ class LayerRegistrar(Generic[P]):
         return cls.build_config().union_type
 
     @classmethod
-    def get_config_schema(cls, key: str) -> Any:
+    def get_config_schema(cls, key: str, *, coverage: Coverage = "complete") -> Any:
         """Get the config schema for a specific registered key.
 
         Args:
             key: The registration key.
+            coverage: ``"partial"`` for a class of a catalog that deliberately
+                holds part of the implementations (see
+                :func:`conscribe.config.extractor.extract_config_schema`).
 
         Returns:
             A Pydantic ``BaseModel`` subclass, or ``None`` if no
@@ -429,19 +433,22 @@ class LayerRegistrar(Generic[P]):
             target_cls,
             mro_scope=cls._mro_scope,
             mro_depth=cls._mro_depth,
+            coverage=coverage,
         )
 
     @classmethod
-    def get_config_provenance(cls, key: str) -> ConfigProvenance:
+    def get_config_provenance(cls, key: str, *, coverage: Coverage = "complete") -> ConfigProvenance:
         """Declaration evidence for :meth:`get_config_schema` with this layer's settings.
 
         Like ``get_config_schema``, this is per-class extraction before a
-        builder adds discriminators or composes/nests layers.
+        builder adds discriminators or composes/nests layers; ``coverage``
+        works the same way.
         """
         from conscribe.config.extractor import extract_config_provenance
 
         return extract_config_provenance(
             cls._registry.get(key), mro_scope=cls._mro_scope, mro_depth=cls._mro_depth,
+            coverage=coverage,
         )
 
 

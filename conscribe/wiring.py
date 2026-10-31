@@ -240,6 +240,26 @@ class ResolvedWiring:
     declare_only: bool = False
 
 
+class _Unresolved(NamedTuple):
+    """What a partial resolution left out of one entry.
+
+    Only partial resolution (``coverage="partial"`` of
+    ``build_composed_config`` and the per-class extraction functions)
+    produces these: a ``declare_only`` entry naming keys that are not
+    registered, or an entry whose target registry is empty.  ``keys`` are the
+    keys that did resolve (empty: the field accepts only values that select
+    no implementation).
+    """
+
+    name: str
+    registry_name: str
+    declare_only: bool
+    keys: tuple[str, ...]
+    missing_keys: tuple[str, ...]
+    missing_optional_keys: tuple[str, ...]
+    registry_empty: bool
+
+
 # ── Merging along the MRO ──────────────────────────────────────
 
 
@@ -1116,6 +1136,61 @@ def _empty_registry_detail(registry_name: str) -> str:
     )
 
 
+def _partial_empty_registry_detail(registry_name: str, why: str) -> str:
+    """``empty_registry`` detail of a partial build: the field has no usable default."""
+    return (
+        f"registry '{registry_name}' is empty (no class is registered in it), and a "
+        "partial build keeps a field wired to an empty registry only when the field's "
+        "default selects no implementation (None, or an empty list or a "
+        f"default_factory on a multi-instance receptor); {why}. Import an "
+        f"implementation of '{registry_name}', or give the field such a default"
+        + _failures_hint()
+    )
+
+
+def _unusable_default(slot: Any) -> str | None:
+    """Why *slot*'s default cannot stand in for an empty target registry.
+
+    ``None`` when it can: the entry is slot-less (its field defaults to
+    ``None``); the default is ``None``, or a class annotation without a
+    value admits ``None`` (the field then defaults to ``None``); or, on a
+    multi-instance receptor, the default is an empty list, tuple or set, or
+    comes from a ``default_factory`` (carried as it is, as for any list
+    receptor).  A class annotation without a value takes its default from
+    the first ``Field`` default in its ``Annotated`` metadata, as the
+    extractor does.  *slot* is the entry's
+    :class:`conscribe.introspect.ReceptorSlot`, or ``None``.
+    """
+    if slot is None:
+        return None
+    from pydantic_core import PydanticUndefined
+
+    from conscribe.config._annotations import admits_none
+    from conscribe.config._fieldinfo import field_infos_of, no_implementation_default_problem
+
+    default, factory = slot.default, slot.default_factory
+    if slot.via == "annotation" and default is inspect.Parameter.empty and factory is None:
+        declared = next(
+            (
+                info for info in field_infos_of(slot.annotation)
+                if info.default is not PydanticUndefined or info.default_factory is not None
+            ),
+            None,
+        )
+        if declared is not None:
+            default, factory = declared.default, declared.default_factory
+        elif admits_none(slot.annotation, slot.declared_on):
+            return None
+    why = no_implementation_default_problem(default, factory, container=slot.shape != "scalar")
+    return None if why is None else f"'{slot.name}' {why}"
+
+
+def _tier3_field(cls: type, name: str) -> bool:
+    """Whether *cls*'s ``__config_schema__`` declares the config field *name*."""
+    fields = getattr(getattr(cls, "__config_schema__", None), "model_fields", None)
+    return isinstance(fields, Mapping) and name in fields
+
+
 def _default_problem(
     default: str,
     *,
@@ -1179,12 +1254,22 @@ def _expand_and_split(
 
 
 def _resolve_spec(
-    spec: WiringSpec, views: _Views | None = None
-) -> tuple[ResolvedWiring | None, list[tuple[str, str]]]:
-    """Resolve one grammatically valid spec; return ``(resolved, [(kind, detail)])``.
+    spec: WiringSpec, views: _Views | None = None, *, partial: bool = False
+) -> tuple[ResolvedWiring | None, list[tuple[str, str]], _Unresolved | None]:
+    """Resolve one grammatically valid spec: ``(resolved, [(kind, detail)], unresolved)``.
 
     *views* caches each registry's keys across the specs of one resolution
     run (:func:`validate_wiring` passes one for every class).
+
+    With *partial* (a build that deliberately holds only part of the
+    implementations), keys a ``declare_only`` entry names that are not
+    registered are left out instead of reported, and an empty target
+    registry resolves to no key at all (unless the entry declares a
+    ``default`` key, which an empty registry cannot hold); ``unresolved``
+    records what was left out.  Whether the entry's runtime slot can keep
+    a default for an empty registry is decided by the caller, which reads
+    the slots.  Unknown registries and unknown keys of other entries are
+    problems in both modes.
     """
     if not spec.registry_name:
         # Mode 3: literal list, validated by the grammar pass.
@@ -1195,19 +1280,44 @@ def _resolve_spec(
                 registry_name=None,
             ),
             [],
+            None,
         )
 
     view = _view({} if views is None else views, spec.registry_name)
     if view is None:
-        return None, [("unknown_registry", _unknown_registry_detail(spec.registry_name))]
+        return None, [("unknown_registry", _unknown_registry_detail(spec.registry_name))], None
 
     registered = view.keys
     if not registered:
-        return None, [("empty_registry", _empty_registry_detail(spec.registry_name))]
+        if not partial:
+            return None, [("empty_registry", _empty_registry_detail(spec.registry_name))], None
+        if spec.default_key is not None:
+            why = f"the entry's default {spec.default_key!r} names one of its keys"
+            detail = _partial_empty_registry_detail(spec.registry_name, why)
+            return None, [("empty_registry", detail)], None
+        return (
+            ResolvedWiring(
+                param_name=spec.param_name,
+                allowed_keys=[],
+                registry_name=spec.registry_name,
+                optional_keys=None if spec.optional_keys is None else [],
+                declare_only=spec.declare_only,
+            ),
+            [],
+            _Unresolved(
+                spec.param_name, spec.registry_name, spec.declare_only, (),
+                tuple(spec.allowed_keys or ()), tuple(spec.optional_keys or ()), True,
+            ),
+        )
 
     separator = view.separator
     problems: list[tuple[str, str]] = []
     optional_resolved: list[str] | None = None
+    # A partial build leaves out what a declaration-only entry names but
+    # the build does not hold; the framework's own negotiation judges it.
+    tolerate = partial and spec.declare_only
+    missing: list[str] = []
+    missing_opt: list[str] = []
 
     if spec.allowed_keys is None:
         # Mode 1 (or dict form without "keys"): every registered key.
@@ -1215,7 +1325,7 @@ def _resolve_spec(
     else:
         declared = set(spec.allowed_keys) | set(spec.optional_keys or ())
         required, missing = _expand_and_split(spec.allowed_keys, view)
-        if missing:
+        if missing and not tolerate:
             problems.append((
                 "unknown_key",
                 _unknown_keys_detail(
@@ -1230,7 +1340,7 @@ def _resolve_spec(
         allowed = list(required)
         if spec.optional_keys is not None:
             optional_found, missing_opt = _expand_and_split(spec.optional_keys, view)
-            if missing_opt:
+            if missing_opt and not tolerate:
                 problems.append((
                     "unknown_optional_key",
                     _unknown_keys_detail(
@@ -1259,7 +1369,13 @@ def _resolve_spec(
             problems.append(("bad_default", detail))
 
     if problems:
-        return None, problems
+        return None, problems, None
+    unresolved = None
+    if missing or missing_opt:  # only when tolerated: otherwise they are problems
+        unresolved = _Unresolved(
+            spec.param_name, spec.registry_name, spec.declare_only, tuple(allowed),
+            tuple(missing), tuple(missing_opt), False,
+        )
     return (
         ResolvedWiring(
             param_name=spec.param_name,
@@ -1270,6 +1386,7 @@ def _resolve_spec(
             declare_only=spec.declare_only,
         ),
         [],
+        unresolved,
     )
 
 
@@ -1467,32 +1584,42 @@ def _resolve_class(
     and parameter-default problems (see :func:`_parameter_default_problem`).
     An entry with a slot or default problem is not in the returned mapping.
     """
-    resolved, problems, _ = _resolve_class_and_slots(cls, owner_key, views)
+    resolved, problems, _, _ = _resolve_class_and_slots(cls, owner_key, views)
     return resolved, problems
 
 
 def _resolve_class_and_slots(
-    cls: type, owner_key: str | None, views: _Views | None = None
-) -> tuple[dict[str, ResolvedWiring], list[WiringProblem], dict[str, Any]]:
-    """:func:`_resolve_class`, also returning the receptor slots it read.
+    cls: type, owner_key: str | None, views: _Views | None = None, *, partial: bool = False
+) -> tuple[dict[str, ResolvedWiring], list[WiringProblem], dict[str, Any], list[_Unresolved]]:
+    """:func:`_resolve_class`, also returning the receptor slots it read and,
+    for a *partial* build, what it left out.
 
     The slots are :func:`conscribe.introspect.receptor_slots` of the entries
     that needed one (every resolved entry, and every ``default`` /
     ``declare_only`` entry), so a caller that needs them again can reuse
     them instead of resolving the annotations a second time.
+
+    With *partial* (see :func:`_resolve_spec`), an entry whose target
+    registry is empty resolves to no key when it is ``declare_only`` or its
+    field's default selects no implementation (:func:`_unusable_default`);
+    otherwise it is an ``empty_registry`` problem.  The fourth item lists
+    the entries resolved incompletely, in declaration order (always empty
+    without *partial*).
     """
     if views is None:
         views = {}
     head, parsed = _parse_class(cls, owner_key)
-    outcomes: list[tuple[_Parsed, ResolvedWiring | None, list[tuple[str, str]]]] = []
+    outcomes: list[
+        tuple[_Parsed, ResolvedWiring | None, list[tuple[str, str]], _Unresolved | None]
+    ] = []
     wanted: list[str] = []
     for item in parsed:
         spec = item.spec
         if spec is None:
-            outcomes.append((item, None, []))
+            outcomes.append((item, None, [], None))
             continue
-        result, spec_problems = _resolve_spec(spec, views)
-        outcomes.append((item, result, list(spec_problems)))
+        result, spec_problems, unresolved = _resolve_spec(spec, views, partial=partial)
+        outcomes.append((item, result, list(spec_problems), unresolved))
         if spec.declare_only or spec.default_key is not None or result is not None:
             wanted.append(spec.param_name)
 
@@ -1504,7 +1631,8 @@ def _resolve_class_and_slots(
 
     problems = list(head)
     resolved: dict[str, ResolvedWiring] = {}
-    for item, result, details in outcomes:
+    left_out: list[_Unresolved] = []
+    for item, result, details, unresolved in outcomes:
         spec = item.spec
         if spec is None:
             problems.extend(item.problems)
@@ -1514,6 +1642,16 @@ def _resolve_class_and_slots(
             slot_problems = _slot_problems(spec, slot)
             if slot_problems:
                 details.extend(slot_problems)
+                result = None
+        if result is not None and unresolved is not None and unresolved.registry_empty and (
+            not spec.declare_only
+        ):
+            # A Tier-3 schema field brings its own default; the builder judges it.
+            why = None if _tier3_field(cls, spec.param_name) else _unusable_default(slot)
+            if why is not None:
+                details.append((
+                    "empty_registry", _partial_empty_registry_detail(spec.registry_name, why),
+                ))
                 result = None
         if result is not None and not spec.declare_only:
             detail = _parameter_default_problem(result, slot)
@@ -1529,7 +1667,9 @@ def _resolve_class_and_slots(
             )
         if result is not None:
             resolved[spec.param_name] = result
-    return resolved, problems, slots
+            if unresolved is not None:
+                left_out.append(unresolved)
+    return resolved, problems, slots, left_out
 
 
 def resolve_wiring(cls: type) -> dict[str, ResolvedWiring]:
@@ -1650,13 +1790,31 @@ def validate_wiring(registrars: Any) -> None:
         TypeError: If *registrars* is not a registrar, mapping or iterable
             of registrars.
     """
+    _validate_wiring(registrars)
+
+
+def _validate_wiring(
+    registrars: Any, *, partial: bool = False
+) -> dict[type, tuple[_Unresolved, ...]]:
+    """:func:`validate_wiring`; with *partial*, the rules of a partial build.
+
+    Returns:
+        ``{class: entries it resolved incompletely}`` for the classes that
+        have such entries (always empty without *partial*).
+    """
     problems: list[WiringProblem] = []
+    left_out: dict[type, tuple[_Unresolved, ...]] = {}
     views: _Views = {}  # each target registry is read once for the whole run
     for cls, key in _registered_classes(registrars):
-        _, class_problems = _resolve_class(cls, _owner_key(cls) or str(key), views)
+        _, class_problems, _, unresolved = _resolve_class_and_slots(
+            cls, _owner_key(cls) or str(key), views, partial=partial,
+        )
         problems.extend(class_problems)
+        if unresolved:
+            left_out[cls] = tuple(unresolved)
     if problems:
         raise WiringResolutionError(problems=problems)
+    return left_out
 
 
 # ── WiredField descriptor ──────────────────────────────────────

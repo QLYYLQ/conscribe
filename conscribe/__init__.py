@@ -73,11 +73,14 @@ from conscribe.config import (
 )
 from conscribe.config.composed import (
     INLINE_ONLY_ERROR_TYPE,
+    NO_IMPLEMENTATION_ERROR_TYPE,
+    Coverage,
     ReceptorLocation,
     TopLevelExtra,
+    UnresolvedWiring,
 )
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 __all__ = [
     # Registration API
@@ -118,6 +121,9 @@ __all__ = [
     "ReceptorLocation",
     "TopLevelExtra",
     "INLINE_ONLY_ERROR_TYPE",
+    "Coverage",
+    "UnresolvedWiring",
+    "NO_IMPLEMENTATION_ERROR_TYPE",
     "generate_layer_config_source",
     "generate_composed_config_source",
     "generate_layer_json_schema",

@@ -154,12 +154,26 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from typing import Annotated, Any, ClassVar, Final, ForwardRef, Literal, Optional, Union, get_args, get_origin
 
-from pydantic import BaseModel, Field, TypeAdapter, ValidationError, create_model, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    TypeAdapter,
+    ValidationError,
+    create_model,
+    field_validator,
+    model_validator,
+)
 from pydantic.fields import FieldInfo
 from pydantic_core import PydanticCustomError, PydanticUndefined
 
 from conscribe.config import _annotations as _ann
-from conscribe.config._fieldinfo import CONFIG_FIELD_ATTRS, config_field, field_infos_of, narrow_keys
+from conscribe.config._fieldinfo import (
+    CONFIG_FIELD_ATTRS,
+    config_field,
+    field_infos_of,
+    narrow_keys,
+    no_implementation_field,
+)
 from conscribe.config._utils import is_pydantic_dataclass, own_init, qualified_name
 from conscribe.config.degradation import DegradedField, degrade_field_definitions
 from conscribe.config.docstring import parse_param_descriptions
@@ -191,10 +205,46 @@ _GENERATED_MARKER = "__conscribe_generated__"
 #: Error type raised by the old-shape guard.
 LEGACY_FLAT_ERROR = "legacy_flat_config"
 
+#: Pydantic error type of a value that selects an implementation for a wired
+#: field when a partial build holds no implementation the field accepts.
+NO_IMPLEMENTATION_ERROR_TYPE = "no_implementation"
+
+#: Message template of that error (context: ``field`` and ``layer``, the
+#: field's target registry).
+NO_IMPLEMENTATION_MESSAGE = (
+    "this build holds no implementation of layer '{layer}' that '{field}' accepts; "
+    "leave '{field}' out"
+)
+
+#: Class attribute of a model whose wired fields a partial build left without
+#: a key: ``{field: target registry}``.
+NO_IMPLEMENTATION_ATTR = "__no_implementation_fields__"
+
+# Name of the field validator reporting values of those fields.
+_NO_IMPLEMENTATION_VALIDATOR = "_conscribe_report_no_implementation"
+
+#: Whether the registered implementations are all those the wiring
+#: declarations name (``"complete"``) or deliberately only part of them
+#: (``"partial"``): see :func:`conscribe.config.composed.build_composed_config`.
+Coverage = Literal["complete", "partial"]
+
+#: The accepted ``coverage`` values, in documentation order.
+COVERAGE_MODES: tuple[str, ...] = get_args(Coverage)
+
 __all__ = [
-    "LEGACY_FLAT_ERROR", "extract_config_schema", "extract_config_provenance",
-    "extract_own_init_params",
+    "COVERAGE_MODES", "Coverage", "LEGACY_FLAT_ERROR", "NO_IMPLEMENTATION_ATTR",
+    "NO_IMPLEMENTATION_ERROR_TYPE", "NO_IMPLEMENTATION_MESSAGE", "extract_config_schema",
+    "extract_config_provenance", "extract_own_init_params",
 ]
+
+
+def _partial(coverage: Any, function: str) -> bool:
+    """Whether *coverage* asks for a partial build; ``ValueError`` for an unknown mode."""
+    if not isinstance(coverage, str) or coverage not in COVERAGE_MODES:
+        raise ValueError(
+            f"{function}(): coverage must be one of {list(COVERAGE_MODES)}, got {coverage!r}"
+        )
+    return coverage == "partial"
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +256,8 @@ def extract_config_schema(
     cls: type,
     mro_scope: str | list[str] = "local",
     mro_depth: int | None = None,
+    *,
+    coverage: Coverage = "complete",
 ) -> type[BaseModel] | None:
     """Extract the config schema of a class.
 
@@ -244,6 +296,11 @@ def extract_config_schema(
             per class by ``__config_mro_scope__``.
         mro_depth: Max parent ``__init__`` definers to visit (``None`` =
             unlimited).  Overridden per class by ``__config_mro_depth__``.
+        coverage: ``"partial"`` resolves the class's wiring with the rules of
+            a partial composed build (see
+            :func:`conscribe.config.composed.build_composed_config`), for a
+            class of a catalog that deliberately holds part of the
+            implementations.  A Tier-3 schema is still returned verbatim.
 
     Returns:
         A pydantic ``BaseModel`` subclass, or ``None``.
@@ -260,24 +317,48 @@ def extract_config_schema(
             Tier-3 schema without a wired field, a ``Literal`` member that is
             not a wiring key, an invalid ``__config_mro_scope__`` /
             ``__config_mro_depth__``, a parameter no config can pass...).
+        ValueError: *coverage* is not ``"complete"`` or ``"partial"``.
+    """
+    partial = _partial(coverage, "extract_config_schema")
+    return _extract_config_schema(cls, mro_scope, mro_depth, partial=partial)
+
+
+def _extract_config_schema(
+    cls: type,
+    mro_scope: str | list[str] = "local",
+    mro_depth: int | None = None,
+    *,
+    partial: bool = False,
+) -> type[BaseModel] | None:
+    """:func:`extract_config_schema`; *partial* applies a partial build's wiring rules.
+
+    In a partial build (``build_composed_config(..., coverage="partial")``)
+    the class's wiring resolves as :func:`conscribe.wiring._resolve_spec`
+    describes, and a wired field left without a key accepts only values
+    that select no implementation
+    (:func:`conscribe.config._fieldinfo.no_implementation_field`); the model
+    reports any other value as a ``no_implementation`` error.
     """
     schema = getattr(cls, "__config_schema__", None)
     if schema is not None:
-        return _tier3(cls, schema)[0]
+        return _tier3(cls, schema, partial=partial)[0]
     scope = _mro_setting(cls, "__config_mro_scope__", "mro_scope", mro_scope, mro_scope_problem)
     depth = _mro_setting(cls, "__config_mro_depth__", "mro_depth", mro_depth, mro_depth_problem)
-    return _Extraction(cls, walk_init_chain(cls, scope=scope, depth=depth)).run()
+    chain = walk_init_chain(cls, scope=scope, depth=depth)
+    return _Extraction(cls, chain, partial=partial).run()
 
 
 def extract_config_provenance(
     cls: type,
     mro_scope: str | list[str] = "local",
     mro_depth: int | None = None,
+    *,
+    coverage: Coverage = "complete",
 ) -> ConfigProvenance:
     """Extract immutable declaration provenance using the schema extraction path.
 
-    Accepts the same settings and raises the same declaration errors and
-    warnings as :func:`extract_config_schema`. It performs extraction (and
+    Accepts the same settings (``coverage`` included) and raises the same
+    declaration errors and warnings as :func:`extract_config_schema`. It performs extraction (and
     its normal factory handling); it is not a source-code-only static scan.
     It neither changes the returned schema nor adds JSON Schema extensions.
     Input explicit/default selection and actual runtime injection belong to
@@ -285,9 +366,10 @@ def extract_config_provenance(
     """
     from conscribe.wiring import wiring_provenance
 
+    partial = _partial(coverage, "extract_config_provenance")
     schema = getattr(cls, "__config_schema__", None)
     if schema is not None:
-        schema, wiring = _tier3(cls, schema)
+        schema, wiring = _tier3(cls, schema, partial=partial)
         history = wiring_provenance(cls)
         fields = _schema_provenance_fields(schema, "schema", wiring, history)
         return ConfigProvenance(
@@ -298,7 +380,7 @@ def extract_config_provenance(
         )
     scope = _mro_setting(cls, "__config_mro_scope__", "mro_scope", mro_scope, mro_scope_problem)
     depth = _mro_setting(cls, "__config_mro_depth__", "mro_depth", mro_depth, mro_depth_problem)
-    extraction = _Extraction(cls, walk_init_chain(cls, scope=scope, depth=depth))
+    extraction = _Extraction(cls, walk_init_chain(cls, scope=scope, depth=depth), partial=partial)
     model = extraction.run()
     return extraction.provenance(model, scope=scope, depth=depth)
 
@@ -455,11 +537,11 @@ def _own_init_params(cls: type) -> list[InitParam] | None:
 # ---------------------------------------------------------------------------
 
 
-def _tier3(cls: type, schema: Any) -> tuple[type[BaseModel], _Wiring]:
+def _tier3(cls: type, schema: Any, *, partial: bool = False) -> tuple[type[BaseModel], _Wiring]:
     """Check a ``__config_schema__``; return it and the wiring evidence as read."""
     if not (isinstance(schema, type) and _safe_issubclass(schema, BaseModel)):
         raise InvalidConfigSchemaError(cls.__qualname__, schema)
-    wiring = _Wiring.prepare(cls)
+    wiring = _Wiring.prepare(cls, partial=partial)
     owner = qualified_name(cls)
     fields = schema.model_fields
     missing = [
@@ -520,19 +602,21 @@ class _Wiring:
     problems: list[WiringProblem] = dataclasses.field(default_factory=list)
 
     @classmethod
-    def prepare(cls, owner: type) -> _Wiring:
+    def prepare(cls, owner: type, *, partial: bool = False) -> _Wiring:
         """Resolve *owner*'s wiring (grammar, registries, keys, defaults, slots).
 
         Raises one :class:`WiringResolutionError` listing every problem of
         the class, as :func:`conscribe.wiring.resolve_wiring` does (including
-        the slot-dependent ``bad_default`` / ``contradiction`` checks).
+        the slot-dependent ``bad_default`` / ``contradiction`` checks).  With
+        *partial*, a partial build's rules apply (an entry may resolve to no
+        key; see :func:`conscribe.wiring._resolve_spec`).
         """
         from conscribe.wiring import _owner_key, _resolve_class_and_slots, collect_wiring_from_mro
 
         owner_key = _owner_key(owner)
         # The resolution pass already read the receptor slots of every
         # resolved entry; reuse them instead of resolving annotations twice.
-        resolved, problems, slots = _resolve_class_and_slots(owner, owner_key)
+        resolved, problems, slots, _ = _resolve_class_and_slots(owner, owner_key, partial=partial)
         if not resolved and not problems:
             return cls(owner, owner_key, {}, {}, [])
         if problems:
@@ -595,10 +679,11 @@ class _Knob:
 class _Extraction:
     """State of one :func:`extract_config_schema` run."""
 
-    def __init__(self, cls: type, chain: InitChain) -> None:
+    def __init__(self, cls: type, chain: InitChain, *, partial: bool = False) -> None:
         self.cls = cls
         self.owner = qualified_name(cls)
         self.chain = chain
+        self.partial = partial
         self.annotated_only = bool(getattr(cls, "__config_annotated_only__", False))
         self.fields: dict[str, tuple[Any, Any]] = {}
         #: ``{field: "module.QualName"}`` / ``{field: class}`` of the declaring class.
@@ -608,6 +693,8 @@ class _Extraction:
         self.wired_fields: dict[str, str] = {}
         self.wired_keys: dict[str, tuple[str, ...]] = {}
         self.wired_defaults: dict[str, str] = {}
+        #: Partial builds: wired fields left without a key ``{field: registry}``.
+        self.no_implementation: dict[str, str] = {}
         #: The parameter 1.x flattened implicitly: always a field, even under
         #: ``__config_annotated_only__`` (its model's fields were knobs in 1.x).
         self.legacy_param: str | None = None
@@ -621,7 +708,7 @@ class _Extraction:
 
     def run(self) -> type[BaseModel] | None:
         self._warn_if_unreadable()
-        wiring = _Wiring.prepare(self.cls)
+        wiring = _Wiring.prepare(self.cls, partial=self.partial)
         self._wiring = wiring
         from_param = config_from_param(self.cls)
         if from_param is not None:
@@ -629,9 +716,11 @@ class _Extraction:
 
         guard = self._legacy_flat_guard(wiring)
         self.legacy_param = guard["param"] if guard is not None else None
+        added: set[str] = set()
         for param in self.chain.params:
             if param.name in wiring.resolved:
                 self._add_wired(param.name, wiring)
+                added.add(param.name)
                 continue
             if not self.configurable(param):
                 continue
@@ -641,7 +730,7 @@ class _Extraction:
                 self.sources[param.name] = qualified_name(param.declared_on)
                 self.source_classes[param.name] = param.declared_on
         for name in wiring.resolved:
-            if name not in self.wired_fields:
+            if name not in added:
                 self._add_wired(name, wiring)
         wiring.raise_problems()
 
@@ -893,7 +982,6 @@ class _Extraction:
         rw = wiring.resolved[name]
         slot = wiring.slots.get(name)
         keys = tuple(dict.fromkeys(rw.allowed_keys))
-        literal = Literal[keys]  # type: ignore[valid-type]
         if name.startswith("_"):
             raise ConfigDeclarationError(
                 self.owner,
@@ -902,6 +990,11 @@ class _Extraction:
                 name,
             )
         _check_field_name(name, self.owner)
+        if not keys:
+            # Only partial resolution resolves an entry to no key.
+            self._add_no_implementation(name, rw, slot, wiring)
+            return
+        literal = Literal[keys]  # type: ignore[valid-type]
         self.wired_fields[name] = rw.registry_name or "literal"
         self.wired_keys[name] = keys
         if rw.declare_only or slot is None:
@@ -949,6 +1042,69 @@ class _Extraction:
         self.fields[name] = (field_type, info)
         self.sources[name] = qualified_name(knob.owner)
         self.source_classes[name] = knob.owner
+
+    def _add_no_implementation(
+        self, name: str, rw: Any, slot: ReceptorSlot | None, wiring: _Wiring,
+    ) -> None:
+        """The field of an entry a partial build resolved to no key.
+
+        It accepts only values that select no implementation (see
+        :func:`conscribe.config._fieldinfo.no_implementation_field`).  A
+        ``declare_only`` or slot-less entry defaults to ``None``; a receptor
+        keeps the default its slot declares, which must select no
+        implementation.  Resolution already refused any other plain default;
+        a pure ``default_factory`` is evaluated only here, so its result is
+        checked here.
+        """
+        from conscribe.config._fieldinfo import no_implementation_default_problem
+        from conscribe.wiring import _partial_empty_registry_detail
+
+        container = False
+        optional = True
+        if rw.declare_only or slot is None:
+            description = self._description(name, None)
+            src = Field(default=None, description=description) if description else Field(default=None)
+            owner = self.cls
+        else:
+            container = slot.shape != "scalar"
+            knob = self._receptor_knob(name, slot)
+            infos = (*field_infos_of(knob.annotation), *knob.infos)
+            default, factory = knob.default, knob.factory
+            if (
+                knob.via == "annotation"
+                and default is EMPTY
+                and factory is None
+                and not any(
+                    fi.default is not PydanticUndefined or fi.default_factory is not None
+                    for fi in infos
+                )
+            ):
+                # As for any class-level slot: omitted means None when it admits None.
+                default = None if _ann.admits_none(knob.annotation, knob.owner) else EMPTY
+            _, src = config_field(
+                _with_infos(Any, infos),
+                owner=qualified_name(knob.owner),
+                field=name,
+                signature_default=default,
+                signature_factory=factory,
+                description=self._description(name, knob.owner),
+            )
+            src = self._settle_factory(src, knob)
+            owner = knob.owner
+            why = no_implementation_default_problem(
+                src.default, src.default_factory, container=container,
+            )
+            if why is not None:
+                wiring.problems.append(wiring.problem(
+                    name, rw.registry_name, "empty_registry",
+                    _partial_empty_registry_detail(rw.registry_name, f"'{name}' {why}"),
+                ))
+                return
+            optional = src.default is None or _ann.admits_none(knob.annotation, knob.owner)
+        self.fields[name] = no_implementation_field(src, container=container, optional=optional)
+        self.no_implementation[name] = rw.registry_name
+        self.sources[name] = qualified_name(owner)
+        self.source_classes[name] = owner
 
     def _receptor_knob(self, name: str, slot: ReceptorSlot) -> _Knob:
         """The knob of a receptor slot (constructor parameter or class annotation).
@@ -1318,17 +1474,16 @@ class _Extraction:
     ) -> type[BaseModel]:
         from pydantic import PydanticSchemaGenerationError, PydanticUserError
 
-        validators = None
+        validators: dict[str, Any] = {}
         if guard is not None:
-            validators = {
-                "_conscribe_reject_legacy_flat_keys": model_validator(mode="before")(
-                    _reject_legacy_flat_keys
-                )
-            }
+            validators["_conscribe_reject_legacy_flat_keys"] = model_validator(mode="before")(
+                _reject_legacy_flat_keys
+            )
+        validators.update(_no_implementation_validators(self.no_implementation))
         fields = self.fields
         try:
             model = _create_dynamic_model(
-                name, fields, extra, base=base, validators=validators, doc=doc,
+                name, fields, extra, base=base, validators=validators or None, doc=doc,
             )
         except (PydanticSchemaGenerationError, PydanticUserError):
             fields, degraded = degrade_field_definitions(
@@ -1353,7 +1508,7 @@ class _Extraction:
                 )
             self.degraded.extend(degraded)
             model = _create_dynamic_model(
-                name, fields, extra, base=base, validators=validators, doc=doc,
+                name, fields, extra, base=base, validators=validators or None, doc=doc,
             )
         setattr(model, _GENERATED_MARKER, True)
         if self.degraded:
@@ -1365,6 +1520,8 @@ class _Extraction:
             model.__wired_defaults__ = dict(self.wired_defaults)  # type: ignore[attr-defined]
         if guard is not None:
             model.__legacy_flat_keys__ = guard  # type: ignore[attr-defined]
+        if self.no_implementation:
+            setattr(model, NO_IMPLEMENTATION_ATTR, dict(self.no_implementation))
         return model
 
 
@@ -1574,6 +1731,43 @@ def _reject_legacy_flat_keys(cls: type[BaseModel], data: Any) -> Any:
             {"param": param, "keys": stale},
         )
     return data
+
+
+# ---------------------------------------------------------------------------
+# Partial builds: wired fields without an implementation
+# ---------------------------------------------------------------------------
+
+
+def _report_no_implementation(cls: type[BaseModel], value: Any, handler: Any, info: Any) -> Any:
+    """``mode="wrap"`` field validator of the fields a partial build left without a key.
+
+    Their type accepts only values that select no implementation (see
+    :func:`conscribe.config._fieldinfo.no_implementation_field`); any value it
+    refuses is reported as ``no_implementation``, naming the field's target
+    registry from ``cls.__no_implementation_fields__``.  The default is never
+    validated, so omitting the field never reaches this.
+    """
+    try:
+        return handler(value)
+    except ValidationError:
+        field = info.field_name
+        raise PydanticCustomError(
+            NO_IMPLEMENTATION_ERROR_TYPE,
+            NO_IMPLEMENTATION_MESSAGE,
+            {"field": field, "layer": getattr(cls, NO_IMPLEMENTATION_ATTR)[field]},
+        ) from None
+
+
+def _no_implementation_validators(fields: Mapping[str, str]) -> dict[str, Any]:
+    """``create_model`` validators reporting values of the keyless *fields*.
+
+    Empty when there are none.  The model must also carry *fields* as its
+    ``__no_implementation_fields__`` table (``{field: target registry}``).
+    """
+    if not fields:
+        return {}
+    validator = field_validator(*fields, mode="wrap")(_report_no_implementation)
+    return {_NO_IMPLEMENTATION_VALIDATOR: validator}
 
 
 # ---------------------------------------------------------------------------

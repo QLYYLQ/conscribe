@@ -135,9 +135,15 @@ from typing import Annotated, Any, Literal, Union, get_args, get_origin
 from pydantic import BaseModel, Discriminator, Field, Tag, create_model
 from pydantic.fields import FieldInfo
 
+from conscribe.config._fieldinfo import no_implementation_field
 from conscribe.config._utils import is_pydantic_dataclass, is_pydantic_model, own_init
 from conscribe.config.degradation import DegradedField, degrade_field_definitions
-from conscribe.config.extractor import _build_param_fields, extract_config_schema
+from conscribe.config.extractor import (
+    NO_IMPLEMENTATION_ATTR,
+    _build_param_fields,
+    _no_implementation_validators,
+    _extract_config_schema,
+)
 from conscribe.config.mro import InitChain, walk_init_chain
 from conscribe.exceptions import (
     ConfigDeclarationError,
@@ -145,9 +151,11 @@ from conscribe.exceptions import (
     DegradationWarning,
     EmptyLayerError,
     ExtractionWarning,
+    WiringProblem,
+    WiringResolutionError,
 )
 from conscribe.introspect import config_from_param
-from conscribe.wiring import resolve_wiring, validate_wiring
+from conscribe.wiring import validate_wiring
 
 #: Class attribute set to ``True`` in the own ``__dict__`` of every model
 #: conscribe builds.  Check it with ``model.__dict__.get(GENERATED_MARKER)``
@@ -292,6 +300,7 @@ def _build_validated_layer(
     registrar: type,
     *,
     names: _ModelNames | None = None,
+    partial: bool = False,
 ) -> LayerConfigResult:
     """Build a layer whose registrar passed :func:`_check_buildable` and whose
     wiring was validated (the composed builder validates every layer at once).
@@ -301,14 +310,19 @@ def _build_validated_layer(
         names: The model-name allocator of the build.  A composed build
             passes one allocator to every layer so model names are unique
             across the whole build; a fresh one is used when omitted.
+        partial: Apply a partial composed build's wiring rules (see
+            :func:`conscribe.config.extractor._extract_config_schema`).
+            Nested-mode layers declare no wiring, so it changes nothing there.
     """
     names = names if names is not None else _ModelNames()
     if getattr(registrar, "discriminator_fields", None):
         return _build_nested_config(registrar, names)
-    return _build_flat_config(registrar, names)
+    return _build_flat_config(registrar, names, partial=partial)
 
 
-def _build_flat_config(registrar: type, names: _ModelNames) -> LayerConfigResult:
+def _build_flat_config(
+    registrar: type, names: _ModelNames, *, partial: bool = False,
+) -> LayerConfigResult:
     """Build flat (single-level) discriminated union."""
     disc_field = registrar.discriminator_field
     layer_name = registrar._registry.name
@@ -323,8 +337,8 @@ def _build_flat_config(registrar: type, names: _ModelNames) -> LayerConfigResult
 
     for key, cls in all_classes.items():
         with _warnings_at(cls):
-            schema = extract_config_schema(
-                cls, mro_scope=reg_mro_scope, mro_depth=reg_mro_depth,
+            schema = _extract_config_schema(
+                cls, mro_scope=reg_mro_scope, mro_depth=reg_mro_depth, partial=partial,
             )
         model_name = names.claim(_build_model_name(key, layer_name))
 
@@ -334,6 +348,7 @@ def _build_flat_config(registrar: type, names: _ModelNames) -> LayerConfigResult
         else:
             model = _inject_discriminator(
                 schema, model_name, disc_field, key, owner=cls, layer_name=layer_name,
+                partial=partial,
             )
             schema_degraded = getattr(schema, "__degraded_fields__", None)
             if schema_degraded:
@@ -1431,6 +1446,7 @@ def _inject_discriminator(
     *,
     owner: type | None = None,
     layer_name: str | None = None,
+    partial: bool = False,
 ) -> type[BaseModel]:
     """Derive the per-key model: *schema* plus a ``Literal[key]`` discriminator.
 
@@ -1446,7 +1462,9 @@ def _inject_discriminator(
     When *schema* is *owner*'s Tier-3 ``__config_schema__`` (used verbatim),
     the per-key model records the wired entries that are schema fields in
     ``__wired_fields__`` / ``__wired_keys__`` (as the extractor does for the
-    models it builds), so composed builds inline them.
+    models it builds), so composed builds inline them.  In a partial build
+    a wired schema field left without a key is redeclared to accept only
+    values that select no implementation (see :func:`_tier3_wiring`).
 
     Args:
         schema: The extracted config schema (or Tier-3 ``__config_schema__``).
@@ -1455,11 +1473,15 @@ def _inject_discriminator(
         key: Registry key.
         owner: The registered class (error messages); defaults to *schema*.
         layer_name: The layer (error messages).
+        partial: Apply a partial composed build's wiring rules.
 
     Raises:
         ConfigDeclarationError: *schema* cannot be derived from (see
             :func:`_check_derivable`), has a field named or aliased like the
             discriminator, or stays incomplete.
+        WiringResolutionError: In a partial build, a Tier-3 schema field
+            wired to an empty registry has a default that selects an
+            implementation (or none).
     """
     target = owner if owner is not None else schema
     _check_derivable(schema, target)
@@ -1468,29 +1490,80 @@ def _inject_discriminator(
     disc: tuple[Any, Any] = (Literal[key], key)  # type: ignore[valid-type]
     if schema.model_config.get("alias_generator") is not None:
         disc = (Literal[key], Field(default=key, alias=disc_field))  # type: ignore[valid-type]
+    attrs, fields, keyless = _tier3_wiring(owner, schema, partial=partial)
     return _derive_model(
         model_name,
         schema,
-        {disc_field: disc},
+        {**fields, disc_field: disc},
         extra=extra,
         carry_from=schema,
-        attrs=_tier3_wiring_attrs(owner, schema),
+        attrs=attrs,
+        validators=_no_implementation_validators(keyless),
         owner=target,
     )
 
 
-def _tier3_wiring_attrs(owner: type | None, schema: type[BaseModel]) -> dict[str, Any]:
-    """``__wired_fields__`` / ``__wired_keys__`` of a Tier-3 owner's wired schema fields."""
+def _tier3_wiring(
+    owner: type | None, schema: type[BaseModel], *, partial: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
+    """The wiring record of a Tier-3 owner's per-key model.
+
+    Returns:
+        ``(attrs, fields, keyless)``: the class attributes
+        (``__wired_fields__`` / ``__wired_keys__`` of the wired schema
+        fields, and ``__no_implementation_fields__``), the fields the per-key
+        model redeclares and the wired schema fields a partial build left
+        without a key (``{field: target registry}``).  Those are the
+        redeclared fields: they accept only values that select no
+        implementation (see :func:`~conscribe.config._fieldinfo.no_implementation_field`),
+        and the schema field's own default must be one of them (or, on a
+        list field, come from a ``default_factory``).
+
+    Raises:
+        WiringResolutionError: A field left without a key has a default
+            that selects an implementation, or none.
+    """
     if owner is None or getattr(owner, "__config_schema__", None) is not schema:
-        return {}
-    wired = {
-        name: rw for name, rw in resolve_wiring(owner).items() if name in schema.model_fields
-    }
-    if not wired:
-        return {}
+        return {}, {}, {}
+    from conscribe.config._annotations import admits_none, annotation_shape
+    from conscribe.config._fieldinfo import no_implementation_default_problem
+    from conscribe.wiring import _owner_key, _partial_empty_registry_detail, _resolve_class_and_slots
+
+    owner_key = _owner_key(owner)
+    resolved, problems, _, _ = _resolve_class_and_slots(owner, owner_key, partial=partial)
+    if problems:  # pragma: no cover - extraction resolved the same wiring first
+        raise WiringResolutionError(problems=problems)
+    wired = {name: rw for name, rw in resolved.items() if name in schema.model_fields}
     keys: dict[str, tuple[str, ...]] = {}
+    fields: dict[str, Any] = {}
+    keyless: dict[str, str] = {}
     for name, rw in wired.items():
         allowed = tuple(dict.fromkeys(rw.allowed_keys))
+        if not allowed:  # only a partial build resolves an entry to no key
+            info = schema.model_fields[name]
+            container = annotation_shape(info.annotation) != "scalar"
+            why = no_implementation_default_problem(
+                info.default, info.default_factory, container=container,
+            )
+            if why is not None:
+                raise WiringResolutionError(problems=[WiringProblem(
+                    owner=owner.__qualname__,
+                    param_name=name,
+                    registry_name=rw.registry_name or "",
+                    kind="empty_registry",
+                    detail=_partial_empty_registry_detail(
+                        rw.registry_name or "",
+                        f"the __config_schema__ field '{name}' {why}",
+                    ),
+                    owner_key=owner_key,
+                )])
+            fields[name] = no_implementation_field(
+                info,
+                container=container,
+                optional=info.default is None or admits_none(info.annotation),
+            )
+            keyless[name] = rw.registry_name or ""
+            continue
         # A schema field typed with ``Literal[...]`` narrows the wiring: the
         # inline union must accept exactly what the per-layer model accepts.
         accepted = _literal_strings(schema.model_fields[name].annotation)
@@ -1505,10 +1578,13 @@ def _tier3_wiring_attrs(owner: type | None, schema: type[BaseModel]) -> dict[str
                     field=name,
                 )
         keys[name] = allowed
-    return {
-        "__wired_fields__": {name: rw.registry_name or "literal" for name, rw in wired.items()},
-        "__wired_keys__": keys,
-    }
+    attrs: dict[str, Any] = {}
+    if keys:
+        attrs["__wired_fields__"] = {name: wired[name].registry_name or "literal" for name in keys}
+        attrs["__wired_keys__"] = keys
+    if keyless:
+        attrs[NO_IMPLEMENTATION_ATTR] = keyless
+    return attrs, fields, keyless
 
 
 def _literal_strings(annotation: Any) -> frozenset[str] | None:

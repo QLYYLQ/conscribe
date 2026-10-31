@@ -20,7 +20,7 @@ Three artifacts come out of a build: the in-process models, the generated Python
 
 ## Extraction (`extractor.py`)
 
-`extract_config_schema(cls, mro_scope="local", mro_depth=None)` turns one class into the pydantic model that validates its config block. The builder adds the discriminator afterwards. It tries, in order:
+`extract_config_schema(cls, mro_scope="local", mro_depth=None, *, coverage="complete")` turns one class into the pydantic model that validates its config block (`coverage`: see [Partial builds](#partial-builds)). The builder adds the discriminator afterwards. It tries, in order:
 
 1. Tier 3, `__config_schema__`: the schema, used verbatim after its wiring checks (see [Tier 3](#tier-3-__config_schema__)).
 2. `__config_from_param__ = "<param>"`: the flattened model of one `BaseModel` parameter (see [Single-parameter models](#single-parameter-models-__config_from_param__)).
@@ -296,6 +296,7 @@ The parameter or attribute named by a wiring entry is its *receptor*. It has a *
 - A receptor with a runtime slot is required unless its default says otherwise; a class-annotation slot without a value is optional (default `None`) only when its annotation admits `None`. A class-body value (`hooks: list[P] = []`) is the default.
 - A non-`None` default of the receptor must be a valid value of the field (an allowed key, or a list of them for a container receptor). `None` is always accepted.
 - A slot-less entry and a `declare_only` entry are `Optional[Literal[...]] = None`. A config may name a key there, but nothing receives a value at construction time, so the field is never required.
+- In a [partial composed build](#partial-builds), a field left without a key accepts only the values that select no implementation instead.
 - The dict-form `default` makes the field optional with that key as default. When the receptor's annotation admits `None`, it stays `Optional`: an omitted value means the default key, `null` means `None`. A parameter default naming another key is an error (`bad_default`).
 
 conscribe collects every wiring problem of the class (unknown keys or registries, bad defaults, `declare_only` contradictions) and raises them together in one `WiringResolutionError`. Contradictions in a receptor's own annotation (a `Literal` member that is not a key, key constraints that reject every key) are a `ConfigDeclarationError`.
@@ -658,14 +659,14 @@ model_type='openai' temperature=0.7 provider=DefaultProviderConfig(name='default
 
 ## Composed Config (`composed.py`)
 
-`build_composed_config(registrars, *, inline_wiring=True, top_level_extra="forbid")` builds one top-level model from several layers.
+`build_composed_config(registrars, *, inline_wiring=True, top_level_extra="forbid", coverage="complete")` builds one top-level model from several layers.
 
 ### Build order
 
-1. Argument checks: `registrars` must map section names to registrars (`TypeError`), `top_level_extra` must be a known mode (`ValueError`), section names must be usable as fields (below).
+1. Argument checks: `registrars` must map section names to registrars (`TypeError`), `top_level_extra` and `coverage` must be known modes (`ValueError`), section names must be usable as fields (below).
 2. Empty layers: one `EmptyLayerError` naming all of them.
 3. Each layer's own checks, as in `build_layer_config`.
-4. `validate_wiring(registrars)`: every wiring problem of the build in one `WiringResolutionError`.
+4. `validate_wiring(registrars)`: every wiring problem of the build in one `WiringResolutionError` (a [partial build](#partial-builds) tolerates what it lists).
 5. With `inline_wiring=False`, inline-only layers are refused.
 6. The layers are built leaves first, and wired fields are inlined (below).
 7. The top-level model is built.
@@ -790,6 +791,104 @@ False {'archiver': ['hook[trace_writer].archive']}
 True
 ```
 
+### Partial builds
+
+A framework that imports only the packages one configuration names builds its schema from part of the implementations. `coverage="complete"`, the default, treats that as an error: every key a wiring entry names must be registered and no target registry may be empty, which catches misspelled keys and layers that packaging left empty. Keep it for the build that imports everything (code generation, CI). `coverage="partial"` declares that the build deliberately holds part of the implementations and changes exactly two rules:
+
+- Keys a `declare_only` entry names that are not registered are left out of its `Literal[...]` instead of raising. Such entries feed the framework's own negotiation, which runs later and decides what it needs.
+- An entry whose target registry is empty is kept when it is `declare_only`, slot-less, or a receptor whose default selects no implementation: `None`, or on a multi-instance receptor an empty list, tuple or set, or a `default_factory` (carried as it is).
+
+A field left without a key (an empty target registry, or a `declare_only` entry none of whose keys is registered) accepts exactly the values that select no implementation: omitted (its default, never validated), `null` where the field admits `None`, `[]` on a multi-instance receptor. So a config that a complete build accepts stays valid in the partial build as long as it names no missing implementation. Any other value fails with the pydantic error type `no_implementation` (`NO_IMPLEMENTATION_ERROR_TYPE`), at the field, naming the field and its target layer. The JSON Schema states the same (`null`, or an array with `maxItems: 0`), and the generated source reproduces the field and its error.
+
+Everything else is checked as in a complete build: unknown registries, unknown keys of entries that are not `declare_only`, defaults, contradictions, and layers passed in without implementations (`EmptyLayerError`: leave such a layer out). A receptor wired to an empty registry without such a default (required, or defaulting to a key or a non-empty list) is still `empty_registry`, with a message saying why the partial build cannot keep it. Grammar is checked at class creation and never consults a registry, so a class registers even before its targets exist.
+
+Known limits:
+
+- A [Tier-3 schema](#tier-3-__config_schema__) is used verbatim, so per-class `extract_config_schema(cls, coverage="partial")` returns it unchanged and does not check its fields' defaults. Only the composed build redeclares a Tier-3 field left without a key and checks that the schema's own default selects nothing; that problem is raised for the first such field, not together with the build's other wiring problems.
+- Any value such a field refuses is reported as `no_implementation`, including a value of the wrong shape (`null` on a field that does not admit `None`, a string where a list is expected), which a complete build reports with pydantic's own error type.
+
+The per-class functions take the same keyword, so a framework can explain a component of a partial run: `extract_config_schema(cls, coverage="partial")`, `extract_config_provenance(cls, coverage="partial")` and the registrar's `get_config_schema(key, coverage=...)` / `get_config_provenance(key, coverage=...)`. `ComposedConfigResult.coverage` records the mode. `ComposedConfigResult.unresolved_wiring` lists every entry the partial build resolved incompletely as `UnresolvedWiring` records (`owner_layer`, `owner_key`, `name`, `registry_name`, `declare_only`, `keys` that did resolve, `missing_keys` and `missing_optional_keys` as written, `registry_empty`), one per `(layer, key)` the class is registered under, in dependency order, key order and declaration order. The top-level schema carries `x-coverage: "partial"` and the generated source a `# Coverage: partial` header line, so a partial artifact is not taken for the whole catalog.
+
+```python
+from typing import Optional, Protocol, runtime_checkable
+
+from pydantic import ValidationError
+
+from conscribe import build_composed_config, create_registrar
+
+
+@runtime_checkable
+class Plugin(Protocol):
+    def run(self) -> None: ...
+
+
+Action = create_registrar("action", Plugin, discriminator_field="kind", key_separator=".")
+Archiver = create_registrar("archiver", Plugin, discriminator_field="kind", inline_only=True)
+Agent = create_registrar("agent", Plugin, discriminator_field="kind")
+Hook = create_registrar("hook", Plugin, discriminator_field="kind")
+
+
+class ActionBase(metaclass=Action.Meta):
+    def run(self) -> None: ...
+
+
+class AgentBase(metaclass=Agent.Meta):
+    def run(self) -> None: ...
+
+
+class HookBase(metaclass=Hook.Meta):
+    def run(self) -> None: ...
+
+
+# Only the android package was imported: two actions, and no archiver at all.
+class AndroidClick(ActionBase):
+    __registry_key__ = "android.click"
+
+
+class AndroidNavigate(ActionBase):
+    __registry_key__ = "android.navigate"
+
+
+class Dom(AgentBase):
+    __wiring__ = {
+        "action": {
+            "registry": "action",
+            "keys": ["navigate", "click"],
+            "optional_keys": ["scroll", "drag"],
+            "declare_only": True,
+        },
+    }
+
+
+class TraceWriter(HookBase):
+    __wiring__ = {"archive": "archiver"}
+
+    def __init__(self, archive: Optional[list[Plugin]] = None) -> None: ...
+
+
+layers = {"action": Action, "agent": Agent, "hook": Hook}  # the empty archiver layer is left out
+result = build_composed_config(layers, coverage="partial")
+for item in result.unresolved_wiring:
+    print(item, item.keys, item.missing_optional_keys, item.registry_empty)
+
+Top = result.top_level_type
+print(Top(hook=[{"kind": "trace_writer", "archive": []}]).hook[0])
+try:
+    Top(hook=[{"kind": "trace_writer", "archive": [{"kind": "disk"}]}])
+except ValidationError as exc:
+    error = exc.errors()[0]
+    print(error["type"], error["loc"], error["msg"])
+```
+
+```
+agent[dom].action ('android.navigate', 'android.click') ('scroll', 'drag') False
+hook[trace_writer].archive () () True
+archive=[] kind='trace_writer'
+no_implementation ('hook', 0, 'archive') this build holds no implementation of layer 'archiver' that 'archive' accepts; leave 'archive' out
+```
+
+The same layers without `coverage="partial"` raise one `WiringResolutionError` with both problems: `unknown optional keys 'scroll', 'drag'` and `registry 'archiver' is empty`.
+
 ## Code generation (`codegen.py`)
 
 `generate_layer_config_source(result)` and `generate_composed_config_source(result)` write a self-contained module whose models validate like the in-process ones. The one exception is validator metadata the file cannot write ([below](#the-value-ladder)), which only the in-process models enforce.
@@ -910,7 +1009,7 @@ For one layer, `generate_layer_json_schema(result)` is pydantic's JSON Schema of
 - `x-discriminator-fields` and `x-key-separator` in nested mode;
 - for degraded fields, a top-level `x-degraded-fields` (`{key: [{field, original_type}]}`) and, on each degraded property, `x-degraded-from` and a `[degraded]` note in its description.
 
-For a composed build, `generate_composed_json_schema(result)` *is* `result.top_level_type.model_json_schema()`. The extensions `x-composed-layers`, `x-inline-wiring`, `x-inline-only-layers` (`{layer: [paths]}`) and, under `top_level_extra="ignore"` / `"allow"`, a `not: {anyOf: [{required: [layer]}, ...]}` clause refusing inline-only names, all live in the model's `json_schema_extra`, so conscribe adds nothing after pydantic generates the schema.
+For a composed build, `generate_composed_json_schema(result)` *is* `result.top_level_type.model_json_schema()`. The extensions `x-composed-layers`, `x-inline-wiring`, `x-inline-only-layers` (`{layer: [paths]}`), `x-coverage` (`"partial"`, only in a [partial build](#partial-builds)) and, under `top_level_extra="ignore"` / `"allow"`, a `not: {anyOf: [{required: [layer]}, ...]}` clause refusing inline-only names, all live in the model's `json_schema_extra`, so conscribe adds nothing after pydantic generates the schema.
 
 Both schemas write the members of set-valued defaults in a canonical order, so files do not change with `PYTHONHASHSEED`. Values you put into `examples` or `json_schema_extra` are written as given.
 

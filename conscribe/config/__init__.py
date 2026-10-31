@@ -9,9 +9,12 @@ from conscribe.config.builder import LayerConfigResult, build_layer_config
 from conscribe.config.codegen import generate_composed_config_source, generate_layer_config_source
 from conscribe.config.composed import (
     INLINE_ONLY_ERROR_TYPE,
+    NO_IMPLEMENTATION_ERROR_TYPE,
     ComposedConfigResult,
+    Coverage,
     ReceptorLocation,
     TopLevelExtra,
+    UnresolvedWiring,
     build_composed_config,
 )
 from conscribe.config.degradation import DegradedField
@@ -48,6 +51,9 @@ __all__ = [
     "ReceptorLocation",
     "TopLevelExtra",
     "INLINE_ONLY_ERROR_TYPE",
+    "Coverage",
+    "UnresolvedWiring",
+    "NO_IMPLEMENTATION_ERROR_TYPE",
     "DegradedField",
     "generate_layer_config_source",
     "generate_composed_config_source",

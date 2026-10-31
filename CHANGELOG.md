@@ -5,6 +5,68 @@ All notable changes to conscribe are documented here.
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-11-01
+
+### Added
+
+- Partial composed builds: `build_composed_config(..., coverage="partial")`
+  declares that the build deliberately holds only part of the
+  implementations, as when a framework imports only the packages one
+  configuration names. Two wiring rules change, and nothing else:
+  - keys a `declare_only` entry names that are not registered are left out of
+    its `Literal[...]` instead of raising `unknown_key` /
+    `unknown_optional_key`;
+  - an entry whose target registry is empty no longer raises `empty_registry`
+    when it is `declare_only`, slot-less, or a receptor whose default selects
+    no implementation (`None`; on a multi-instance receptor also an empty
+    list, tuple or set, or a `default_factory`).
+- A field a partial build leaves without a key accepts exactly the values that
+  select no implementation: omitted (its default, never validated), `null`
+  where the field admits `None`, `[]` on a multi-instance receptor. A config
+  the complete build accepts therefore stays valid as long as it names no
+  missing implementation. Any other value fails with the new pydantic error
+  type `no_implementation` (`NO_IMPLEMENTATION_ERROR_TYPE`), at the field,
+  naming the field and its target layer. The JSON Schema says the same (`null`
+  or an array with `maxItems: 0`), and the generated source reproduces the
+  field and the error.
+- `ComposedConfigResult.coverage` and `ComposedConfigResult.unresolved_wiring`:
+  frozen `UnresolvedWiring` records (`owner_layer`, `owner_key`, `name`,
+  `registry_name`, `declare_only`, the `keys` that resolved, `missing_keys` and
+  `missing_optional_keys` as written, `registry_empty`) for every entry a
+  partial build resolved incompletely, so the framework can show or check them.
+  A partial build's top-level schema carries `x-coverage: "partial"` and its
+  generated source a `# Coverage: partial` header line.
+- The per-class functions take the same keyword, so a framework can explain a
+  component of a partial run: `extract_config_schema()`,
+  `extract_config_provenance()`, `Registrar.get_config_schema()` and
+  `Registrar.get_config_provenance()` accept `coverage="partial"`.
+- New public names: `Coverage`, `UnresolvedWiring`,
+  `NO_IMPLEMENTATION_ERROR_TYPE` (also `COVERAGE_MODES` and
+  `NO_IMPLEMENTATION_MESSAGE` in `conscribe.config.composed`).
+
+### Compatibility and limits
+
+`coverage="complete"` is the default, and complete builds behave exactly as
+before: same errors, messages, models, generated source and JSON Schema. A
+partial build still raises for unknown registries, unknown keys of entries
+that are not `declare_only`, receptors wired to an empty registry without such
+a default (required, or defaulting to a key, a non-empty list or, on a
+single-instance receptor, a `default_factory`; still `empty_registry`, with
+a message saying why), bad defaults, declaration contradictions and layers
+passed in without implementations (`EmptyLayerError`). A pure
+`default_factory` is evaluated during the build, so a factory that names keys
+is refused there. A Tier-3 field is judged by the schema's own default; only
+the composed build redeclares and checks it, and it raises for the first such
+field rather than with the build's other wiring problems. Per-class
+`extract_config_schema(cls, coverage="partial")` returns a Tier-3 schema
+verbatim and does not check its defaults. A field left without a key reports
+every value it refuses as `no_implementation`, including values of the wrong
+shape (`null` where `None` is not admitted, a string for a list), which a
+complete build reports with pydantic's own error types.
+`build_layer_config()`, `validate_wiring()`, stubs, fingerprints and the CLI
+always check completely. Wiring checks at class creation remain grammar-only,
+so registration never depends on what is registered.
+
 ## [2.1.0]
 
 ### Added

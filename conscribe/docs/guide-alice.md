@@ -447,6 +447,8 @@ Archiver = create_registrar("archiver", ArchiverProtocol, discriminator_field="n
 
 See the [Recipes](recipes.md) for inline-only layers and default instances.
 
+If your framework imports only the packages a given config names, so a small program stays light, build that run's schema with `coverage="partial"`. Declarations that name implementations the run did not import no longer fail the build: unregistered keys of `declare_only` entries are left out, and a receptor wired to an empty layer keeps its default and accepts no implementation (any value that selects one fails with `no_implementation`). `result.unresolved_wiring` lists what was left out. Keep the default `coverage="complete"` for the build that imports everything, such as code generation and your tests, where it still catches misspelled keys and layers that packaging left empty. See [Partial builds](config-typing.md#partial-builds).
+
 CLI equivalent:
 
 ```bash
@@ -550,7 +552,7 @@ if load_cached_fingerprint(cache, "llm") != current:
     save_fingerprint(cache, "llm", current)
 ```
 
-Stubs are not hashed; regenerate `.pyi` files separately. For composed configs, track every participating layer and the composition options (`inline_wiring` and `top_level_extra`).
+Stubs are not hashed; regenerate `.pyi` files separately. For composed configs, track every participating layer and the composition options (`inline_wiring`, `top_level_extra` and `coverage`).
 
 ## CLI Usage
 
